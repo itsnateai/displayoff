@@ -10,12 +10,25 @@ Requirements:
 Usage:
     python displayoff.py              # Start in tray
     python displayoff.py --off        # Turn off immediately (no tray)
+    python displayoff.py --version    # Print version
     pythonw displayoff.py             # Start in tray, no console window
 """
 import ctypes
+import logging
+import os
 import sys
 import threading
 import time
+
+__version__ = "1.1.0"
+
+log = logging.getLogger("displayoff")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(name)s] %(message)s",
+)
+
+_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "displayoff.ico")
 
 # Win32 constants
 SC_MONITORPOWER = 0xF170
@@ -47,7 +60,7 @@ _turn_off_lock = threading.Lock()
 def turn_off_monitors():
     """Send SC_MONITORPOWER to turn off all displays."""
     if SendMessageW is None:
-        print("[displayoff] Not on Windows — monitor power control unavailable.")
+        log.warning("Not on Windows — monitor power control unavailable.")
         return
 
     if not _turn_off_lock.acquire(blocking=False):
@@ -117,11 +130,11 @@ def _start_hotkey_listener():
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         listener.daemon = True
         listener.start()
-        print("[displayoff] Global hotkey registered: Ctrl+Alt+F12")
+        log.info("Global hotkey registered: Ctrl+Alt+F12")
     except ImportError:
-        print("[displayoff] pynput not installed — hotkey disabled. Install with: pip install pynput")
+        log.warning("pynput not installed — hotkey disabled. Install with: pip install pynput")
     except Exception as e:
-        print(f"[displayoff] Hotkey registration failed: {e}")
+        log.error("Hotkey registration failed: %s", e)
 
 
 def run_tray():
@@ -129,7 +142,11 @@ def run_tray():
     import pystray
     from pystray import MenuItem, Menu
 
-    icon_image = _create_icon_image()
+    if os.path.isfile(_ICON_PATH):
+        from PIL import Image
+        icon_image = Image.open(_ICON_PATH)
+    else:
+        icon_image = _create_icon_image()
 
     def on_turn_off(icon, item):
         threading.Thread(target=turn_off_monitors, daemon=True).start()
@@ -156,21 +173,25 @@ def run_tray():
     # Start hotkey listener
     _start_hotkey_listener()
 
-    print("[displayoff] Running in system tray. Click icon or press Ctrl+Alt+F12 to turn off displays.")
+    log.info("Running in system tray. Click icon or press Ctrl+Alt+F12 to turn off displays.")
     icon.run()
 
 
 def main():
+    if "--version" in sys.argv:
+        print(f"displayoff {__version__}")
+        return
+
     if "--off" in sys.argv:
-        print("Turning off displays...")
+        log.info("Turning off displays...")
         turn_off_monitors()
         return
 
     try:
         run_tray()
     except ImportError:
-        print("pystray not installed. Install with: pip install pystray Pillow")
-        print("Running in --off mode instead...")
+        log.warning("pystray not installed. Install with: pip install pystray Pillow")
+        log.info("Running in --off mode instead...")
         turn_off_monitors()
 
 
