@@ -10,28 +10,68 @@ Requirements:
 Usage:
     python displayoff.py              # Start in tray
     python displayoff.py --off        # Turn off immediately (no tray)
+    python displayoff.py --version    # Print version
     pythonw displayoff.py             # Start in tray, no console window
 """
 import ctypes
+import logging
+import os
 import sys
 import threading
 import time
+
+__version__ = "1.1.0"
+
+log = logging.getLogger("displayoff")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(name)s] %(message)s",
+)
+
+_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "displayoff.ico")
 
 # Win32 constants
 SC_MONITORPOWER = 0xF170
 HWND_BROADCAST = 0xFFFF
 WM_SYSCOMMAND = 0x0112
 MONITOR_OFF = 2
-MONITOR_ON = -1
 
-SendMessageW = ctypes.windll.user32.SendMessageW
+# Set up SendMessageW with correct type signatures for 64-bit safety.
+# Without argtypes, ctypes defaults to c_int (4 bytes) which truncates
+# pointer-sized values (HWND, WPARAM, LPARAM) on 64-bit Windows.
+if sys.platform == "win32":
+    import ctypes.wintypes
+
+    SendMessageW = ctypes.windll.user32.SendMessageW
+    SendMessageW.argtypes = [
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.UINT,
+        ctypes.wintypes.WPARAM,
+        ctypes.wintypes.LPARAM,
+    ]
+    SendMessageW.restype = ctypes.wintypes.LPARAM
+else:
+    SendMessageW = None
+
+# Guard against concurrent/repeated triggers — only one turn-off at a time
+_turn_off_lock = threading.Lock()
 
 
 def turn_off_monitors():
     """Send SC_MONITORPOWER to turn off all displays."""
-    # Small delay so the mouse click / hotkey release doesn't immediately wake
-    time.sleep(0.3)
-    SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF)
+    if SendMessageW is None:
+        log.warning("Not on Windows — monitor power control unavailable.")
+        return
+
+    if not _turn_off_lock.acquire(blocking=False):
+        return  # Already in progress, skip duplicate
+
+    try:
+        # Small delay so the mouse click / hotkey release doesn't immediately wake
+        time.sleep(0.3)
+        SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF)
+    finally:
+        _turn_off_lock.release()
 
 
 def _create_icon_image():
@@ -64,25 +104,37 @@ def _start_hotkey_listener():
         from pynput import keyboard
 
         current_keys = set()
-        HOTKEY = {keyboard.Key.ctrl_l, keyboard.Key.alt_l, keyboard.Key.f12}
-        HOTKEY_R = {keyboard.Key.ctrl_r, keyboard.Key.alt_r, keyboard.Key.f12}
+        TRIGGER_KEY = keyboard.Key.f12
+        CTRL_KEYS = {keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
+        ALT_KEYS = {keyboard.Key.alt_l, keyboard.Key.alt_r}
+
+        def _hotkey_active():
+            """Check if any Ctrl + any Alt + F12 are held."""
+            return (
+                TRIGGER_KEY in current_keys
+                and bool(CTRL_KEYS & current_keys)
+                and bool(ALT_KEYS & current_keys)
+            )
 
         def on_press(key):
             current_keys.add(key)
-            if HOTKEY.issubset(current_keys) or HOTKEY_R.issubset(current_keys):
+            if _hotkey_active():
                 threading.Thread(target=turn_off_monitors, daemon=True).start()
 
         def on_release(key):
             current_keys.discard(key)
+            # Cap set size to prevent unbounded growth from missed release events
+            if len(current_keys) > 20:
+                current_keys.clear()
 
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         listener.daemon = True
         listener.start()
-        print("[displayoff] Global hotkey registered: Ctrl+Alt+F12")
+        log.info("Global hotkey registered: Ctrl+Alt+F12")
     except ImportError:
-        print("[displayoff] pynput not installed — hotkey disabled. Install with: pip install pynput")
+        log.warning("pynput not installed — hotkey disabled. Install with: pip install pynput")
     except Exception as e:
-        print(f"[displayoff] Hotkey registration failed: {e}")
+        log.error("Hotkey registration failed: %s", e)
 
 
 def run_tray():
@@ -90,7 +142,11 @@ def run_tray():
     import pystray
     from pystray import MenuItem, Menu
 
-    icon_image = _create_icon_image()
+    if os.path.isfile(_ICON_PATH):
+        from PIL import Image
+        icon_image = Image.open(_ICON_PATH)
+    else:
+        icon_image = _create_icon_image()
 
     def on_turn_off(icon, item):
         threading.Thread(target=turn_off_monitors, daemon=True).start()
@@ -117,21 +173,25 @@ def run_tray():
     # Start hotkey listener
     _start_hotkey_listener()
 
-    print("[displayoff] Running in system tray. Click icon or press Ctrl+Alt+F12 to turn off displays.")
+    log.info("Running in system tray. Click icon or press Ctrl+Alt+F12 to turn off displays.")
     icon.run()
 
 
 def main():
+    if "--version" in sys.argv:
+        print(f"displayoff {__version__}")
+        return
+
     if "--off" in sys.argv:
-        print("Turning off displays...")
+        log.info("Turning off displays...")
         turn_off_monitors()
         return
 
     try:
         run_tray()
     except ImportError:
-        print("pystray not installed. Install with: pip install pystray Pillow")
-        print("Running in --off mode instead...")
+        log.warning("pystray not installed. Install with: pip install pystray Pillow")
+        log.info("Running in --off mode instead...")
         turn_off_monitors()
 
 
