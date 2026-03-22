@@ -1,0 +1,40 @@
+# Task Management
+AUDIT_TASKS.md
+TODO_LIST.md
+SCHEDULED_TASKS.md
+ASSUMPTIONS.md
+WORKFLOW_STATE.md
+FINAL_REPORT.md
+
+# Editor/OS artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Temp files
+*.tmp
+*.bak
+*.log
+
+# Merge/patch artifacts
+*.orig
+*.rej
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Config (may contain personal paths)
+*.cfg
+
+# Environment
+.env

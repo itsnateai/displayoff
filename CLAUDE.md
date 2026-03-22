@@ -35,5 +35,7 @@ pythonw displayoff.py             # Tray mode, no console
 - `ctypes.windll` is guarded behind `sys.platform == "win32"` so the module can be imported on non-Windows
 
 ## Status
-- **Version:** 1.1.0
-- **State:** Complete
+
+**v1.1.0 — Final release (shipped 2026-03-21)**
+
+All audit items resolved. Cloud's PR merged (64-bit fix, logging, icon, README). Tracking files deleted. See CHANGELOG.md for history.
