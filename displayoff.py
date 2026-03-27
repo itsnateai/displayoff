@@ -118,7 +118,7 @@ def _start_hotkey_listener():
 
         def on_press(key):
             current_keys.add(key)
-            if _hotkey_active():
+            if _hotkey_active() and not _turn_off_lock.locked():
                 threading.Thread(target=turn_off_monitors, daemon=True).start()
 
         def on_release(key):
