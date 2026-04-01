@@ -187,6 +187,10 @@ def main():
         turn_off_monitors()
         return
 
+    if "--start-off" in sys.argv:
+        log.info("Turning off displays, then starting tray...")
+        turn_off_monitors()
+
     try:
         run_tray()
     except ImportError:
