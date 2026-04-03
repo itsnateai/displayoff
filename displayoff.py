@@ -21,13 +21,35 @@ import sys
 import threading
 import time
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 log = logging.getLogger("displayoff")
 logging.basicConfig(
     level=logging.INFO,
     format="[%(name)s] %(message)s",
 )
+
+# ── Single-instance guard ──────────────────────────────────────────────────
+_MUTEX_NAME = "Global\\DisplayOff_SingleInstance"
+_mutex_handle = None
+
+
+def _acquire_single_instance():
+    """Acquire a named mutex to prevent multiple instances.
+
+    Returns True if this is the only instance, False if another is running.
+    """
+    global _mutex_handle
+    if sys.platform != "win32":
+        return True
+    _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+    last_error = ctypes.windll.kernel32.GetLastError()
+    # ERROR_ALREADY_EXISTS = 183
+    if last_error == 183:
+        ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        _mutex_handle = None
+        return False
+    return True
 
 _ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "displayoff.ico")
 
@@ -467,6 +489,11 @@ def main():
     if "--off" in sys.argv:
         log.info("Turning off displays...")
         turn_off_monitors()
+        return
+
+    # Tray modes need single-instance protection
+    if not _acquire_single_instance():
+        log.info("Another instance is already running — exiting.")
         return
 
     if "--start-off" in sys.argv:
