@@ -1,5 +1,16 @@
 # Changelog — Display Off
 
+## [1.3.0] — 2026-04-18
+
+### New Features
+- Single-instance mutex — launching a second instance brings the existing tray icon forward instead of starting a duplicate
+- `--start-off` CLI flag — turn monitors off and then start into tray in one step
+
+### Fixed
+- Crash on resume from sleep (now targets desktop window instead of broadcasting)
+- Hotkey repeat no longer spawns redundant threads
+- Semgrep security scanning workflow on CI
+
 ## [1.1.0] — 2026-03-21
 
 ### New Features
