@@ -9,7 +9,9 @@ Requirements:
 
 Usage:
     python displayoff.py              # Start in tray
-    python displayoff.py --off        # Turn off immediately (honors lock-on-off config)
+    python displayoff.py --off        # Turn off immediately (honors lock-on-off config + path config)
+    python displayoff.py --native-off # Force the native idle-blank path (regardless of config)
+    python displayoff.py --legacy-off # Force the legacy SC_MONITORPOWER path (regardless of config)
     python displayoff.py --lock-and-off   # Lock workstation, then turn off
     python displayoff.py --no-lock-off    # Turn off without locking (override config)
     python displayoff.py --start-off  # Turn off, then start tray
@@ -32,7 +34,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.4.0"
+__version__ = "1.6.0"
 
 log = logging.getLogger("displayoff")
 
@@ -57,9 +59,22 @@ ERROR_ALREADY_EXISTS = 183
 
 # ── Tunables ───────────────────────────────────────────────────────────────
 _TRIGGER_SETTLE_SECS = 0.5      # Delay before powering off so the trigger keypress doesn't immediately wake.
-_LOCK_SETTLE_SECS = 0.3         # Delay between LockWorkStation and SC_MONITORPOWER.
+_LOCK_SETTLE_SECS = 0.3         # Delay between LockWorkStation and the blank.
 _SEND_TIMEOUT_MS = 5000         # SendMessageTimeoutW abort-if-hung timeout.
 _KEY_TRACKER_OVERFLOW_CAP = 20  # Cap on tracked simultaneously-pressed keys (defense vs missed releases).
+_DOUBLE_CLICK_WINDOW_SECS = 0.5 # Treat two icon clicks within this window as a double-click.
+                                # Matches Windows' default GetDoubleClickTime() of ~500ms. The hidden
+                                # default-action menu item is fired by pystray on every left-click on
+                                # Windows (not just double-click), so we time the gap ourselves.
+_NATIVE_PROD_SLEEP_SECS = 5.0   # How long the native idle-blank path holds the 1s timeout in production.
+                                # Bumped from 2.5s after empirical "menu click → no blank" reports: when the user
+                                # navigates the right-click menu, the mouse moves continuously and the kernel's
+                                # idle counter keeps resetting. By the time we'd restore at 2.5s the counter has
+                                # never reached the 1s threshold. 5s lets idle accumulate even with ~3s of post-
+                                # click motion. Lock-collision cost is logged explicitly so the user can see
+                                # when rapid double-trigger drops a second click.
+_NATIVE_PROD_SETTLE_SECS = 0.5  # Pause before writing the 1s timeout. Same idea as the legacy SC_MONITORPOWER
+                                # path: gives the user's mouse time to come to rest before we arm the trap.
 
 # ── Win32 bindings (Windows-only) ──────────────────────────────────────────
 # Every call site must use the bound names from this block — never raw
@@ -187,12 +202,23 @@ def _acquire_single_instance():
     Returns True if this is the only instance, False if another is running.
     The kernel reaps the mutex when the owning process exits; no explicit
     release is needed.
+
+    Treats a CreateMutexW failure (NULL handle) as "no single-instance guard"
+    rather than silently letting two trays coexist — log loudly and refuse to
+    proceed. Conditions that can cause this: low system resources, sandbox
+    restrictions, ACL changes on the Local\\ namespace.
     """
     global _mutex_handle
     if sys.platform != "win32":
         return True
     _mutex_handle = CreateMutexW(None, True, _MUTEX_NAME)
     last_error = GetLastError()
+    if not _mutex_handle:
+        # CreateMutexW failed entirely — no guard at all. Treat as "another
+        # instance might be running" rather than risk launching a second tray.
+        log.error("CreateMutexW failed (lastError=%d) — cannot acquire single-instance guard; "
+                  "refusing to start to avoid duplicate trays.", last_error)
+        return False
     if last_error == ERROR_ALREADY_EXISTS:
         CloseHandle(_mutex_handle)
         _mutex_handle = None
@@ -209,6 +235,12 @@ _DEFAULT_CONFIG = {
     },
     "lock_on_off": False,
     "idle_blank_minutes": 0,  # 0 disables idle-trigger blanking.
+    # Path selector. Native idle-blank (default in v1.6.0+) hooks into Windows'
+    # built-in display-off-after-N-minutes mechanism — works on every Windows
+    # version and on hardware where SC_MONITORPOWER cycles (Modern Standby +
+    # hybrid GPU laptops). Set true to force the legacy SC_MONITORPOWER path
+    # used in v1.0-1.5.
+    "use_legacy_sc_monitorpower": False,
 }
 
 
@@ -253,25 +285,94 @@ def hotkey_display_name(cfg):
     return "+".join(parts)
 
 
-# ── Autostart (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ─────────
+# ── Autostart (Startup-folder .lnk, matching the rest of the tray-app set) ─
+# v1.7.0+ uses the user's Startup folder (a .lnk next to MicMute.lnk,
+# SyncthingPause.lnk, CapsNumTray.lnk, MWBToggle.lnk, etc.) instead of the
+# HKCU Run registry key. Same effect at logon, but the .lnk is visible /
+# manageable in File Explorer, which matches how Nate manages every other
+# tray app in the workspace. The legacy `HKCU\...\Run\DisplayOff` registry
+# entry is detected for backward compat and cleaned up on next toggle.
 
 _RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _RUN_VALUE_NAME = "DisplayOff"
 
+_STARTUP_DIR = os.path.join(os.environ.get("APPDATA", ""),
+                            r"Microsoft\Windows\Start Menu\Programs\Startup")
+_STARTUP_LNK_NAME = "Display Off.lnk"
+_STARTUP_LNK_PATH = os.path.join(_STARTUP_DIR, _STARTUP_LNK_NAME)
 
-def _autostart_command():
-    """Build the command Windows runs at logon. Prefer pythonw.exe (no console flash)."""
-    script = os.path.abspath(__file__)
+
+def _autostart_target_pythonw():
+    """Resolve the `pythonw.exe` path that should launch us at logon. Prefers
+    `pythonw.exe` over `python.exe` so there's no console flash."""
     py = sys.executable
     if py.lower().endswith("python.exe"):
         pyw = py[:-len("python.exe")] + "pythonw.exe"
         if os.path.isfile(pyw):
-            py = pyw
-    return f'"{py}" "{script}"'
+            return pyw
+    return py
 
 
-def autostart_enabled():
-    """Return True if Display Off is registered in HKCU Run."""
+def _create_startup_lnk():
+    """Create the `Display Off.lnk` shortcut in the user's Startup folder.
+    Uses PowerShell + `WScript.Shell` COM (the same WSH COM API every other
+    tray app in this workspace uses). PowerShell spawn is hidden via
+    CREATE_NO_WINDOW + STARTUPINFO so there's no console flash.
+
+    Raises OSError on PowerShell failure or missing icon."""
+    if sys.platform != "win32":
+        raise OSError("startup-folder shortcut is Windows-only")
+    script = os.path.abspath(__file__)
+    py = _autostart_target_pythonw()
+    working_dir = os.path.dirname(script)
+    icon_path = os.path.join(working_dir, "displayoff.ico")
+
+    # PowerShell here-string keeps the script readable. Single-quoted PS
+    # strings preserve everything literally except `''` (double-up escape),
+    # so paths with backslashes don't need extra quoting. The Arguments
+    # field gets a single-quoted PS string whose CONTENT is a double-quoted
+    # path — that's how the .lnk records the arg with quotes around it.
+    ps_script = (
+        f"$sh = New-Object -ComObject WScript.Shell; "
+        f"$lnk = $sh.CreateShortcut('{_STARTUP_LNK_PATH}'); "
+        f"$lnk.TargetPath = '{py}'; "
+        f"$lnk.Arguments = '\"{script}\"'; "
+        f"$lnk.WorkingDirectory = '{working_dir}'; "
+        f"$lnk.IconLocation = '{icon_path},0'; "
+        f"$lnk.WindowStyle = 7; "
+        f"$lnk.Description = 'Display Off - tray app autostart'; "
+        f"$lnk.Save()"
+    )
+
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        capture_output=True, text=True, timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        startupinfo=si,
+    )
+    if proc.returncode != 0:
+        raise OSError(f"Could not create startup shortcut (PowerShell rc={proc.returncode}): "
+                      f"{proc.stderr.strip() or proc.stdout.strip()}")
+
+
+def _remove_startup_lnk():
+    """Remove the Display Off.lnk shortcut from the user's Startup folder.
+    No-op if the file doesn't exist."""
+    if os.path.exists(_STARTUP_LNK_PATH):
+        try:
+            os.remove(_STARTUP_LNK_PATH)
+        except OSError as e:
+            log.warning("Could not remove startup shortcut: %s", e)
+            raise
+
+
+def _legacy_run_key_present():
+    """True if the legacy HKCU\\...\\Run\\DisplayOff entry exists. Used both
+    for backward-compat detection in `autostart_enabled` and for cleanup
+    when we migrate a user from the registry path to the .lnk path."""
     if winreg is None:
         return False
     try:
@@ -282,20 +383,45 @@ def autostart_enabled():
         return False
 
 
-def set_autostart(enabled):
-    """Register or unregister Display Off for autostart. Raises OSError on failure."""
+def _delete_legacy_run_key():
+    """Remove the legacy HKCU\\...\\Run\\DisplayOff entry if present.
+    No-op if not present. Doesn't raise — the cleanup is best-effort."""
     if winreg is None:
-        raise OSError("winreg unavailable on this platform")
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, _RUN_VALUE_NAME)
+        log.info("Removed legacy HKCU Run\\%s autostart entry (migrated to Startup-folder .lnk)",
+                 _RUN_VALUE_NAME)
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def autostart_enabled():
+    """True if Display Off is set to autostart. Checks the Startup-folder
+    .lnk (v1.7.0+ canonical) AND the legacy HKCU Run entry (v1.6.0 and
+    earlier) — either being present is "enabled"."""
+    if os.path.exists(_STARTUP_LNK_PATH):
+        return True
+    return _legacy_run_key_present()
+
+
+def set_autostart(enabled):
+    """Enable or disable autostart. Writes to the Startup folder as a
+    .lnk and cleans up any legacy HKCU Run entry from prior versions.
+
+    Raises OSError on creation failure."""
     if enabled:
-        cmd = _autostart_command()
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, _RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+        _create_startup_lnk()
+        # If user had the legacy registry entry from v1.6.0, clean it up so
+        # autostart fires from exactly one place.
+        _delete_legacy_run_key()
     else:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.DeleteValue(key, _RUN_VALUE_NAME)
-        except FileNotFoundError:
-            pass
+        _remove_startup_lnk()
+        # Also clear any legacy entry, even when "disabling" — the user
+        # clicked off, they want autostart off, period.
+        _delete_legacy_run_key()
 
 
 # ── Hotkey listener (restartable) ──────────────────────────────────────────
@@ -439,20 +565,33 @@ def lock_workstation():
         return False
 
 
-def turn_off_monitors(lock_first=None):
-    """Send SC_MONITORPOWER to turn off all displays.
+def turn_off_monitors(lock_first=None, force_path=None):
+    """Blank all displays without putting the PC to sleep.
 
-    Sends to the desktop window (not HWND_BROADCAST) — the kernel powers off
-    all monitors regardless of which window receives the message. Broadcasting
-    floods every top-level window with WM_SYSCOMMAND, which can crash GPU
-    drivers on resume when queued messages fight the wake process.
+    Dispatches to one of two underlying mechanisms based on
+    `cfg['use_legacy_sc_monitorpower']`:
 
-    Uses SendMessageTimeoutW with SMTO_ABORTIFHUNG so we never hang if the
-    target window is unresponsive.
+      - **Native idle-blank** (default in v1.6.0+) — temporarily writes a
+        1-second display-off timeout into the active power scheme via
+        PowerWriteACValueIndex + PowerSetActiveScheme. Windows itself fires
+        its native idle-display-off code as the idle counter crosses the
+        threshold. No SC_MONITORPOWER message is sent. Required on hardware
+        where SC_MONITORPOWER triggers a wake-handshake loop (Modern Standby
+        + hybrid GPU laptops).
+
+      - **Legacy SC_MONITORPOWER** (opt-in) — original v1.0–v1.5 mechanism.
+        Sends WM_SYSCOMMAND + SC_MONITORPOWER + MONITOR_OFF to the desktop
+        window. Works on most Windows hardware; cycles on some.
+
+    Either path respects the same single-instance lock, RDP early-return,
+    and lock-first option.
 
     lock_first: True/False overrides config; None honors config['lock_on_off'].
+    force_path: None (honor config), "native", or "legacy". Used by --native-off
+                and --legacy-off CLI flags to bypass config for explicit one-shot
+                invocations without mutating displayoff_config.json.
     """
-    if SendMessageTimeoutW is None:
+    if sys.platform != "win32":
         log.warning("Not on Windows — monitor power control unavailable.")
         return
 
@@ -461,11 +600,17 @@ def turn_off_monitors(lock_first=None):
         return
 
     if not _turn_off_lock.acquire(blocking=False):
-        return  # Already in progress, skip duplicate
+        # Previous blank still in flight; silently dropping this trigger would
+        # confuse the user ("nothing happened when I clicked!"). Log so we can
+        # see the collision in displayoff.log.
+        log.info("blank already in progress — dropping duplicate trigger (force_path=%s)",
+                 force_path)
+        return
 
     try:
+        cfg = load_config()
         if lock_first is None:
-            lock_first = bool(load_config().get("lock_on_off", False))
+            lock_first = bool(cfg.get("lock_on_off", False))
 
         if lock_first:
             if lock_workstation():
@@ -473,18 +618,70 @@ def turn_off_monitors(lock_first=None):
                 # secure desktop transition itself can wake the displays.
                 time.sleep(_LOCK_SETTLE_SECS)
 
-        # Wait for input events to settle so the click/keypress that triggered
-        # this doesn't immediately wake the monitors back up.
-        time.sleep(_TRIGGER_SETTLE_SECS)
-
-        result = ctypes.wintypes.DWORD(0)
-        hwnd = GetDesktopWindow()
-        SendMessageTimeoutW(
-            hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF,
-            SMTO_ABORTIFHUNG, _SEND_TIMEOUT_MS, ctypes.byref(result),
-        )
+        if force_path == "native":
+            _fire_native_idle_blank()
+        elif force_path == "legacy":
+            _fire_sc_monitorpower()
+        elif cfg.get("use_legacy_sc_monitorpower", False):
+            _fire_sc_monitorpower()
+        else:
+            _fire_native_idle_blank()
     finally:
         _turn_off_lock.release()
+
+
+def _fire_sc_monitorpower():
+    """Legacy v1.0–v1.5 mechanism: WM_SYSCOMMAND + SC_MONITORPOWER + MONITOR_OFF
+    to GetDesktopWindow(). Targets the desktop (not HWND_BROADCAST) because
+    broadcasting flooded every top-level window with WM_SYSCOMMAND and crashed
+    GPU drivers on resume in older Windows builds. SendMessageTimeoutW with
+    SMTO_ABORTIFHUNG so we never hang on a frozen target."""
+    if SendMessageTimeoutW is None:
+        return
+    # Wait for the trigger event to settle so the click/keypress that fired
+    # this doesn't immediately wake the monitors back up.
+    time.sleep(_TRIGGER_SETTLE_SECS)
+    result = ctypes.wintypes.DWORD(0)
+    hwnd = GetDesktopWindow()
+    SendMessageTimeoutW(
+        hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF,
+        SMTO_ABORTIFHUNG, _SEND_TIMEOUT_MS, ctypes.byref(result),
+    )
+
+
+def _fire_native_idle_blank():
+    """Default v1.6.0+ mechanism: hook into Windows' native idle-display-off
+    path by temporarily writing a 1-second display-off timeout. The mechanism
+    + sentinel-based crash safety live in `native_blank.py`.
+
+    On import failure we REFUSE TO BLANK rather than fall back to
+    SC_MONITORPOWER. The entire reason v1.6.0 exists is that SC_MONITORPOWER
+    cycles the display on Modern Standby + hybrid-GPU hardware to the point
+    of requiring a reboot. Silently falling back to that path on a broken
+    install would re-introduce exactly the bug v1.6.0 was built to fix. Users
+    who actually want SC_MONITORPOWER on their (working) hardware set
+    `use_legacy_sc_monitorpower: true` in config — and reach this code via
+    `_fire_sc_monitorpower()` directly, not via this fallback path."""
+    try:
+        from native_blank import blank_via_idle_path
+    except ImportError as e:
+        log.error("native_blank.py missing or broken (%s) — REFUSING to fall back to "
+                  "SC_MONITORPOWER (would re-trigger the bug v1.6.0 fixed). "
+                  "Reinstall displayoff or restore native_blank.py.", e)
+        return
+    # Settle pause so the click/keypress that triggered us doesn't leak into
+    # the idle window and prevent the kernel from crossing the 1s threshold.
+    # Especially load-bearing for the right-click → menu path where the mouse
+    # is still moving when this function fires.
+    if _NATIVE_PROD_SETTLE_SECS > 0:
+        time.sleep(_NATIVE_PROD_SETTLE_SECS)
+    try:
+        ok = blank_via_idle_path(sleep_seconds=_NATIVE_PROD_SLEEP_SECS)
+    except Exception as e:
+        log.exception("native idle-blank raised — no blank fired: %s", e)
+        return
+    if not ok:
+        log.error("native idle-blank left a sentinel on disk — see native_blank.log")
 
 
 # ── Background watchers (listener liveness + idle trigger) ────────────────
@@ -695,6 +892,58 @@ def check_for_updates(timeout=5):
     return has_update, latest.lstrip("vV"), html_url, None
 
 
+# ── Dark theme palette + helpers ──────────────────────────────────────────
+# Colors picked to match Win11 dark mode chrome (Settings, File Explorer,
+# context menus). Centralized constants so a future tweak is one-line.
+_THEME_BG           = "#1f1f1f"  # Main window background
+_THEME_BG_SUNKEN    = "#2d2d2d"  # Input fields, sunken hotkey display
+_THEME_BG_RECORD    = "#4a3f1c"  # Hotkey display while recording (dark amber)
+_THEME_FG           = "#e6e6e6"  # Primary text
+_THEME_FG_HINT      = "#8a8a8a"  # Secondary / hint text
+_THEME_SEP          = "#3a3a3a"  # Separator line
+_THEME_BTN_BG       = "#2d2d2d"
+_THEME_BTN_FG       = "#e6e6e6"
+_THEME_BTN_ACTIVE_BG = "#3d3d3d"
+_THEME_BTN_ACTIVE_FG = "#ffffff"
+
+
+def _apply_dark_titlebar(root):
+    """Apply Win11 immersive dark mode to the title bar of a Tk Toplevel.
+
+    Uses `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE = 20)` which
+    became stable in Win10 build 19041 (2004). Without this call the window
+    body is themed (we set bg manually) but the title bar stays light-gray —
+    classic broken-dark-theme look.
+
+    `root.winfo_id()` returns the HWND of Tk's internal frame, not the
+    top-level window — we need the parent. No-op on non-Windows or older
+    Win10/11 builds where the attribute isn't supported."""
+    if sys.platform != "win32":
+        return
+    try:
+        # update() forces window creation if it hasn't fully realized yet —
+        # winfo_id is only valid post-realize.
+        root.update_idletasks()
+        hwnd_inner = root.winfo_id()
+        # The actual top-level HWND is the inner widget's parent in Tk.
+        hwnd = ctypes.windll.user32.GetParent(hwnd_inner) or hwnd_inner
+        dwmapi = ctypes.windll.dwmapi
+        # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 on Win10 2004+ / Win11.
+        # Earlier Win10 builds (1903–1909) used 19 — try 20 first, fall back
+        # to 19 only if 20 returns nonzero (failure).
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        value = ctypes.c_int(1)
+        result = dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(value), ctypes.sizeof(value))
+        if result != 0:
+            # Try the legacy attribute index used on early Win10 1903-1909.
+            dwmapi.DwmSetWindowAttribute(hwnd, 19,
+                                         ctypes.byref(value), ctypes.sizeof(value))
+    except (AttributeError, OSError) as e:
+        log.warning("Could not apply dark title bar: %s", e)
+
+
 # ── UI helpers ─────────────────────────────────────────────────────────────
 
 def _set_dpi_awareness():
@@ -779,10 +1028,14 @@ def _build_header(root, row, pad):
     from tkinter import ttk
 
     header = tk.Label(root, text=f"Display Off v{__version__}",
-                      font=("Segoe UI", 13, "bold"), bg="#f0f0f0", anchor="w")
+                      font=("Segoe UI", 13, "bold"),
+                      bg=_THEME_BG, fg=_THEME_FG, anchor="w")
     header.grid(row=row, column=0, columnspan=3, sticky="w", padx=pad, pady=(pad, 2))
 
-    sep = ttk.Separator(root, orient="horizontal")
+    # ttk.Separator doesn't accept `bg=` directly — use a configured ttk Style.
+    style = ttk.Style(root)
+    style.configure("Dark.TSeparator", background=_THEME_SEP)
+    sep = ttk.Separator(root, orient="horizontal", style="Dark.TSeparator")
     sep.grid(row=row + 1, column=0, columnspan=3, sticky="ew", padx=pad, pady=(0, 12))
 
 
@@ -797,19 +1050,20 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
     import tkinter as tk
 
     hotkey_lbl = tk.Label(root, text="Hotkey:", font=("Segoe UI", 10),
-                          bg="#f0f0f0", anchor="e")
+                          bg=_THEME_BG, fg=_THEME_FG, anchor="e")
     hotkey_lbl.grid(row=row, column=0, sticky="e", padx=(pad, 8), pady=4)
 
     display_var = tk.StringVar(value=hotkey_display_name(cfg))
 
     hotkey_display = tk.Label(root, textvariable=display_var, font=("Segoe UI", 11),
-                              relief="sunken", bg="white", anchor="center", width=28,
-                              pady=6, cursor="hand2")
+                              relief="sunken", bg=_THEME_BG_SUNKEN, fg=_THEME_FG,
+                              anchor="center", width=28, pady=6, cursor="hand2",
+                              highlightthickness=1, highlightbackground=_THEME_SEP)
     hotkey_display.grid(row=row, column=1, columnspan=2, sticky="ew",
                         padx=(0, pad), pady=4)
 
     hint = tk.Label(root, text="Click the field above, press your hotkey (Esc cancels)",
-                    font=("Segoe UI", 8), fg="#888888", bg="#f0f0f0")
+                    font=("Segoe UI", 8), fg=_THEME_FG_HINT, bg=_THEME_BG)
     hint.grid(row=row + 1, column=1, columnspan=2, sticky="w", pady=(0, 10))
 
     def start_recording(event=None):
@@ -817,7 +1071,7 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
             return
         recording["active"] = True
         display_var.set("Press your hotkey...")
-        hotkey_display.config(bg="#fff8e0", relief="solid")
+        hotkey_display.config(bg=_THEME_BG_RECORD, relief="solid")
 
         from pynput import keyboard as kb
 
@@ -859,7 +1113,7 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
                 display_var.set(hotkey_display_name({"hotkey": captured}))
             else:
                 display_var.set(hotkey_display_name(cfg))
-            hotkey_display.config(bg="white", relief="sunken")
+            hotkey_display.config(bg=_THEME_BG_SUNKEN, relief="sunken")
             recording["active"] = False
 
         root.after(50, poll_capture)
@@ -876,43 +1130,78 @@ def _build_options_section(root, row, pad, lock_var, autostart_var, idle_var):
     """
     import tkinter as tk
 
+    # Common checkbutton kwargs — selectcolor is the indicator box itself,
+    # activebackground is the row's hover state.
+    _chk_kw = dict(
+        font=("Segoe UI", 10),
+        bg=_THEME_BG, fg=_THEME_FG,
+        selectcolor=_THEME_BG_SUNKEN,
+        activebackground=_THEME_BG, activeforeground=_THEME_FG,
+        anchor="w",
+    )
     lock_chk = tk.Checkbutton(root, text="Lock workstation when blanking",
-                              variable=lock_var, font=("Segoe UI", 10),
-                              bg="#f0f0f0", anchor="w")
+                              variable=lock_var, **_chk_kw)
     lock_chk.grid(row=row, column=0, columnspan=3, sticky="w", padx=pad, pady=2)
 
     autostart_chk = tk.Checkbutton(root, text="Run at Windows startup",
-                                   variable=autostart_var, font=("Segoe UI", 10),
-                                   bg="#f0f0f0", anchor="w")
+                                   variable=autostart_var, **_chk_kw)
     autostart_chk.grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=pad, pady=2)
 
-    idle_frame = tk.Frame(root, bg="#f0f0f0")
+    idle_frame = tk.Frame(root, bg=_THEME_BG)
     idle_frame.grid(row=row + 2, column=0, columnspan=3, sticky="w", padx=pad, pady=(6, 2))
     tk.Label(idle_frame, text="Auto-blank after",
-             font=("Segoe UI", 10), bg="#f0f0f0").pack(side="left")
+             font=("Segoe UI", 10), bg=_THEME_BG, fg=_THEME_FG).pack(side="left")
     tk.Spinbox(idle_frame, from_=0, to=999, width=5, textvariable=idle_var,
-               font=("Segoe UI", 10)).pack(side="left", padx=(8, 8))
+               font=("Segoe UI", 10),
+               bg=_THEME_BG_SUNKEN, fg=_THEME_FG,
+               insertbackground=_THEME_FG,
+               buttonbackground=_THEME_BTN_BG,
+               highlightthickness=1, highlightbackground=_THEME_SEP,
+               relief="flat").pack(side="left", padx=(8, 8))
     tk.Label(idle_frame, text="minutes idle  (0 = off)",
-             font=("Segoe UI", 10), bg="#f0f0f0").pack(side="left")
+             font=("Segoe UI", 10), bg=_THEME_BG, fg=_THEME_FG).pack(side="left")
 
 
-def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None):
-    """GitHub link + Save / Apply (optional) / Cancel buttons."""
+def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
+                  on_about=None, on_check_updates=None):
+    """Footer button row.
+
+    Left side  : [GitHub] [About] [Updates]   ← info / action buttons
+    Right side : [Apply] [Save] [Cancel]      ← dialog-result buttons
+
+    `on_about` and `on_check_updates` are optional callbacks. When supplied,
+    they render as buttons that open child dialogs of the Settings root.
+    Added in v1.7.0 — previously these lived in the tray right-click menu."""
     import tkinter as tk
 
-    footer = tk.Frame(root, bg="#f0f0f0")
+    footer = tk.Frame(root, bg=_THEME_BG)
     footer.grid(row=row, column=0, columnspan=3, sticky="ew", padx=pad, pady=(16, pad))
+
+    _btn_kw = dict(
+        font=("Segoe UI", 9), width=8,
+        bg=_THEME_BTN_BG, fg=_THEME_BTN_FG,
+        activebackground=_THEME_BTN_ACTIVE_BG,
+        activeforeground=_THEME_BTN_ACTIVE_FG,
+        relief="flat", borderwidth=1,
+        highlightthickness=1, highlightbackground=_THEME_SEP,
+    )
 
     tk.Button(footer, text="GitHub",
               command=lambda: webbrowser.open("https://github.com/itsnateai/displayoff"),
-              font=("Segoe UI", 9), width=8).pack(side="left")
+              **_btn_kw).pack(side="left")
+    if on_about is not None:
+        tk.Button(footer, text="About", command=on_about,
+                  **_btn_kw).pack(side="left", padx=(4, 0))
+    if on_check_updates is not None:
+        tk.Button(footer, text="Updates", command=on_check_updates,
+                  **_btn_kw).pack(side="left", padx=(4, 0))
     tk.Button(footer, text="Cancel", command=on_cancel,
-              font=("Segoe UI", 9), width=8).pack(side="right", padx=(4, 0))
+              **_btn_kw).pack(side="right", padx=(4, 0))
     tk.Button(footer, text="Save", command=on_save,
-              font=("Segoe UI", 9), width=8).pack(side="right", padx=(0, 4))
+              **_btn_kw).pack(side="right", padx=(0, 4))
     if on_apply is not None:
         tk.Button(footer, text="Apply", command=on_apply,
-                  font=("Segoe UI", 9), width=8).pack(side="right", padx=(0, 4))
+                  **_btn_kw).pack(side="right", padx=(0, 4))
 
 
 def _release_dialog_slot():
@@ -946,16 +1235,23 @@ def _open_settings_impl(tray_icon, on_saved):
     _set_dpi_awareness()
 
     root = tk.Tk()
+    # Hide the window IMMEDIATELY so the user never sees the default
+    # light-mode Tk chrome flash before our dark theme + DWM dark title bar
+    # apply. We re-show (deiconify) only after every widget is built, the
+    # geometry is set, and the title bar has been re-painted dark.
+    root.withdraw()
     root.title("Display Off — Settings")
     root.resizable(False, False)
     root.attributes("-topmost", True)
-    root.configure(bg="#f0f0f0")
+    root.configure(bg=_THEME_BG)
+    # Dark title bar (Win11 via DWM immersive dark mode). No-op on older OS.
+    _apply_dark_titlebar(root)
 
     PAD = 20
-    w, h = 460, 380
-    x = (root.winfo_screenwidth() - w) // 2
-    y = (root.winfo_screenheight() - h) // 2
-    root.geometry(f"{w}x{h}+{x}+{y}")
+    w = 460
+    # Height is computed AFTER widgets are built (see below) so the window
+    # always matches its content. Was previously hardcoded to 380, which left
+    # ~90px of dead space below the footer after the v1.4.0 row decomposition.
 
     # Tk vars must be created after the root exists.
     lock_var = tk.BooleanVar(value=bool(cfg.get("lock_on_off", False)))
@@ -1026,62 +1322,200 @@ def _open_settings_impl(tray_icon, on_saved):
     def on_apply():
         _apply_settings()  # stays open regardless
 
+    # About and Updates buttons render as child dialogs of the Settings Tk
+    # root. Settings already holds the dialog-slot, so these don't need
+    # separate slot machinery.
+    def on_about_btn():
+        _show_about(root)
+
+    def on_updates_btn():
+        _run_update_check(root)
+
     _build_footer(root, row=7, pad=PAD,
-                  on_save=on_save, on_cancel=on_cancel, on_apply=on_apply)
+                  on_save=on_save, on_cancel=on_cancel, on_apply=on_apply,
+                  on_about=on_about_btn, on_check_updates=on_updates_btn)
+
+    # Size the window to its actual content. Must happen after every widget
+    # has been added so winfo_reqheight reports the right value. Center on
+    # screen using the computed height.
+    root.update_idletasks()
+    h = root.winfo_reqheight()
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    root.geometry(f"{w}x{h}+{x}+{y}")
+
+    # NOW show — everything is themed, sized, positioned. Re-asserting the
+    # dark title bar after deiconify is belt-and-suspenders: some Win11
+    # builds re-paint the title bar with default chrome when a previously-
+    # withdrawn window is first shown.
+    root.deiconify()
+    _apply_dark_titlebar(root)
+
     root.protocol("WM_DELETE_WINDOW", on_cancel)
     root.mainloop()
 
 
-# ── About dialog ───────────────────────────────────────────────────────────
+# ── Dark-mode native menus (Win10 1903+) ──────────────────────────────────
 
-def _show_about():
-    """Open a simple About messagebox in its own Tk root."""
+def _enable_dark_mode_menus():
+    """Force this process's native Win32 context menus (including pystray's
+    `TrackPopupMenu`-based tray right-click menu) to render in dark mode.
+
+    Uses uxtheme's undocumented `SetPreferredAppMode` (ordinal 135) and
+    `FlushMenuThemes` (ordinal 136). These are private/undocumented APIs but
+    have been stable since Windows 10 1903 and are exactly what Explorer
+    itself uses for its own context menus. Microsoft has not deprecated
+    them in any release through Win11 25H2.
+
+    Modes:
+      0 = Default (follow system setting)
+      1 = AllowDark   (let app opt-in per-window via DwmSetWindowAttribute)
+      2 = ForceDark   (force every window/menu in this process to dark)
+      3 = ForceLight  (force every window/menu in this process to light)
+      4 = Max         (sentinel — do not use)
+
+    If the OS is already in dark mode, this is a no-op. If the OS is light
+    but the user wants the tray menu themed to match the app's dark icon,
+    ForceDark gets that result without affecting the rest of Windows.
+
+    No-op on non-Windows or if the uxtheme ordinals don't resolve (defensive
+    against future Windows builds that might rename them)."""
+    if sys.platform != "win32":
+        return
+    try:
+        uxtheme = ctypes.windll.uxtheme
+        # Resolve by ordinal — these functions are name-less exports.
+        SetPreferredAppMode = uxtheme[135]
+        SetPreferredAppMode.argtypes = [ctypes.c_int]
+        SetPreferredAppMode.restype = ctypes.c_int
+        FlushMenuThemes = uxtheme[136]
+        FlushMenuThemes.argtypes = []
+        FlushMenuThemes.restype = ctypes.c_int
+
+        SetPreferredAppMode(2)  # ForceDark
+        FlushMenuThemes()
+        log.info("Dark-mode menus enabled (uxtheme SetPreferredAppMode = ForceDark)")
+    except (AttributeError, OSError) as e:
+        log.warning("Could not enable dark-mode menus (uxtheme ordinal lookup failed): %s", e)
+
+
+# ── About + Update-check dialogs (called from Settings) ──────────────────
+# As of v1.7.0 these are invoked exclusively from buttons inside the Settings
+# dialog — not from the tray right-click menu. That means they render as
+# CHILD dialogs of the Settings Tk root rather than spawning their own
+# top-level root, and the parent's dialog-slot (already held by Settings)
+# covers them too — no separate slot mgmt needed.
+
+def _show_about(parent_root):
+    """Open a modeless About window as a child of `parent_root`.
+
+    Modeless = no `grab_set`, no `transient`, no `-topmost`. The user can
+    click away to other windows while About stays visible, and can dismiss
+    it whenever — same affordance as a typical About dialog in Office, VS
+    Code, etc. Replaces the prior `messagebox.showinfo` which was
+    application-modal and stole focus until dismissed."""
     try:
         import tkinter as tk
-        from tkinter import messagebox
-        _set_dpi_awareness()
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
         cfg = load_config()
         idle_min = int(cfg.get("idle_blank_minutes", 0) or 0)
         idle_line = f"{idle_min} min" if idle_min > 0 else "off"
-        messagebox.showinfo(
-            "About Display Off",
+
+        about = tk.Toplevel(parent_root)
+        about.title("About Display Off")
+        about.configure(bg=_THEME_BG)
+        about.resizable(False, False)
+        # Deliberately NOT transient(parent_root) and NOT -topmost — those
+        # would make the window stay above its parent and steal focus on
+        # parent activation. We want fully independent z-order.
+        _apply_dark_titlebar(about)
+
+        body_text = (
             f"Display Off v{__version__}\n\n"
             "Tiny tray utility to power off all monitors\n"
             "without putting the PC to sleep.\n\n"
             f"Hotkey: {hotkey_display_name(cfg)}\n"
             f"Lock on blank: {'on' if cfg.get('lock_on_off') else 'off'}\n"
             f"Auto-blank when idle: {idle_line}\n"
-            f"Autostart: {'on' if autostart_enabled() else 'off'}\n\n"
-            "https://github.com/itsnateai/displayoff",
-            parent=root,
+            f"Autostart: {'on' if autostart_enabled() else 'off'}"
         )
-        root.destroy()
+        body = tk.Label(about, text=body_text, justify="left",
+                        font=("Segoe UI", 10),
+                        bg=_THEME_BG, fg=_THEME_FG,
+                        padx=20, pady=15)
+        body.pack()
+
+        # Clickable GitHub link styled as a label with hand cursor.
+        link = tk.Label(about, text="https://github.com/itsnateai/displayoff",
+                        font=("Segoe UI", 9, "underline"),
+                        bg=_THEME_BG, fg="#4ec9ff", cursor="hand2",
+                        padx=20, pady=(0, 10))
+        link.pack()
+        link.bind("<Button-1>",
+                  lambda _: webbrowser.open("https://github.com/itsnateai/displayoff"))
+
+        btn_frame = tk.Frame(about, bg=_THEME_BG)
+        btn_frame.pack(pady=(0, 15))
+        close_btn = tk.Button(btn_frame, text="Close", command=about.destroy,
+                              font=("Segoe UI", 9), width=10,
+                              bg=_THEME_BTN_BG, fg=_THEME_BTN_FG,
+                              activebackground=_THEME_BTN_ACTIVE_BG,
+                              activeforeground=_THEME_BTN_ACTIVE_FG,
+                              relief="flat", borderwidth=1,
+                              highlightthickness=1, highlightbackground=_THEME_SEP)
+        close_btn.pack()
+        # Enter / Escape both close the window.
+        about.bind("<Return>", lambda _: about.destroy())
+        about.bind("<Escape>", lambda _: about.destroy())
+
+        # Center on screen.
+        about.update_idletasks()
+        w, h = about.winfo_reqwidth(), about.winfo_reqheight()
+        x = (about.winfo_screenwidth() - w) // 2
+        y = (about.winfo_screenheight() - h) // 2
+        about.geometry(f"+{x}+{y}")
+        close_btn.focus_set()
     except Exception as e:
         log.exception("About dialog crashed: %s", e)
-    finally:
-        _release_dialog_slot()
 
 
-def _run_update_check():
-    """Hit GitHub releases API and show a result dialog. Same Tk-root discipline as About."""
+def _run_update_check(parent_root):
+    """Hit the GitHub releases API and show a result dialog as a child of
+    `parent_root`. Synchronous — the network call (~3s typical, 5s timeout)
+    blocks the Tk event loop. Acceptable for a Settings-driven user action."""
     try:
-        has_update, latest, html_url, err = check_for_updates()
-        import tkinter as tk
         from tkinter import messagebox
-        _set_dpi_awareness()
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        has_update, latest, html_url, err = check_for_updates()
         if err:
-            messagebox.showwarning(
-                "Display Off",
-                f"Could not check for updates.\n\n{err}\n\n"
-                "Verify your internet connection and try again.",
-                parent=root,
-            )
+            err_text = str(err)
+            # GitHub returns 404 for both "private repo with no auth" and
+            # "no releases tagged yet" — they look identical to an
+            # unauthenticated caller. Spell out both possibilities instead
+            # of the generic "check your internet" message.
+            if "404" in err_text or "Not Found" in err_text:
+                msg = (
+                    "Could not check for updates — GitHub returned 404 (Not Found).\n\n"
+                    "This usually means one of:\n"
+                    "  • The repository (itsnateai/displayoff) is private and the\n"
+                    "    update check has no authentication token.\n"
+                    "  • The repository exists but has no published releases yet —\n"
+                    "    update-check needs at least one tagged release to compare against.\n"
+                    "  • The repository or owner name has changed.\n\n"
+                    "Manage releases at:\n"
+                    "https://github.com/itsnateai/displayoff/releases\n\n"
+                    f"Raw error: {err_text}"
+                )
+            elif "timeout" in err_text.lower() or "timed out" in err_text.lower():
+                msg = (
+                    "Could not check for updates — request timed out.\n\n"
+                    "Verify your internet connection and try again. GitHub may\n"
+                    "also be experiencing an outage — check https://www.githubstatus.com/"
+                )
+            else:
+                msg = (
+                    f"Could not check for updates.\n\n{err_text}\n\n"
+                    "Verify your internet connection and try again."
+                )
+            messagebox.showwarning("Display Off", msg, parent=parent_root)
         elif has_update:
             if messagebox.askyesno(
                 "Display Off — Update available",
@@ -1089,7 +1523,7 @@ def _run_update_check():
                 f"Current: v{__version__}\n"
                 f"Latest:  v{latest}\n\n"
                 "Open the release page in your browser?",
-                parent=root,
+                parent=parent_root,
             ):
                 webbrowser.open(html_url or "https://github.com/itsnateai/displayoff/releases")
         else:
@@ -1098,13 +1532,10 @@ def _run_update_check():
                 f"You're on the latest release.\n\n"
                 f"Current: v{__version__}\n"
                 f"Latest:  v{latest}",
-                parent=root,
+                parent=parent_root,
             )
-        root.destroy()
     except Exception as e:
         log.exception("Update check dialog crashed: %s", e)
-    finally:
-        _release_dialog_slot()
 
 
 # ── Tray ───────────────────────────────────────────────────────────────────
@@ -1113,6 +1544,43 @@ def run_tray():
     """Run as a system tray application."""
     import pystray
     from pystray import MenuItem, Menu
+
+    # Eagerly recover from any stale native-blank sentinel BEFORE doing
+    # anything else. If a prior run was killed mid-blank (BSOD, power
+    # loss, Task Manager kill), the display-off timeout is still 1s and
+    # the user is one idle-second away from a constant-blanking loop.
+    # The blank path itself runs this on every fire, but if the user
+    # launches displayoff and doesn't immediately blank, the broken state
+    # persists for the whole session. Calling here closes that window.
+    # Safe no-op when no sentinel is on disk.
+    try:
+        from native_blank import recover_stale_sentinel
+        recover_stale_sentinel()
+    except ImportError as e:
+        log.warning("native_blank not available at startup (%s) — skipping stale-sentinel recovery", e)
+
+    # Force dark-mode native menus for this process. Must happen BEFORE
+    # pystray creates the tray icon so the menu rendering picks up the
+    # theme on its first display. Safe no-op on non-Windows or if the
+    # private uxtheme ordinals ever change.
+    _enable_dark_mode_menus()
+
+    # Capture the NotifyIconSettings subkey baseline BEFORE pystray registers
+    # the icon (Shell_NotifyIcon NIM_ADD). Any subkey that appears after this
+    # snapshot is a Phase-2 orphan-claim candidate. Captured here, used by
+    # the background promoter below. Safe on non-Win11 (returns None).
+    #
+    # tray_promoter is UX polish — never a crash surface. If the module is
+    # missing or fails to import, log it and proceed with no promotion (the
+    # icon will land in Win11's overflow flyout instead of the main tray).
+    try:
+        from tray_promoter import capture_baseline, promote_in_background
+        tray_baseline = capture_baseline()
+        _promote_tray = True
+    except ImportError as e:
+        log.warning("tray_promoter not available (%s) — tray icon will land in Win11 overflow until manually promoted", e)
+        tray_baseline = None
+        _promote_tray = False
 
     if os.path.isfile(_ICON_PATH):
         from PIL import Image
@@ -1134,8 +1602,41 @@ def run_tray():
             _dialog_active = True
             return True
 
+    def _spawn_blank_thread(reason):
+        """All paths that should fire a blank go through here. Logs the reason
+        so we can see in displayoff.log which UI action triggered it (or which
+        action *didn't* fire when the user reports "nothing happened")."""
+        log.info("blank-trigger: %s — spawning turn_off_monitors thread", reason)
+        try:
+            t = threading.Thread(target=turn_off_monitors, daemon=True,
+                                 name=f"displayoff-blank-{reason}")
+            t.start()
+        except Exception as e:
+            log.exception("failed to spawn blank thread (%s): %s", reason, e)
+
     def on_turn_off(icon, item):
-        threading.Thread(target=turn_off_monitors, daemon=True).start()
+        _spawn_blank_thread("menu-turn-off")
+
+    # Hidden default-action item for left-click on the tray icon. pystray on
+    # Windows fires this on EVERY left-click (single, double, triple) — there
+    # is no separate single/double-click event in its API — so we measure the
+    # gap between clicks ourselves and only fire the blank when two clicks
+    # land within _DOUBLE_CLICK_WINDOW_SECS of each other. The first click of
+    # a pair stores a timestamp and exits without blanking.
+    last_icon_click = [0.0]
+    icon_click_lock = threading.Lock()
+
+    def on_icon_default_click(icon, item):
+        with icon_click_lock:
+            now = time.monotonic()
+            gap = now - last_icon_click[0]
+            log.info("icon-click: now=%.3f last=%.3f gap=%.3fs (window=%.1fs)",
+                     now, last_icon_click[0], gap, _DOUBLE_CLICK_WINDOW_SECS)
+            if last_icon_click[0] > 0 and gap <= _DOUBLE_CLICK_WINDOW_SECS:
+                last_icon_click[0] = 0.0  # consume the pair so a 3rd click doesn't combo
+                _spawn_blank_thread("icon-double-click")
+            else:
+                last_icon_click[0] = now
 
     def on_settings(icon, item):
         if not _claim_dialog():
@@ -1147,35 +1648,54 @@ def run_tray():
 
         threading.Thread(target=_open_settings, args=(icon, on_saved), daemon=True).start()
 
-    def on_about(icon, item):
-        if not _claim_dialog():
-            return
-        threading.Thread(target=_show_about, daemon=True).start()
-
-    def on_check_updates(icon, item):
-        if not _claim_dialog():
-            return
-        threading.Thread(target=_run_update_check, daemon=True).start()
-
     def on_quit(icon, item):
         icon.stop()
 
+    # Why no clickable "Turn Off Displays" menu item:
+    #
+    # In v1.6.0+ the blank routes through the Win32 native idle-display-off
+    # path (PowerWriteACValueIndex + PowerSetActiveScheme writing a 1-second
+    # timeout). On this developer's hardware (ASUS ROG Strix G614JV, Modern
+    # Standby + Intel UHD/RTX 4060 hybrid), the menu-item path fired the
+    # underlying call chain perfectly — idle counter accumulated past the
+    # threshold cleanly per GetLastInputInfo polling, nothing held the
+    # display awake per `powercfg /requests` — but the kernel did not act on
+    # the policy change. Double-click on the tray icon and the Ctrl+Alt+F12
+    # hotkey, which run the IDENTICAL code path, do trigger the blank
+    # reliably. The most plausible hypothesis is that `/setactive` is a
+    # lazy refresh that gets optimized away when the active scheme is
+    # unchanged, and the kernel only re-reads the policy when prodded by
+    # the right combination of state changes (the two working paths
+    # produce some side effect the menu path doesn't). Rather than ship a
+    # menu item that silently fails, we replace it with a disabled label
+    # documenting the two paths that work.
     menu = Menu(
         MenuItem(f"Display Off v{__version__}", None, enabled=False),
         Menu.SEPARATOR,
-        MenuItem("Turn Off Displays", on_turn_off),
-        MenuItem(lambda item: f"Hotkey: {hotkey_name[0]}", None, enabled=False),
+        MenuItem("Blank displays:", None, enabled=False),
+        MenuItem("  • Double-click this icon", None, enabled=False),
+        MenuItem(lambda item: f"  • {hotkey_name[0]}", None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("Settings...", on_settings),
-        MenuItem("Check for Updates...", on_check_updates),
-        MenuItem("About...", on_about),
         MenuItem("Quit", on_quit),
+        # Hidden item — not shown in the right-click menu, but `default=True`
+        # makes pystray route every left-click on the icon to this handler so
+        # we can apply double-click detection.
+        # NOTE: About and Check-for-Updates were moved out of this menu and
+        # into the Settings dialog footer in v1.7.0 — the right-click menu is
+        # now minimal (Settings + Quit), with the rest of the info/action
+        # buttons living inside Settings.
+        MenuItem("__icon_default__", on_icon_default_click, default=True, visible=False),
     )
 
+    # Tooltip is also the registry-key identity for Win11's tray-icon
+    # NotifyIconSettings — changing it invalidates any prior IsPromoted=1
+    # setting. Keep stable.
+    tray_tooltip = "Display Off"
     icon = pystray.Icon(
         name="displayoff",
         icon=icon_image,
-        title="Display Off — Click to sleep monitors",
+        title=tray_tooltip,
         menu=menu,
     )
 
@@ -1189,8 +1709,29 @@ def run_tray():
     if quit_handle:
         _watch_quit_event(quit_handle, lambda: icon.stop())
 
-    log.info("Running in system tray. Click icon or press %s to turn off displays.",
+    log.info("Running in system tray. Double-click icon or press %s to turn off displays.",
              hotkey_name[0])
+
+    # Win11 hides new tray icons in the overflow flyout by default. Auto-promote
+    # via the shared tray_promoter module (canonical pattern at
+    # _.claude/_templates/snippets/python/tray-icon-promoter.md). pystray uses
+    # pythonw.exe as the executable path, so the promoter matches on
+    # (ExecutablePath, tooltip) rather than path alone to distinguish from
+    # other Python tray apps the user might have. Guarded above against
+    # ImportError so a missing/broken tray_promoter module never crashes
+    # the tray (UX polish, never a crash surface).
+    if _promote_tray:
+        # max_wait_secs=None → poll for the full tray lifetime. Win11
+        # catalogs pystray icons lazily (often not until the user opens
+        # the tray overflow flyout for the first time), which can happen
+        # hours after launch. The promoter uses backoff (0.5s for the
+        # first minute, then 30s thereafter) so the CPU cost is negligible.
+        promote_in_background(
+            exe_path=sys.executable,
+            tooltip=tray_tooltip,
+            baseline=tray_baseline,
+            max_wait_secs=None,
+        )
 
     if first_run:
         # One-time welcome notification + persist defaults so this won't fire again.
@@ -1218,9 +1759,14 @@ def run_tray():
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main():
+    # File logging so pythonw.exe runs are debuggable. Without this, every
+    # log.* call below goes to a NullHandler and we have zero visibility.
+    _displayoff_log = os.path.join(_HERE, "displayoff.log")
     logging.basicConfig(
         level=logging.INFO,
-        format="[%(name)s] %(message)s",
+        format="[%(asctime)s] [%(name)s] %(message)s",
+        handlers=[logging.FileHandler(_displayoff_log, encoding="utf-8"),
+                  logging.StreamHandler()],
     )
 
     if "--version" in sys.argv:
@@ -1262,6 +1808,19 @@ def main():
     if "--no-lock-off" in sys.argv:
         log.info("Turning off displays (no lock)...")
         turn_off_monitors(lock_first=False)
+        return
+
+    if "--native-off" in sys.argv:
+        # Force the native idle-blank path regardless of config. Useful when
+        # the user has `use_legacy_sc_monitorpower: true` but wants to fire
+        # the native path explicitly (or vice-versa as `--legacy-off`).
+        log.info("Turning off displays via native idle path (forced)...")
+        turn_off_monitors(force_path="native")
+        return
+
+    if "--legacy-off" in sys.argv:
+        log.info("Turning off displays via legacy SC_MONITORPOWER path (forced)...")
+        turn_off_monitors(force_path="legacy")
         return
 
     # Tray modes need single-instance protection

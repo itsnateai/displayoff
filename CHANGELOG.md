@@ -1,5 +1,57 @@
 # Changelog — Display Off
 
+## [1.6.0] — 2026-05-14
+
+### UX
+
+- **Double-click the tray icon to blank.** Single-click is a no-op (opens menu / does nothing visible). Ctrl+Alt+F12 hotkey unchanged.
+- **No clickable "Turn Off Displays" menu item.** The right-click menu shows a disabled informational label documenting the two paths that work (double-click + hotkey). The clickable menu item was removed after empirical testing on the developer's hardware: the menu-item path ran the identical code chain as double-click and hotkey (verified via `displayoff.log` + `native_blank.log` instrumentation — same `_fire_native_idle_blank` → `blank_via_idle_path` → powercfg writes → idle counter accumulating past threshold per `GetLastInputInfo` polling, with `powercfg /requests` confirming nothing was holding the display awake), but the kernel never acted on the policy change for menu-triggered invocations. Hypothesis: `powercfg /setactive SCHEME_CURRENT` is a lazy refresh that gets optimized away when the active scheme is unchanged, and the kernel only re-reads the live policy when prodded by the right state changes — the two working paths produce some side effect the menu path doesn't. Rather than ship a silently-broken click, the item is now an informational label.
+- **Click-timing implementation:** pystray on Windows fires `default=True` menu items on every left-click (single, double, triple) — its API has no separate single-vs-double event. To get true double-click semantics, the tray menu includes a hidden `default=True` item (`visible=False`) that's routed to a click-gap handler. The handler measures the time between successive icon clicks and only fires the blank when two land within 500ms (matching Windows' `GetDoubleClickTime()`). First click records a timestamp and exits silently; second click within the window fires the blank and resets the pair.
+
+### Diagnostics
+
+- **`displayoff.log`** — new file-backed logger so pythonw.exe runs are debuggable. Records every blank trigger source (icon-double-click, menu-turn-off via the now-removed item, hotkey path) and lock-collision drops. Previously every `log.*` call under pythonw went to a NullHandler.
+- **`native_blank.py` import-path logging** — when imported by displayoff.py (rather than run as a script) it now attaches a FileHandler to its own logger so log entries still reach `native_blank.log`. Without this, blank invocations from the tray left zero forensic trail.
+- **Idle-counter sampling during the sleep window** — `_sleep_with_idle_log` polls `GetLastInputInfo` every 250ms and logs the idle-seconds samples. Made it possible to prove that the menu-item path's failure was NOT an idle-reset issue (samples cleanly accumulate past threshold) but a kernel-policy-refresh issue.
+
+### Hardening (from post-implementation multi-agent review)
+
+- **`_fire_native_idle_blank` no longer falls back to `SC_MONITORPOWER` on `ImportError`.** The whole reason v1.6.0 exists is that `SC_MONITORPOWER` cycles the display on affected hardware; silently falling back to it on a broken install would re-introduce the very bug v1.6.0 ships to fix. Now refuses to blank, logs loudly.
+- **`native_blank()` finally block is now resilient.** Previous version called `_write_display_timeouts(saved_ac, saved_dc)` followed by `_clear_sentinel()`. If powercfg failed during restore, the un-wrapped `RuntimeError` propagated out before `_clear_sentinel()` could run — leaving the sentinel orphaned on disk forever. Wrapped in try/except; verifies values match before clearing sentinel; logs manual-recovery command if restore fails.
+- **`_recover_from_stale_sentinel` deletes corrupt/invalid sentinels.** Previous version logged a warning and left the unreadable file in place; every subsequent launch hit the same wall and bailed. Now deletes the unreadable file so the system can recover from a one-shot corruption.
+- **Hidden powercfg subprocess windows.** Under `pythonw.exe`, every `subprocess.run("powercfg.exe", ...)` call was allocating a fresh console window, producing ~10 visible terminal flashes per blank invocation. Added `creationflags=CREATE_NO_WINDOW` + `STARTUPINFO(dwFlags=STARTF_USESHOWWINDOW, wShowWindow=SW_HIDE)` in `native_blank._run_powercfg`. The window churn was also resetting Windows' idle-input counter, preventing the native blank from firing — hiding the subprocesses fixed both symptoms.
+
+### Changed
+
+- **Native idle-blank is now the default mechanism** for *every* blank trigger: tray icon click, tray menu "Turn Off Displays" item, Ctrl+Alt+F12 hotkey, idle-blank watcher, and `--off` / `--lock-and-off` / `--no-lock-off` / `--start-off` CLI flags. All paths now route through `turn_off_monitors()` which dispatches to `_fire_native_idle_blank()` by default and to the legacy `_fire_sc_monitorpower()` only when explicitly opted in.
+- **Production blank window** in `_fire_native_idle_blank()` is **5 seconds** (down from the 8s test-harness default in `native_blank.py`). Bumped from the originally-planned 2.5s after empirical "menu click → no blank" reports — when the user navigates the right-click menu, the mouse moves continuously and the kernel's idle counter keeps resetting, so a tight window of 2.5s left no time for the kernel to cross the 1s threshold. 5s tolerates ~3s of post-click motion. Combined with the 0.5s pre-blank settle (`_NATIVE_PROD_SETTLE_SECS`), the dispatcher lock is held ~5.5s per blank — silently dropped duplicate triggers are now explicitly logged in `displayoff.log`.
+
+### New
+
+- **`use_legacy_sc_monitorpower` config key** (default `false`) — set to `true` in `displayoff_config.json` to force every blank trigger back to the v1.0–v1.5 `SC_MONITORPOWER` behavior. Useful on hardware where the legacy path works fine and you want the slightly faster blank (~0.5s vs ~1–2s).
+- **`--native-off` CLI flag** — forces the native idle-blank path regardless of config. Identity-clear opt-in for scripts/shortcuts that must blank via this path no matter what.
+- **`--legacy-off` CLI flag** — forces `SC_MONITORPOWER` regardless of config. Symmetric counterpart to `--native-off`, useful for testing or for users who want one-shot legacy behavior without mutating their config.
+- **`force_path` parameter** on `turn_off_monitors()` — `"native"` / `"legacy"` / `None` (honor config). Both new CLI flags route through the unified dispatcher so they inherit the single-instance lock, RDP early-return, and `lock_first` handling.
+
+### Why this is the right default
+
+The v1.5.0 changelog explained why the native path is required on some hardware (Modern Standby + hybrid GPU laptops where `SC_MONITORPOWER` triggers a wake-handshake loop). v1.6.0 takes the conclusion to its logical end: native is strictly safer (works on every Windows version since Win95, is OEM-driver-friendly, uses the same code path as the built-in Settings dropdown). The only downside is a ~1-second-slower blank, which doesn't matter for the "click and walk away" use case. Users on hardware where `SC_MONITORPOWER` is fine can opt back in with one config key.
+
+## [1.5.0] — 2026-05-14
+
+### New Features
+
+- **`--native-off` CLI flag** — turns off displays via Windows' own idle-display-off code path instead of `SC_MONITORPOWER`. Temporarily writes `GUID_VIDEO_POWERDOWN_TIMEOUT = 1s` via `PowerWriteACValueIndex` + `PowerSetActiveScheme`, waits ~8s for the kernel to fire its native idle-blank, then restores the original AC/DC timeouts. No `SC_MONITORPOWER` message is sent — uses the exact mechanism wired to **Settings ▸ Power ▸ "Turn off the display after N minutes."** Required on hardware where `SC_MONITORPOWER` triggers a wake-handshake loop (verified on ASUS ROG Strix G614JV with Modern Standby + Intel UHD/RTX 4060 hybrid GPU, where 20× SC_MONITORPOWER events fired in 38s with no input recovery).
+- **`native_blank.py`** — standalone helper module with three modes:
+  - `--read` — print current AC/DC display-off timeouts (zero risk, no writes)
+  - `--toggle` — write 1s timeouts, sleep 0.5s (too short to actually blank), restore (plumbing test)
+  - `--blank` — full sequence with 8s blank window and 6s "hands off keyboard/mouse" countdown
+  - Crash-safe: writes a sentinel file before changing timeouts; uses `try/finally` + `atexit` + sentinel-based recovery on next launch so a hard kill mid-run cannot leave the user stuck with a 1-second display timeout. Logs to `native_blank.log`.
+
+### Why a second code path
+
+`SC_MONITORPOWER` is the documented, canonical API and works on virtually every Windows PC. But on certain Modern Standby + hybrid-GPU laptops, the userland-message → kernel-power-policy handoff lands in a no-recovery wake loop. The native idle-display-off path (the one the Settings dropdown writes to) has been working reliably on every Windows version since Win95 and is OEM-driver-friendly. `--native-off` is the safe fallback for users on affected hardware. `--off` and `--lock-and-off` continue to use `SC_MONITORPOWER` for backward compatibility on hardware where it works fine.
+
 ## [1.4.0] — 2026-05-08
 
 ### New Features

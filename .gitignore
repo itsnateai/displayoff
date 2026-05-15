@@ -35,6 +35,7 @@ venv/
 
 # Config (may contain personal paths)
 *.cfg
+displayoff_config.json
 
 # Environment
 .env
