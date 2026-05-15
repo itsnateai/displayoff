@@ -24,6 +24,7 @@ import ctypes
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -347,6 +348,7 @@ def _create_startup_lnk():
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0  # SW_HIDE
+    log.info("Creating startup shortcut: target=%s args=%s lnk=%s", py, script, _STARTUP_LNK_PATH)
     proc = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
         capture_output=True, text=True, timeout=10,
@@ -356,6 +358,19 @@ def _create_startup_lnk():
     if proc.returncode != 0:
         raise OSError(f"Could not create startup shortcut (PowerShell rc={proc.returncode}): "
                       f"{proc.stderr.strip() or proc.stdout.strip()}")
+    # Verify-back: PS rc=0 doesn't guarantee the file landed on disk (AV quarantine,
+    # COM Save silent no-op on locked-down profiles, etc.). Same pattern as our
+    # GH-release post-publish verify-back. If the file isn't there, raise so the
+    # caller surfaces an error instead of silently leaving autostart broken.
+    if not os.path.exists(_STARTUP_LNK_PATH):
+        raise OSError(
+            f"PowerShell reported success (rc=0) but {_STARTUP_LNK_PATH} does not exist. "
+            f"Possible causes: antivirus quarantine, restricted profile, or "
+            f"PowerShell execution policy. stdout={proc.stdout.strip()!r} "
+            f"stderr={proc.stderr.strip()!r}"
+        )
+    log.info("Startup shortcut created: %s (%d bytes)",
+             _STARTUP_LNK_PATH, os.path.getsize(_STARTUP_LNK_PATH))
 
 
 def _remove_startup_lnk():
@@ -364,9 +379,12 @@ def _remove_startup_lnk():
     if os.path.exists(_STARTUP_LNK_PATH):
         try:
             os.remove(_STARTUP_LNK_PATH)
+            log.info("Removed startup shortcut: %s", _STARTUP_LNK_PATH)
         except OSError as e:
             log.warning("Could not remove startup shortcut: %s", e)
             raise
+    else:
+        log.info("Remove startup shortcut: no-op (already absent at %s)", _STARTUP_LNK_PATH)
 
 
 def _legacy_run_key_present():
@@ -412,6 +430,8 @@ def set_autostart(enabled):
     .lnk and cleans up any legacy HKCU Run entry from prior versions.
 
     Raises OSError on creation failure."""
+    log.info("set_autostart(%s) — current state: lnk=%s legacy=%s",
+             enabled, os.path.exists(_STARTUP_LNK_PATH), _legacy_run_key_present())
     if enabled:
         _create_startup_lnk()
         # If user had the legacy registry entry from v1.6.0, clean it up so
@@ -1298,13 +1318,18 @@ def _open_settings_impl(tray_icon, on_saved):
             )
             return False
         # Autostart is a separate side effect; don't fail the save on its failure.
+        # Catch broadly — Tk's default report_callback_exception writes to
+        # stderr, which is /dev/null under pythonw.exe, so a NameError /
+        # TimeoutExpired / etc. would otherwise vanish silently and the user
+        # would see "Save did nothing" with no error dialog and no log entry.
         try:
             if bool(autostart_var.get()) != autostart_enabled():
                 set_autostart(bool(autostart_var.get()))
-        except OSError as e:
+        except Exception as e:
+            log.exception("Autostart toggle failed")
             messagebox.showerror(
                 "Display Off",
-                f"Settings saved, but autostart toggle failed:\n{e}",
+                f"Settings saved, but autostart toggle failed:\n{type(e).__name__}: {e}",
                 parent=root,
             )
         start_hotkey_listener(cfg)
