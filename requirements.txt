@@ -1,3 +1,7 @@
-pystray==0.19.5
-Pillow==12.2.0
+packaging==26.2
+pillow==12.2.0
 pynput==1.8.1
+pystray==0.19.5
+setuptools==82.0.1
+six==1.17.0
+wheel==0.47.0
