@@ -25,6 +25,7 @@ to put the timeouts back before anything else runs.
 
 import argparse
 import atexit
+import contextlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -65,13 +66,32 @@ if sys.platform == "win32":
         _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
     _user32 = ctypes.windll.user32
-    _kernel32 = ctypes.windll.kernel32
+    # use_last_error=True so CreateMutexW's LastError survives ctypes' GIL
+    # release into ctypes.get_last_error(). Without it, a stray Python GIL
+    # cycle between CreateMutexW(...) and a separate GetLastError() binding
+    # could clobber the value with an unrelated syscall.
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _GetLastInputInfo = _user32.GetLastInputInfo
     _GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
     _GetLastInputInfo.restype = wintypes.BOOL
     _GetTickCount = _kernel32.GetTickCount
     _GetTickCount.argtypes = []
     _GetTickCount.restype = wintypes.DWORD
+
+    # Named-mutex bindings — cross-process serialization for the blank path
+    # (sentinel file + powercfg writes). See _blank_mutex below.
+    _CreateMutexW = _kernel32.CreateMutexW
+    _CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    _CreateMutexW.restype = wintypes.HANDLE
+    _WaitForSingleObject = _kernel32.WaitForSingleObject
+    _WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _WaitForSingleObject.restype = wintypes.DWORD
+    _ReleaseMutex = _kernel32.ReleaseMutex
+    _ReleaseMutex.argtypes = [wintypes.HANDLE]
+    _ReleaseMutex.restype = wintypes.BOOL
+    _CloseHandle = _kernel32.CloseHandle
+    _CloseHandle.argtypes = [wintypes.HANDLE]
+    _CloseHandle.restype = wintypes.BOOL
 
     def _idle_secs():
         info = _LASTINPUTINFO()
@@ -81,8 +101,59 @@ if sys.platform == "win32":
         elapsed = (_GetTickCount() - info.dwTime) & 0xFFFFFFFF
         return elapsed / 1000.0
 else:
+    _CreateMutexW = None
+    _WaitForSingleObject = None
+    _ReleaseMutex = None
+    _CloseHandle = None
+
     def _idle_secs():
         return -1.0
+
+
+# Win32 wait-result sentinels (mirror displayoff.py)
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_BLANK_MUTEX_NAME = r"Local\DisplayOff_NativeBlank"
+
+
+@contextlib.contextmanager
+def _blank_mutex(timeout_ms=0):
+    """Acquire the cross-process blank mutex. Yields True if acquired, False
+    if another displayoff process is already inside the blank path.
+
+    Serializes powercfg writes + sentinel manipulation across the tray AND
+    CLI invocations of native_blank. Without this, `python native_blank.py
+    --blank` run while the tray is mid-blank would read the in-flight
+    sentinel as "stale crash recovery" and clobber the saved AC/DC values,
+    leaving the user stuck with a 1-second display-off timeout.
+
+    WAIT_ABANDONED (previous owner crashed without releasing) is treated as
+    a successful acquire — the next call to `_recover_from_stale_sentinel`
+    will detect and restore from the orphaned sentinel.
+    """
+    if sys.platform != "win32" or _CreateMutexW is None:
+        yield True
+        return
+    h = _CreateMutexW(None, False, _BLANK_MUTEX_NAME)
+    if not h:
+        # Resource exhaustion / sandbox ACL on Local\ namespace. The tray-side
+        # _turn_off_lock still serializes per-process; cross-process race is
+        # the residual risk. Log loudly and proceed rather than hard-fail.
+        log.warning("native-blank mutex create failed (lastError=%d) — proceeding without cross-process guard",
+                    ctypes.get_last_error())
+        yield True
+        return
+    try:
+        rc = _WaitForSingleObject(h, timeout_ms)
+        if rc not in (_WAIT_OBJECT_0, _WAIT_ABANDONED):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _ReleaseMutex(h)
+    finally:
+        _CloseHandle(h)
 
 
 def _sleep_with_idle_log(sleep_seconds, poll_interval=0.25):
@@ -121,13 +192,19 @@ def _setup_logging():
     RotatingFileHandler bounds growth at 1 MB × 3 backups to match
     displayoff.log's policy — a 24/7 tray that fires idle-blank N times/day
     would otherwise grow this file unbounded across the process lifetime.
+
+    Under pythonw.exe sys.stderr is None and a bare StreamHandler() noisily
+    fails every emit (caught by handleError but wasteful) — only attach it
+    when there's a real stream behind it.
     """
+    handlers = [RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000,
+                                    backupCount=3, encoding="utf-8")]
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(message)s",
-        handlers=[RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000,
-                                      backupCount=3, encoding="utf-8"),
-                  logging.StreamHandler()],
+        handlers=handlers,
     )
 
 
@@ -303,10 +380,18 @@ def recover_stale_sentinel():
     user never sees the "why is my screen blanking constantly?" moment
     after an abrupt prior termination.
 
+    Mutex-guarded: if another displayoff process is mid-blank when we
+    start up, its sentinel is in-flight rather than stale — skip rather
+    than clobber.
+
     Idempotent: no-op if there's no sentinel on disk. Safe to call from
     any thread."""
     _ensure_module_logger_has_filehandler()
-    _recover_from_stale_sentinel()
+    with _blank_mutex(timeout_ms=0) as acquired:
+        if not acquired:
+            log.info("another displayoff process owns the native-blank mutex — skipping eager sentinel recovery (its sentinel is in-flight, not stale)")
+            return
+        _recover_from_stale_sentinel()
 
 
 def blank_via_idle_path(sleep_seconds=None, hands_off_countdown=0):
@@ -323,12 +408,16 @@ def blank_via_idle_path(sleep_seconds=None, hands_off_countdown=0):
     log.info("blank_via_idle_path called from PID %d (import path)", os.getpid())
     if sleep_seconds is None:
         sleep_seconds = _BLANK_SLEEP_SECONDS
-    try:
-        _recover_from_stale_sentinel()
-        native_blank(sleep_seconds, dry_label="display blank", hands_off_countdown=hands_off_countdown)
-    except Exception:
-        log.exception("blank_via_idle_path raised")
-        raise
+    with _blank_mutex(timeout_ms=0) as acquired:
+        if not acquired:
+            log.warning("another displayoff process owns the native-blank mutex — skipping this fire")
+            return False
+        try:
+            _recover_from_stale_sentinel()
+            native_blank(sleep_seconds, dry_label="display blank", hands_off_countdown=hands_off_countdown)
+        except Exception:
+            log.exception("blank_via_idle_path raised")
+            raise
     return not os.path.exists(_SENTINEL_PATH)
 
 
@@ -446,22 +535,32 @@ def main():
     args = parser.parse_args()
 
     _setup_logging()
-    _recover_from_stale_sentinel()
 
     if args.read:
+        # --read is truly read-only (powercfg /query); no sentinel, no
+        # mutex needed. Run even if another process is mid-blank.
         ac, dc, scheme = _read_display_timeouts()
         log.info("scheme=%s  AC display-off=%ds (%d min)  DC display-off=%ds (%d min)",
                  scheme, ac, ac // 60, dc, dc // 60)
         return 0
 
-    if args.toggle:
-        native_blank(_TOGGLE_SLEEP_SECONDS, dry_label="plumbing test")
-        return 0
+    # --toggle / --blank manipulate the sentinel and powercfg state.
+    # Serialize against any concurrent tray instance via the named mutex.
+    with _blank_mutex(timeout_ms=0) as acquired:
+        if not acquired:
+            log.error("another displayoff process owns the native-blank mutex — refusing to start "
+                      "a concurrent blank that would clobber the in-flight sentinel. Try again in a few seconds.")
+            return 2
+        _recover_from_stale_sentinel()
 
-    if args.blank:
-        native_blank(_BLANK_SLEEP_SECONDS, dry_label="real blank",
-                     hands_off_countdown=_BLANK_HANDS_OFF_COUNTDOWN_SECONDS)
-        return 0
+        if args.toggle:
+            native_blank(_TOGGLE_SLEEP_SECONDS, dry_label="plumbing test")
+            return 0
+
+        if args.blank:
+            native_blank(_BLANK_SLEEP_SECONDS, dry_label="real blank",
+                         hands_off_countdown=_BLANK_HANDS_OFF_COUNTDOWN_SECONDS)
+            return 0
 
     parser.error("internal: no mode selected")
 

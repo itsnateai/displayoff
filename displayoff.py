@@ -67,6 +67,9 @@ _DOUBLE_CLICK_WINDOW_SECS = 0.5 # Treat two icon clicks within this window as a 
                                 # Matches Windows' default GetDoubleClickTime() of ~500ms. The hidden
                                 # default-action menu item is fired by pystray on every left-click on
                                 # Windows (not just double-click), so we time the gap ourselves.
+_IDLE_REFIRE_COOLDOWN_SECS = 60 # Minimum gap between idle-watcher fires. Prevents rapid mouse-jitter
+                                # loops from re-firing the blank in quick succession (the wider `fired`
+                                # flag handles the common case, this is the belt-and-suspenders pair).
 _NATIVE_PROD_SLEEP_SECS = 5.0   # How long the native idle-blank path holds the 1s timeout in production.
                                 # Bumped from 2.5s after empirical "menu click → no blank" reports: when the user
                                 # navigates the right-click menu, the mouse moves continuously and the kernel's
@@ -85,7 +88,13 @@ if sys.platform == "win32":
     import ctypes.wintypes
 
     _user32 = ctypes.windll.user32
-    _kernel32 = ctypes.windll.kernel32
+    # use_last_error=True: ctypes captures the Win32 LastError into a thread-
+    # local IMMEDIATELY after the call returns, before the GIL release or any
+    # other ctypes call can clobber it. Without this, `GetLastError()` from a
+    # separate binding can race with Python's own kernel calls between
+    # CreateMutexW(...) and the error check, returning a misleading value.
+    # Read the saved value via `ctypes.get_last_error()` at the call site.
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _shell32 = ctypes.windll.shell32
 
     # ── user32 ──
@@ -120,6 +129,11 @@ if sys.platform == "win32":
     GetLastInputInfo = _user32.GetLastInputInfo
     GetLastInputInfo.argtypes = [ctypes.c_void_p]  # POINTER(LASTINPUTINFO)
     GetLastInputInfo.restype = ctypes.wintypes.BOOL
+
+    # HWND is pointer-sized; default c_int restype truncates on 64-bit.
+    GetParent = _user32.GetParent
+    GetParent.argtypes = [ctypes.wintypes.HWND]
+    GetParent.restype = ctypes.wintypes.HWND
 
     # ── kernel32 ──
     # HANDLE is pointer-sized; restype must be HANDLE (not int) on 64-bit.
@@ -169,6 +183,7 @@ else:
     GetSystemMetrics = None
     LockWorkStation = None
     GetLastInputInfo = None
+    GetParent = None
     CreateMutexW = None
     CreateEventW = None
     OpenEventW = None
@@ -213,7 +228,7 @@ def _acquire_single_instance():
     if sys.platform != "win32":
         return True
     _mutex_handle = CreateMutexW(None, True, _MUTEX_NAME)
-    last_error = GetLastError()
+    last_error = ctypes.get_last_error()
     if not _mutex_handle:
         # CreateMutexW failed entirely — no guard at all. Treat as "another
         # instance might be running" rather than risk launching a second tray.
@@ -1022,6 +1037,7 @@ def _start_idle_watcher(cfg_provider, poll_secs=15):
     """
     def _watch():
         fired = False
+        last_fire = 0.0
         while True:
             time.sleep(poll_secs)
             try:
@@ -1031,6 +1047,15 @@ def _start_idle_watcher(cfg_provider, poll_secs=15):
                 if threshold <= 0:
                     fired = False
                     continue
+                # Hard cooldown: never re-fire within _IDLE_REFIRE_COOLDOWN_SECS
+                # of the previous fire, regardless of idle state. The `fired`
+                # flag normally handles this (stays True while idle ≥ threshold,
+                # resets when user input drops it below), but the cooldown is a
+                # defense-in-depth belt against any future edit that reshapes
+                # the fired-reset semantics, and against rapid mouse-jitter loops
+                # that could otherwise bounce the blank in quick succession.
+                if time.monotonic() - last_fire < _IDLE_REFIRE_COOLDOWN_SECS:
+                    continue
                 idle = _idle_seconds()
                 if idle < threshold:
                     fired = False
@@ -1038,6 +1063,7 @@ def _start_idle_watcher(cfg_provider, poll_secs=15):
                 if fired:
                     continue
                 fired = True
+                last_fire = time.monotonic()
                 log.info("Idle %.0fs ≥ %ds threshold — blanking displays.", idle, threshold)
                 threading.Thread(target=turn_off_monitors, daemon=True).start()
             except Exception as e:
@@ -1079,7 +1105,7 @@ def _signal_other_to_quit():
         if SetEvent(h):
             return "signaled"
         log.warning("SetEvent failed (err=%d) — instance found but could not be signaled.",
-                    GetLastError())
+                    ctypes.get_last_error())
         return "error"
     finally:
         CloseHandle(h)
@@ -1107,7 +1133,7 @@ def _watch_quit_event(handle, on_signaled):
                     log.warning("Quit handler raised: %s", e)
             elif result == _WAIT_FAILED:
                 log.warning("WaitForSingleObject failed (err=%d) — quit watcher exiting.",
-                            GetLastError())
+                            ctypes.get_last_error())
             else:
                 log.warning("Unexpected WaitForSingleObject result %#x — quit watcher exiting.",
                             result)
@@ -1205,7 +1231,11 @@ def _apply_dark_titlebar(root):
         root.update_idletasks()
         hwnd_inner = root.winfo_id()
         # The actual top-level HWND is the inner widget's parent in Tk.
-        hwnd = ctypes.windll.user32.GetParent(hwnd_inner) or hwnd_inner
+        # GetParent goes through the bound-name block (argtypes/restype set)
+        # rather than ctypes.windll.* which defaults to c_int and truncates
+        # HWNDs above 2GB on 64-bit. Bound name per workspace constraint:
+        # "Never call ctypes.windll.* directly outside the bindings block".
+        hwnd = GetParent(hwnd_inner) or hwnd_inner
         dwmapi = ctypes.windll.dwmapi
         # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 on Win10 2004+ / Win11.
         # Earlier Win10 builds (1903–1909) used 19 — try 20 first, fall back
@@ -2109,10 +2139,17 @@ def main():
     _file_handler = RotatingFileHandler(
         _displayoff_log, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
     )
+    # Under pythonw.exe sys.stderr is None — StreamHandler() defaults to
+    # sys.stderr and every emit would call None.write(...), which logging's
+    # handleError catches but noisily. Only attach the StreamHandler when
+    # there's a real stream behind it.
+    _handlers = [_file_handler]
+    if sys.stderr is not None:
+        _handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(name)s] %(message)s",
-        handlers=[_file_handler, logging.StreamHandler()],
+        handlers=_handlers,
     )
 
     if "--version" in sys.argv:
