@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 log = logging.getLogger("displayoff")
 
@@ -297,10 +297,44 @@ def hotkey_display_name(cfg):
 _RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _RUN_VALUE_NAME = "DisplayOff"
 
-_STARTUP_DIR = os.path.join(os.environ.get("APPDATA", ""),
-                            r"Microsoft\Windows\Start Menu\Programs\Startup")
+# PowerShell subprocess timeout for shortcut create/read. 30s tolerates slow
+# first-launch PS JIT, group-policy evaluation, and AV file-creation hooks.
+# Was 10s — bumped after v1.7.0 audit flagged cold-boot Win11 24H2 first-PS
+# launch can exceed 10s, raising subprocess.TimeoutExpired (which is NOT
+# OSError — would have escaped the v1.6.0 `except OSError` guard silently).
+_PS_AUTOSTART_TIMEOUT_SECS = 30
+
+# APPDATA is set on every supported Windows configuration (interactive logon,
+# service-account, even safe-mode). If it's somehow missing we explicitly
+# refuse to build a startup-folder path rather than silently joining onto an
+# empty string, which would produce a CWD-relative path that `os.path.exists`
+# would happily check against random files in the working directory and that
+# `_create_startup_lnk` would silently write outside the user's actual
+# Startup folder. Functions below raise OSError with a clear message if this
+# is unset.
+_APPDATA_DIR = os.environ.get("APPDATA", "")
+_STARTUP_DIR = (
+    os.path.join(_APPDATA_DIR, r"Microsoft\Windows\Start Menu\Programs\Startup")
+    if _APPDATA_DIR else ""
+)
 _STARTUP_LNK_NAME = "Display Off.lnk"
-_STARTUP_LNK_PATH = os.path.join(_STARTUP_DIR, _STARTUP_LNK_NAME)
+_STARTUP_LNK_PATH = (
+    os.path.join(_STARTUP_DIR, _STARTUP_LNK_NAME) if _STARTUP_DIR else ""
+)
+
+
+def _require_appdata():
+    """Raise OSError with a clear message if APPDATA isn't set. Called by every
+    autostart function that touches the Startup folder so the user sees a
+    real error instead of silent writes to a CWD-relative path."""
+    if not _APPDATA_DIR or not _STARTUP_LNK_PATH:
+        raise OSError(
+            "APPDATA environment variable is not set — cannot resolve the "
+            "Windows Startup folder. This is unexpected; restart with a "
+            "fully-initialized user environment, or run via the .lnk that "
+            "Display Off creates in your Startup folder (which Explorer "
+            "launches with APPDATA populated)."
+        )
 
 
 def _autostart_target_pythonw():
@@ -314,54 +348,101 @@ def _autostart_target_pythonw():
     return py
 
 
-def _create_startup_lnk():
-    """Create the `Display Off.lnk` shortcut in the user's Startup folder.
-    Uses PowerShell + `WScript.Shell` COM (the same WSH COM API every other
-    tray app in this workspace uses). PowerShell spawn is hidden via
-    CREATE_NO_WINDOW + STARTUPINFO so there's no console flash.
+def _ps_sq_escape(s):
+    """Escape a string for embedding inside a PowerShell single-quoted literal.
+    PS single-quotes are literal-preserving for everything EXCEPT the single
+    quote itself, which is escaped by doubling it. Windows paths can legally
+    contain `'` (e.g., `C:\\Users\\O'Brien\\...`), so without this every
+    interpolated path is a one-character injection vector waiting to happen."""
+    return s.replace("'", "''")
 
-    Raises OSError on PowerShell failure or missing icon."""
+
+def _ps_run(ps_script, *, timeout=_PS_AUTOSTART_TIMEOUT_SECS):
+    """Run a PowerShell one-liner with hidden window + no profile. Returns
+    `CompletedProcess`. Raises OSError on `FileNotFoundError` (powershell
+    missing from PATH — PSCore-stripped systems) or `TimeoutExpired` (slow
+    profile load / AV scan / GPO eval). Both of those are NOT subclasses of
+    OSError in Python's hierarchy, so without this wrapping they would have
+    escaped the v1.7.0 broadened `except Exception` guard in `_apply_settings`
+    only to land in a generic "unknown error" dialog. Translating to OSError
+    keeps the documented contract truthful."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    try:
+        return subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            startupinfo=si,
+        )
+    except FileNotFoundError as e:
+        raise OSError(
+            "powershell.exe not found on PATH — required for Startup-folder "
+            "shortcut management. Ensure Windows PowerShell 5.1 is installed "
+            f"(default on Win10/11). Underlying error: {e}"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise OSError(
+            f"PowerShell timed out after {timeout}s while managing the Startup "
+            f"shortcut. Possible causes: slow first-launch JIT, AV real-time "
+            f"scanning, Group Policy script-block-logging delay, or a stuck "
+            f"profile load. Underlying error: {e}"
+        ) from e
+
+
+def _create_startup_lnk():
+    """Create (or overwrite) the `Display Off.lnk` shortcut in the user's
+    Startup folder. Uses PowerShell + `WScript.Shell` COM. Idempotent —
+    re-running refreshes the .lnk to point at the current `pythonw.exe`,
+    which is how we recover from a Python upgrade that invalidated the
+    previous shortcut's target.
+
+    Raises OSError on PowerShell failure, timeout, missing PATH, or post-
+    write verify-back failure (file not on disk after rc=0 — AV quarantine
+    or locked-down profile)."""
     if sys.platform != "win32":
         raise OSError("startup-folder shortcut is Windows-only")
+    _require_appdata()
     script = os.path.abspath(__file__)
     py = _autostart_target_pythonw()
     working_dir = os.path.dirname(script)
     icon_path = os.path.join(working_dir, "displayoff.ico")
 
-    # PowerShell here-string keeps the script readable. Single-quoted PS
-    # strings preserve everything literally except `''` (double-up escape),
-    # so paths with backslashes don't need extra quoting. The Arguments
-    # field gets a single-quoted PS string whose CONTENT is a double-quoted
-    # path — that's how the .lnk records the arg with quotes around it.
+    # Escape EVERY interpolated value for the PS single-quoted-literal context.
+    # PS single-quotes preserve backslashes but treat `'` as terminator — paths
+    # with apostrophes (legal NTFS: `C:\Users\O'Brien\...`) would otherwise
+    # break the script or inject arbitrary PS. `_ps_sq_escape` doubles every
+    # `'` per PS literal rules. The Arguments field's content also gets
+    # escaped because the inner double-quotes wrap a value that goes into a
+    # *different* PS string parser (verified by Sonnet+Opus audit 2026-05-14).
+    lnk_q = _ps_sq_escape(_STARTUP_LNK_PATH)
+    py_q = _ps_sq_escape(py)
+    script_q = _ps_sq_escape(script)
+    wd_q = _ps_sq_escape(working_dir)
+    icon_q = _ps_sq_escape(icon_path)
     ps_script = (
         f"$sh = New-Object -ComObject WScript.Shell; "
-        f"$lnk = $sh.CreateShortcut('{_STARTUP_LNK_PATH}'); "
-        f"$lnk.TargetPath = '{py}'; "
-        f"$lnk.Arguments = '\"{script}\"'; "
-        f"$lnk.WorkingDirectory = '{working_dir}'; "
-        f"$lnk.IconLocation = '{icon_path},0'; "
+        f"$lnk = $sh.CreateShortcut('{lnk_q}'); "
+        f"$lnk.TargetPath = '{py_q}'; "
+        f"$lnk.Arguments = '\"{script_q}\"'; "
+        f"$lnk.WorkingDirectory = '{wd_q}'; "
+        f"$lnk.IconLocation = '{icon_q},0'; "
         f"$lnk.WindowStyle = 7; "
         f"$lnk.Description = 'Display Off - tray app autostart'; "
         f"$lnk.Save()"
     )
 
-    si = subprocess.STARTUPINFO()
-    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 0  # SW_HIDE
     log.info("Creating startup shortcut: target=%s args=%s lnk=%s", py, script, _STARTUP_LNK_PATH)
-    proc = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-        capture_output=True, text=True, timeout=10,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-        startupinfo=si,
-    )
+    proc = _ps_run(ps_script)
     if proc.returncode != 0:
         raise OSError(f"Could not create startup shortcut (PowerShell rc={proc.returncode}): "
                       f"{proc.stderr.strip() or proc.stdout.strip()}")
-    # Verify-back: PS rc=0 doesn't guarantee the file landed on disk (AV quarantine,
-    # COM Save silent no-op on locked-down profiles, etc.). Same pattern as our
-    # GH-release post-publish verify-back. If the file isn't there, raise so the
-    # caller surfaces an error instead of silently leaving autostart broken.
+    # Verify-back: PS rc=0 doesn't guarantee the file landed on disk (AV
+    # quarantine, COM Save silent no-op on locked-down profiles, etc.). Same
+    # pattern as our GH-release post-publish verify-back: "reported success"
+    # is not the same as "exists on disk". If the file isn't there, raise so
+    # the caller surfaces an error instead of silently leaving autostart broken.
     if not os.path.exists(_STARTUP_LNK_PATH):
         raise OSError(
             f"PowerShell reported success (rc=0) but {_STARTUP_LNK_PATH} does not exist. "
@@ -369,41 +450,78 @@ def _create_startup_lnk():
             f"PowerShell execution policy. stdout={proc.stdout.strip()!r} "
             f"stderr={proc.stderr.strip()!r}"
         )
+    if proc.stderr.strip():
+        # rc=0 but stderr has content: usually deprecation warnings or profile
+        # noise. Log so future regressions in the PS environment are noticed.
+        log.debug("PowerShell rc=0 but stderr present: %s", proc.stderr.strip()[:300])
     log.info("Startup shortcut created: %s (%d bytes)",
              _STARTUP_LNK_PATH, os.path.getsize(_STARTUP_LNK_PATH))
 
 
 def _remove_startup_lnk():
     """Remove the Display Off.lnk shortcut from the user's Startup folder.
-    No-op if the file doesn't exist."""
+    TOCTOU-safe — handles `FileNotFoundError` gracefully if the file is
+    removed by another process between our existence check and the unlink.
+    Includes a post-removal verify-back to catch the rare case where
+    `os.remove` reports success but the file persists (sync-software
+    replication, OneDrive, AV restore-from-quarantine)."""
+    _require_appdata()
+    try:
+        os.remove(_STARTUP_LNK_PATH)
+        log.info("Removed startup shortcut: %s", _STARTUP_LNK_PATH)
+    except FileNotFoundError:
+        # Already gone — TOCTOU race or manual delete. Treat as success.
+        log.info("Remove startup shortcut: already absent at %s", _STARTUP_LNK_PATH)
+        return
+    except OSError as e:
+        log.warning("Could not remove startup shortcut: %s", e)
+        raise
+    # Verify-back symmetric to _create_startup_lnk's. Catches the case where
+    # `os.remove` returns but sync-software (OneDrive / Syncthing) or AV
+    # restore-from-quarantine puts the .lnk back. User explicitly disabled
+    # autostart, so a re-appearing .lnk is a real bug they need to know about.
     if os.path.exists(_STARTUP_LNK_PATH):
-        try:
-            os.remove(_STARTUP_LNK_PATH)
-            log.info("Removed startup shortcut: %s", _STARTUP_LNK_PATH)
-        except OSError as e:
-            log.warning("Could not remove startup shortcut: %s", e)
-            raise
-    else:
-        log.info("Remove startup shortcut: no-op (already absent at %s)", _STARTUP_LNK_PATH)
+        raise OSError(
+            f"Removed {_STARTUP_LNK_PATH} but it reappeared on disk — likely "
+            f"OneDrive/Syncthing replication or AV restore-from-quarantine. "
+            f"Disable Startup-folder sync, or remove the source copy."
+        )
 
 
 def _legacy_run_key_present():
-    """True if the legacy HKCU\\...\\Run\\DisplayOff entry exists. Used both
-    for backward-compat detection in `autostart_enabled` and for cleanup
-    when we migrate a user from the registry path to the .lnk path."""
+    """True if the legacy HKCU\\...\\Run\\DisplayOff entry exists, False if it
+    doesn't, raises OSError on PermissionError so callers can distinguish
+    "definitely absent" from "I can't tell" (locked hive / Group Policy).
+    Used both for backward-compat detection in `autostart_enabled` and for
+    cleanup when we migrate a user from the registry path to the .lnk path.
+
+    NOTE: `autostart_enabled()` and `set_autostart()` catch this so a locked
+    hive doesn't break those paths — the read is best-effort there."""
     if winreg is None:
         return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH) as key:
             winreg.QueryValueEx(key, _RUN_VALUE_NAME)
         return True
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
+        # Key or value definitely doesn't exist — clean "absent" answer.
         return False
+    except PermissionError as e:
+        # Locked hive / Group Policy. Don't pretend it's absent.
+        log.warning("HKCU Run key read failed (PermissionError): %s — migration "
+                    "cleanup cannot run; legacy entry may still fire at logon", e)
+        raise
+    except OSError as e:
+        # Generic registry error — also can't tell.
+        log.warning("HKCU Run key read failed (%s: %s)", type(e).__name__, e)
+        raise
 
 
 def _delete_legacy_run_key():
     """Remove the legacy HKCU\\...\\Run\\DisplayOff entry if present.
-    No-op if not present. Doesn't raise — the cleanup is best-effort."""
+    No-op if not present. Logs (does NOT raise) on permission/registry
+    errors — cleanup is best-effort and the caller (`set_autostart`)
+    treats this as a non-fatal side-effect."""
     if winreg is None:
         return
     try:
@@ -412,35 +530,116 @@ def _delete_legacy_run_key():
             winreg.DeleteValue(key, _RUN_VALUE_NAME)
         log.info("Removed legacy HKCU Run\\%s autostart entry (migrated to Startup-folder .lnk)",
                  _RUN_VALUE_NAME)
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
+        # Already absent — clean no-op.
         pass
+    except PermissionError as e:
+        log.warning("Could not delete legacy HKCU Run\\%s — PermissionError "
+                    "(locked hive or Group Policy): %s. Legacy entry may still "
+                    "fire at logon alongside the new .lnk.", _RUN_VALUE_NAME, e)
+    except OSError as e:
+        log.warning("Could not delete legacy HKCU Run\\%s (%s): %s. Legacy entry "
+                    "may still fire at logon alongside the new .lnk.",
+                    _RUN_VALUE_NAME, type(e).__name__, e)
+
+
+def _read_lnk_target_path():
+    """Read the `TargetPath` field of the existing startup .lnk via the same
+    `WScript.Shell` COM API used to create it. Returns the resolved path
+    string, or None on any failure (file missing, PS missing, COM error).
+    Used by `autostart_enabled()` to detect a stale .lnk pointing to a
+    Python install that no longer exists or has moved.
+
+    NOT load-bearing — if this returns None we treat the .lnk as unverifiable
+    and let the caller decide; the typical caller path re-writes the .lnk
+    via `_create_startup_lnk` which is idempotent."""
+    if sys.platform != "win32" or not _STARTUP_LNK_PATH or not os.path.exists(_STARTUP_LNK_PATH):
+        return None
+    lnk_q = _ps_sq_escape(_STARTUP_LNK_PATH)
+    ps_script = (
+        f"$sh = New-Object -ComObject WScript.Shell; "
+        f"$lnk = $sh.CreateShortcut('{lnk_q}'); "
+        f"Write-Output $lnk.TargetPath"
+    )
+    try:
+        proc = _ps_run(ps_script, timeout=10)
+    except OSError as e:
+        log.debug("Could not read .lnk target path: %s", e)
+        return None
+    if proc.returncode != 0:
+        log.debug("PS read of .lnk target failed (rc=%d): %s",
+                  proc.returncode, proc.stderr.strip() or proc.stdout.strip())
+        return None
+    return proc.stdout.strip() or None
 
 
 def autostart_enabled():
-    """True if Display Off is set to autostart. Checks the Startup-folder
-    .lnk (v1.7.0+ canonical) AND the legacy HKCU Run entry (v1.6.0 and
-    earlier) — either being present is "enabled"."""
+    """True if Display Off is currently configured to autostart at logon
+    AND the configuration points at a still-valid target.
+
+    Checks (in order):
+      1. Startup-folder .lnk exists AND its TargetPath matches our current
+         `_autostart_target_pythonw()` — a stale .lnk pointing at a moved
+         or uninstalled Python is treated as "not enabled" so the next
+         Save re-creates it correctly.
+      2. Legacy HKCU\\...\\Run\\DisplayOff entry (v1.6.0 and earlier) —
+         either being present is "enabled" for migration purposes.
+
+    Returns False if APPDATA isn't set (so the Settings dialog can still
+    open even in an unusual environment — the toggle attempt will produce
+    a clear error rather than silently checking against an empty path)."""
+    if not _STARTUP_LNK_PATH:
+        return False
     if os.path.exists(_STARTUP_LNK_PATH):
-        return True
-    return _legacy_run_key_present()
+        # Validate the target matches our current Python install. If it
+        # doesn't, the .lnk is stale (e.g., Python upgraded from 3.13 to
+        # 3.14 and the old path doesn't exist anymore) — don't claim
+        # "enabled" when the .lnk wouldn't actually launch us at logon.
+        target = _read_lnk_target_path()
+        if target is None:
+            # Couldn't read it — assume valid and let the user reconcile
+            # via a manual Save toggle if it turns out to be broken.
+            return True
+        expected = _autostart_target_pythonw()
+        if os.path.normcase(os.path.abspath(target)) == \
+           os.path.normcase(os.path.abspath(expected)):
+            return True
+        log.info("Stale startup shortcut: target=%r but current Python is %r — "
+                 "treating as 'not enabled' so next Save re-creates it.",
+                 target, expected)
+        return False
+    try:
+        return _legacy_run_key_present()
+    except OSError:
+        # Can't read the legacy key (locked hive / Group Policy). Assume
+        # not enabled — at worst the user re-toggles to force a refresh.
+        return False
 
 
 def set_autostart(enabled):
-    """Enable or disable autostart. Writes to the Startup folder as a
-    .lnk and cleans up any legacy HKCU Run entry from prior versions.
+    """Enable or disable autostart. Writes to the Startup folder as a .lnk
+    and cleans up any legacy HKCU Run entry from prior versions.
 
-    Raises OSError on creation failure."""
+    Raises OSError on .lnk creation/removal failure (including PowerShell
+    missing from PATH, PS timeout, post-write verify-back failure, and
+    sync-software-restored-removed-file). Legacy registry cleanup is
+    best-effort and never raises (warnings go to displayoff.log)."""
+    try:
+        legacy_state = _legacy_run_key_present()
+    except OSError:
+        legacy_state = "unreadable"
     log.info("set_autostart(%s) — current state: lnk=%s legacy=%s",
-             enabled, os.path.exists(_STARTUP_LNK_PATH), _legacy_run_key_present())
+             enabled, os.path.exists(_STARTUP_LNK_PATH) if _STARTUP_LNK_PATH else "no-appdata",
+             legacy_state)
     if enabled:
         _create_startup_lnk()
         # If user had the legacy registry entry from v1.6.0, clean it up so
-        # autostart fires from exactly one place.
+        # autostart fires from exactly one place. Best-effort.
         _delete_legacy_run_key()
     else:
         _remove_startup_lnk()
         # Also clear any legacy entry, even when "disabling" — the user
-        # clicked off, they want autostart off, period.
+        # clicked off, they want autostart off, period. Best-effort.
         _delete_legacy_run_key()
 
 
@@ -1255,6 +1454,18 @@ def _open_settings_impl(tray_icon, on_saved):
     _set_dpi_awareness()
 
     root = tk.Tk()
+    # Route Tk callback exceptions through our logger BEFORE any other
+    # callback wiring. Tk's default `report_callback_exception` writes the
+    # traceback to sys.stderr, which under `pythonw.exe` has no console —
+    # so any uncaught exception in a button command (Save / Apply / About
+    # / Updates), a key-bind, an `after()` callback, or a hotkey-recording
+    # event would silently evaporate. This single line ensures every
+    # swallowed exception lands in `displayoff.log` instead of /dev/null.
+    # (Defense #2 from `memory/reference_tk_callback_silent_under_pythonw.md`.)
+    def _log_tk_callback_exc(exc_type, exc_val, exc_tb):
+        log.error("Tk callback exception (Settings dialog)",
+                  exc_info=(exc_type, exc_val, exc_tb))
+    root.report_callback_exception = _log_tk_callback_exc
     # Hide the window IMMEDIATELY so the user never sees the default
     # light-mode Tk chrome flash before our dark theme + DWM dark title bar
     # apply. We re-show (deiconify) only after every widget is built, the
@@ -1317,11 +1528,13 @@ def _open_settings_impl(tray_icon, on_saved):
                 parent=root,
             )
             return False
-        # Autostart is a separate side effect; don't fail the save on its failure.
-        # Catch broadly — Tk's default report_callback_exception writes to
-        # stderr, which is /dev/null under pythonw.exe, so a NameError /
-        # TimeoutExpired / etc. would otherwise vanish silently and the user
-        # would see "Save did nothing" with no error dialog and no log entry.
+        # Autostart is a separate side effect — config is already persisted
+        # whether or not this succeeds. Catch broadly: Tk's default
+        # `report_callback_exception` writes to stderr, which is /dev/null
+        # under pythonw.exe, so a NameError / TimeoutExpired / etc. would
+        # otherwise vanish silently and the user would see "Save did nothing"
+        # with no error dialog and no log entry.
+        autostart_ok = True
         try:
             if bool(autostart_var.get()) != autostart_enabled():
                 set_autostart(bool(autostart_var.get()))
@@ -1329,13 +1542,28 @@ def _open_settings_impl(tray_icon, on_saved):
             log.exception("Autostart toggle failed")
             messagebox.showerror(
                 "Display Off",
-                f"Settings saved, but autostart toggle failed:\n{type(e).__name__}: {e}",
+                f"Settings saved, but autostart toggle failed:\n{type(e).__name__}: {e}\n\n"
+                f"The other settings were saved. Dismiss this dialog, then "
+                f"re-open Settings to retry the autostart toggle.",
                 parent=root,
             )
+            # Refresh the checkbox to the actual on-disk state so the user
+            # can see that the toggle didn't take effect when they re-open
+            # Settings. Avoids the v1.6.0 confusion of "I clicked, dialog
+            # closed, but next time it's unchecked again — Save is broken."
+            try:
+                autostart_var.set(autostart_enabled())
+            except Exception:
+                pass  # Tk var destroyed mid-error — fine, dialog is closing.
+            autostart_ok = False
         start_hotkey_listener(cfg)
         if on_saved:
             on_saved(cfg)
-        return True
+        # Keep dialog open on autostart failure so the user has a chance to
+        # retry without re-navigating from the tray menu. The hotkey/idle/
+        # lock settings are already persisted (the autostart try-block runs
+        # AFTER save_config), so the user doesn't lose those edits.
+        return autostart_ok
 
     def on_cancel():
         root.destroy()
@@ -1786,12 +2014,19 @@ def run_tray():
 def main():
     # File logging so pythonw.exe runs are debuggable. Without this, every
     # log.* call below goes to a NullHandler and we have zero visibility.
+    # RotatingFileHandler (v1.7.0+) prevents unbounded growth — a tray app
+    # logs every icon click, blank-trigger, listener-watchdog tick, and
+    # idle-watcher sample. Without rotation the log would grow ~MB/day on
+    # an active workstation. 1MB × 3 backups = ~4MB total budget.
+    from logging.handlers import RotatingFileHandler
     _displayoff_log = os.path.join(_HERE, "displayoff.log")
+    _file_handler = RotatingFileHandler(
+        _displayoff_log, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(name)s] %(message)s",
-        handlers=[logging.FileHandler(_displayoff_log, encoding="utf-8"),
-                  logging.StreamHandler()],
+        handlers=[_file_handler, logging.StreamHandler()],
     )
 
     if "--version" in sys.argv:

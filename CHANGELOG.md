@@ -1,5 +1,41 @@
 # Changelog — Display Off
 
+## [1.7.0] — 2026-05-14
+
+### Fixed
+
+- **"Run at Windows startup" + Save silently did nothing.** `_create_startup_lnk` referenced `subprocess.STARTUPINFO`, `subprocess.run`, and `subprocess.STARTF_USESHOWWINDOW` against an undefined name — `subprocess` was never imported at module top. Every Save click with the autostart checkbox ticked raised `NameError` inside Tk's button callback. Under `pythonw.exe` (no console), Tk's default `report_callback_exception` writes the traceback to a stderr that has nowhere to go, so the exception evaporated with no error dialog and no log entry. The Settings dialog stayed open because `root.destroy()` was never reached; the user saw "Save does nothing." Root-cause fix: `import subprocess` at module top, plus 3 layers of defense-in-depth listed below.
+
+### Changed (autostart subsystem hardening — Sonnet+Opus audit 2026-05-14)
+
+- **Switched from HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run registry entry to a `.lnk` shortcut in the user's Startup folder** (`%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\Display Off.lnk`). Matches how every other tray app in the workspace manages autostart (MicMute, SyncthingPause, MWBToggle, CapsNumTray, etc.) and is visible/manageable in File Explorer. Legacy HKCU Run entries from v1.6.0 are detected and removed automatically on first toggle (logged as `Removed legacy HKCU Run\\DisplayOff autostart entry (migrated to Startup-folder .lnk)`).
+- **`autostart_enabled()` now validates the .lnk's `TargetPath`** against the current `pythonw.exe` path resolved by `_autostart_target_pythonw()`. A stale shortcut pointing at a Python install that was upgraded or moved is treated as "not enabled" so the next Save automatically refreshes it instead of silently leaving autostart broken. Validation uses the same `WScript.Shell` COM API to read `TargetPath`; if reading fails (PS missing / COM error / timeout) we conservatively assume the .lnk is valid and let the next user-initiated Save reconcile.
+- **PowerShell single-quote injection in `_create_startup_lnk`** — every interpolated value (`_STARTUP_LNK_PATH`, `py`, `script`, `working_dir`, `icon_path`) is now run through new `_ps_sq_escape` helper which doubles every `'` per PS literal rules. Paths containing single-quotes (legal NTFS, e.g., `C:\\Users\\O'Brien\\...`) previously would have terminated the PS string early, producing either a parse error or — in a pathological hostile-path case — arbitrary PS execution.
+- **`_remove_startup_lnk` is now TOCTOU-safe** — uses `try: os.remove ... except FileNotFoundError: pass` instead of an `os.path.exists` precheck. Added a post-removal verify-back symmetric to the create-side verify, so a sync-software replication (OneDrive, Syncthing) or AV restore-from-quarantine putting the .lnk back gets surfaced as an error instead of silently flipping autostart back on at next logon.
+- **PowerShell timeout bumped 10s → 30s** via new `_PS_AUTOSTART_TIMEOUT_SECS` constant. 10s could fire `subprocess.TimeoutExpired` on cold-boot Win11 systems where first-launch PS JIT, group-policy script-block-logging, or AV real-time scanning briefly delay PS startup past the budget. `TimeoutExpired` is NOT an `OSError` subclass — it would have escaped the v1.6.0 `except OSError` guard silently.
+- **New `_ps_run` wrapper** catches `FileNotFoundError` (powershell.exe not on PATH — PSCore-stripped systems / locked-down profiles) and `subprocess.TimeoutExpired`, translating both to `OSError` with a clear diagnostic message so `set_autostart`'s "Raises OSError on creation failure" docstring contract is truthful.
+- **`_legacy_run_key_present` distinguishes `FileNotFoundError` (definitely absent) from `PermissionError` (locked hive / Group Policy / can't tell)** — previously broadly caught both as "absent" which silently broke the v1.6.0→v1.7.0 migration on locked profiles. Caller in `autostart_enabled()` still treats "can't tell" as "not enabled" (best-effort) but the warning lands in `displayoff.log` so a user with a locked Run hive can see why their legacy entry persists.
+- **`_delete_legacy_run_key` logs (does NOT raise) on `PermissionError`** — caller treats legacy cleanup as best-effort but the warning is now visible.
+- **`APPDATA` environment-variable check at module load** — if `APPDATA` is unset, `_STARTUP_LNK_PATH` is empty and every autostart function raises a clear `OSError("APPDATA environment variable is not set...")` instead of the v1.6.0 behavior of silently joining onto an empty string and writing/reading a CWD-relative path that wouldn't actually autostart.
+
+### Changed (Tk silent-failure prevention — applies to Settings, About, Updates dialogs)
+
+- **`root.report_callback_exception` is hooked to the logger** in `_open_settings_impl` immediately after `tk.Tk()`. Tk's default callback handler writes tracebacks to stderr, which is /dev/null under pythonw.exe — any exception in a button command, key bind, `after()` callback, or virtual-event handler that wasn't explicitly caught (e.g., a future `NameError`, an `AttributeError` on a pynput KeyCode shape change) would otherwise vanish with no log entry. With this hook, every Tk-callback exception now lands in `displayoff.log` with full traceback. This single line of defense protects every other button in the dialog (Cancel, About, Updates, GitHub link) without per-callback try/except boilerplate.
+- **`_apply_settings` autostart exception catch widened from `OSError` to `Exception`** with `log.exception` and a more informative messagebox that includes the exception type and prompts the user to re-open Settings and retry. `NameError`, `AttributeError`, `subprocess.TimeoutExpired`, and `TclError` are NOT `OSError` subclasses and would have escaped the v1.6.0 guard.
+- **`_apply_settings` now returns False on autostart failure** so the Settings dialog stays open for retry instead of destroying the root and forcing the user back to the tray menu. The autostart_var is also refreshed to the actual on-disk state via `autostart_var.set(autostart_enabled())` so the checkbox visually matches reality.
+
+### Added (observability)
+
+- **`log.info` instrumentation in every autostart entry/exit** — `set_autostart()` logs the desired state plus current `.lnk` and legacy-registry presence; `_create_startup_lnk()` logs the target/args/lnk paths before invocation and a post-create confirmation with byte size; `_remove_startup_lnk()` logs both the successful-remove and the no-op-already-absent path. Catches future regressions where a UI element claims success but no underlying state actually changed.
+- **PowerShell stderr-on-success is now logged at DEBUG level.** rc=0 with non-empty stderr is usually deprecation warnings or profile-script noise; previously thrown away silently.
+- **`displayoff.log` rotation** — switched from unbounded `FileHandler` to `RotatingFileHandler(maxBytes=1_000_000, backupCount=3)`. A tray app logs every icon click, blank-trigger, listener-watchdog tick, idle-watcher sample; unbounded growth was an inevitability waiting to bite an active user.
+- **Verify-back on `.lnk` creation** — `PowerShell rc=0` doesn't guarantee the file landed on disk (AV quarantine, COM `Save()` silent no-op on locked-down profiles, exec-policy edge cases). Post-write `os.path.exists` check raises `OSError` with a diagnostic message including stdout/stderr from the PS run. Same pattern as the post-publish GitHub release-asset verify-back used by the workspace's sibling tray apps.
+
+### Notes
+
+- The v1.6.0 `HKCU\\...\\Run\\DisplayOff` autostart code was the only path that ever shipped. The `.lnk`-based code in v1.6.0's source tree was staged but broken from the first commit (missing import, never tested via the Settings GUI under pythonw); no user ever successfully used the .lnk path on v1.6.0. v1.7.0 is the actual first working release of the Startup-folder shortcut migration.
+- Cross-stack pattern note `memory/reference_tk_callback_silent_under_pythonw.md` captures the Tk-silent-swallow trap for every sibling tray app in the workspace that uses Tk dialogs under pythonw — every one of them is a candidate for the same `report_callback_exception` hook.
+
 ## [1.6.0] — 2026-05-14
 
 ### UX
