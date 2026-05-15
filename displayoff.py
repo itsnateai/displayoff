@@ -1911,12 +1911,21 @@ def run_tray():
         tray_baseline = None
         _promote_tray = False
 
+    icon_image = None
     if os.path.isfile(_ICON_PATH):
         from PIL import Image
-        with Image.open(_ICON_PATH) as _im:
-            icon_image = _im.copy()
-    else:
-        log.warning("displayoff.ico not found — using programmatic fallback icon.")
+        try:
+            with Image.open(_ICON_PATH) as _im:
+                icon_image = _im.copy()
+        except Exception as e:
+            # Truncated / 0-byte / corrupt .ico (Syncthing partial, OneDrive
+            # placeholder, AV quarantine-restore mid-read). Lazy Image.open
+            # would have deferred this to pystray; .copy() forces eager load
+            # so we catch it here and fall through to the programmatic icon.
+            log.warning("displayoff.ico unreadable (%s) — using programmatic fallback icon.", e)
+    if icon_image is None:
+        if not os.path.isfile(_ICON_PATH):
+            log.warning("displayoff.ico not found — using programmatic fallback icon.")
         icon_image = _create_icon_image()
 
     cfg = load_config()
