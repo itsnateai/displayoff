@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 log = logging.getLogger("displayoff")
 
@@ -357,6 +357,18 @@ def _ps_sq_escape(s):
     return s.replace("'", "''")
 
 
+def _ps_dq_escape(s):
+    """Escape a string for embedding inside a PowerShell double-quoted literal
+    (or any context where `"` would close the surrounding quote). PS double-
+    quoted literals escape `"` by doubling it (or via backtick — we use the
+    portable doubling form). Windows paths can legally contain `"` (rare but
+    NTFS-legal), and the `.Arguments` field in our PS script wraps the script
+    path inside inner double-quotes so the .lnk records the arg with quotes
+    around it — without this escape, a path with `"` would break out of the
+    inner DQ context and could corrupt or inject into the surrounding PS SQ."""
+    return s.replace('"', '""')
+
+
 def _ps_run(ps_script, *, timeout=_PS_AUTOSTART_TIMEOUT_SECS):
     """Run a PowerShell one-liner with hidden window + no profile. Returns
     `CompletedProcess`. Raises OSError on `FileNotFoundError` (powershell
@@ -418,7 +430,13 @@ def _create_startup_lnk():
     # *different* PS string parser (verified by Sonnet+Opus audit 2026-05-14).
     lnk_q = _ps_sq_escape(_STARTUP_LNK_PATH)
     py_q = _ps_sq_escape(py)
-    script_q = _ps_sq_escape(script)
+    # script_q is embedded inside `'"{script_q}"'` — the OUTER context is PS
+    # single-quote (so `'` must be doubled), the INNER content is wrapped in
+    # double-quotes that the .lnk records literally (so any `"` in the path
+    # must also be doubled to survive PS DQ-parser semantics). Apply BOTH
+    # escapes; order matters only in that we treat them as independent
+    # character-class substitutions, which is what these helpers do.
+    script_q = _ps_dq_escape(_ps_sq_escape(script))
     wd_q = _ps_sq_escape(working_dir)
     icon_q = _ps_sq_escape(icon_path)
     ps_script = (
@@ -556,13 +574,26 @@ def _read_lnk_target_path():
     if sys.platform != "win32" or not _STARTUP_LNK_PATH or not os.path.exists(_STARTUP_LNK_PATH):
         return None
     lnk_q = _ps_sq_escape(_STARTUP_LNK_PATH)
+    # `$OutputEncoding = [Console]::OutputEncoding = ...UTF8` makes PS emit
+    # output without a BOM on Win10/11. Without this, `Write-Output` under
+    # `pythonw.exe` (no console) often prepends `﻿` to the first line,
+    # which makes the path comparison in `autostart_enabled()` fail forever
+    # → user sees "stale shortcut" log spam on every Settings open and the
+    # .lnk gets re-created every Save. Caught by Sonnet+Opus R2 audit
+    # 2026-05-14. Also strip BOM defensively in case PS env overrides the
+    # encoding directive.
     ps_script = (
+        f"$OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
         f"$sh = New-Object -ComObject WScript.Shell; "
         f"$lnk = $sh.CreateShortcut('{lnk_q}'); "
         f"Write-Output $lnk.TargetPath"
     )
     try:
-        proc = _ps_run(ps_script, timeout=10)
+        # Use the shared module timeout — was 10s hardcoded, which could fire
+        # on cold-boot Win11 where PS JIT exceeds 10s and silently flip the
+        # stale-detection to "couldn't read, assume valid" (false positive on
+        # the "still enabled?" path). Now consistent with create/remove.
+        proc = _ps_run(ps_script)
     except OSError as e:
         log.debug("Could not read .lnk target path: %s", e)
         return None
@@ -570,7 +601,9 @@ def _read_lnk_target_path():
         log.debug("PS read of .lnk target failed (rc=%d): %s",
                   proc.returncode, proc.stderr.strip() or proc.stdout.strip())
         return None
-    return proc.stdout.strip() or None
+    # Strip BOM + whitespace. `.lstrip('﻿')` is a no-op when absent.
+    target = proc.stdout.strip().lstrip("﻿").strip()
+    return target or None
 
 
 def autostart_enabled():
@@ -601,8 +634,15 @@ def autostart_enabled():
             # via a manual Save toggle if it turns out to be broken.
             return True
         expected = _autostart_target_pythonw()
-        if os.path.normcase(os.path.abspath(target)) == \
-           os.path.normcase(os.path.abspath(expected)):
+        # Use `realpath` not `abspath` — `realpath` resolves NTFS junctions,
+        # symlinks, and 8.3 short names (`C:\PROGRA~1\...` ↔ `C:\Program
+        # Files\...`). `WScript.Shell` sometimes returns the long form,
+        # sometimes the short form; without resolution the comparison
+        # spuriously returns False on systems with junction-redirected user
+        # profiles (Enterprise folder redirection) or on installs that
+        # happen to store Python under a path with a space. `normcase`
+        # then lower-cases for case-insensitive NTFS matching.
+        if _normalize_path(target) == _normalize_path(expected):
             return True
         log.info("Stale startup shortcut: target=%r but current Python is %r — "
                  "treating as 'not enabled' so next Save re-creates it.",
@@ -616,6 +656,21 @@ def autostart_enabled():
         return False
 
 
+def _normalize_path(path):
+    """Canonicalize a Windows path for equality comparison: resolve junctions
+    / symlinks / 8.3 short names via `realpath`, then `normcase` for
+    case-insensitive matching. Falls back to `abspath` + `normcase` if
+    `realpath` raises (e.g., target doesn't exist — comparing two
+    not-yet-resolved paths is still useful for the "are these the same
+    path string?" question)."""
+    if not path:
+        return ""
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except OSError:
+        return os.path.normcase(os.path.abspath(path))
+
+
 def set_autostart(enabled):
     """Enable or disable autostart. Writes to the Startup folder as a .lnk
     and cleans up any legacy HKCU Run entry from prior versions.
@@ -624,13 +679,18 @@ def set_autostart(enabled):
     missing from PATH, PS timeout, post-write verify-back failure, and
     sync-software-restored-removed-file). Legacy registry cleanup is
     best-effort and never raises (warnings go to displayoff.log)."""
+    # Build a string description for the log line — keep `_legacy_run_key_present`'s
+    # return contract a clean bool|raise and confine the "unreadable" sentinel
+    # to log presentation only. (Caught by Opus R2 audit: prior version
+    # rebound the same variable name to both bool and str, a future-refactor
+    # footgun where `if legacy_state:` would treat a locked hive as "present".)
     try:
-        legacy_state = _legacy_run_key_present()
+        legacy_desc = "present" if _legacy_run_key_present() else "absent"
     except OSError:
-        legacy_state = "unreadable"
+        legacy_desc = "unreadable"
     log.info("set_autostart(%s) — current state: lnk=%s legacy=%s",
              enabled, os.path.exists(_STARTUP_LNK_PATH) if _STARTUP_LNK_PATH else "no-appdata",
-             legacy_state)
+             legacy_desc)
     if enabled:
         _create_startup_lnk()
         # If user had the legacy registry entry from v1.6.0, clean it up so
@@ -1485,8 +1545,14 @@ def _open_settings_impl(tray_icon, on_saved):
     # ~90px of dead space below the footer after the v1.4.0 row decomposition.
 
     # Tk vars must be created after the root exists.
+    # Cache the initial autostart state so we don't spawn a fresh PS
+    # subprocess (~1-3s cold-boot) on every Save's change-detection. Refreshed
+    # only after a successful toggle. The dialog lifetime is short; if the
+    # autostart state changes externally during the dialog (vanishingly rare)
+    # the user's next Save reconciles via `_create_startup_lnk`'s idempotency.
+    autostart_state = {"enabled": autostart_enabled()}
     lock_var = tk.BooleanVar(value=bool(cfg.get("lock_on_off", False)))
-    autostart_var = tk.BooleanVar(value=autostart_enabled())
+    autostart_var = tk.BooleanVar(value=autostart_state["enabled"])
     idle_var = tk.IntVar(value=int(cfg.get("idle_blank_minutes", 0) or 0))
 
     # Build sections — row indices live here, so adding a row is a one-line change.
@@ -1535,26 +1601,36 @@ def _open_settings_impl(tray_icon, on_saved):
         # otherwise vanish silently and the user would see "Save did nothing"
         # with no error dialog and no log entry.
         autostart_ok = True
+        desired_autostart = bool(autostart_var.get())
         try:
-            if bool(autostart_var.get()) != autostart_enabled():
-                set_autostart(bool(autostart_var.get()))
+            # Compare against the cached state captured at dialog open —
+            # avoids re-spawning a PS subprocess just to answer "did the
+            # checkbox change?". `set_autostart` itself rechecks on-disk
+            # state for the actual write decision.
+            if desired_autostart != autostart_state["enabled"]:
+                set_autostart(desired_autostart)
+                autostart_state["enabled"] = desired_autostart
         except Exception as e:
             log.exception("Autostart toggle failed")
             messagebox.showerror(
                 "Display Off",
-                f"Settings saved, but autostart toggle failed:\n{type(e).__name__}: {e}\n\n"
-                f"The other settings were saved. Dismiss this dialog, then "
-                f"re-open Settings to retry the autostart toggle.",
+                f"Autostart toggle failed:\n{type(e).__name__}: {e}\n\n"
+                f"Your other settings were saved. Adjust and click Save "
+                f"again to retry — the dialog stays open.",
                 parent=root,
             )
             # Refresh the checkbox to the actual on-disk state so the user
-            # can see that the toggle didn't take effect when they re-open
-            # Settings. Avoids the v1.6.0 confusion of "I clicked, dialog
-            # closed, but next time it's unchecked again — Save is broken."
+            # sees the real state (not what they thought they'd set) and
+            # the cached state matches reality for the next change-check.
+            # Wrapped — Tk var destroyed mid-error would otherwise raise
+            # TclError which would route through report_callback_exception
+            # (now hooked) — harmless but noisy.
             try:
-                autostart_var.set(autostart_enabled())
+                actual = autostart_enabled()
+                autostart_var.set(actual)
+                autostart_state["enabled"] = actual
             except Exception:
-                pass  # Tk var destroyed mid-error — fine, dialog is closing.
+                pass
             autostart_ok = False
         start_hotkey_listener(cfg)
         if on_saved:

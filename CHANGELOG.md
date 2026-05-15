@@ -1,5 +1,26 @@
 # Changelog — Display Off
 
+## [1.7.1] — 2026-05-14
+
+Patch release closing the gaps surfaced by the v1.7.0 audit pair-set's R2 sweep. v1.7.0 introduced new helpers (`_ps_sq_escape`, `_read_lnk_target_path`, `_normalize_path`, etc.) which themselves carried second-order bugs — this release closes them before they reach production.
+
+### Fixed
+
+- **UTF-8 BOM in `_read_lnk_target_path` would have made stale-detection backfire** — `Write-Output` under `pythonw.exe` on Win11 can prepend a UTF-8 BOM (`﻿`) to the first line; the previous code's `.strip()` doesn't remove BOMs, so `os.path.normcase` comparison in `autostart_enabled()` would have failed forever (BOM-prefixed string never equals clean string). Symptom: every Settings open logs "Stale startup shortcut" and re-creates the .lnk on every Save. Fixed by adding `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` to the PS script (no-BOM directive) AND defensively stripping any residual BOM via `.lstrip("﻿")`.
+- **Double-quote injection in the `Arguments` field** — `_create_startup_lnk` embeds `script` inside an inner double-quoted context (`'"{script_q}"'`) but only ran `_ps_sq_escape`. A path containing `"` (legal NTFS, rare but possible) would break out of the inner DQ context. New `_ps_dq_escape` helper doubles `"` per PS DQ rules; `script` is now passed through `_ps_dq_escape(_ps_sq_escape(...))` for both contexts.
+- **`_read_lnk_target_path` hardcoded `timeout=10`** while every other PS call used `_PS_AUTOSTART_TIMEOUT_SECS = 30`. Cold-boot Win11 systems where PS JIT exceeds 10s would silently return `None` from the read, and `autostart_enabled()` would fall through to "assume valid" — a false-positive on the stale-detection path. Now uses the shared module constant via `_ps_run` default.
+- **`autostart_enabled()` path comparison missed NTFS junctions / 8.3 short names / symlinks** — `os.path.normcase(os.path.abspath(...))` doesn't resolve any of those. Enterprise folder-redirected user profiles, installs under `C:\PROGRA~1`, or `WScript.Shell.TargetPath` returning the short form would all spuriously trip stale-detection. New `_normalize_path()` helper uses `os.path.realpath` + `normcase` to canonicalize before comparison; falls back to `abspath` if `realpath` raises (e.g., target doesn't exist).
+- **`set_autostart()` introduced a `bool|str` type pollution** in the v1.7.0 commit — `legacy_state = _legacy_run_key_present()` could be `bool`, then on `OSError` rebound to `"unreadable"` (str). Harmless today (only used in log.info) but a footgun for future `if legacy_state:` refactors that would silently treat a locked hive as "present". Refactored to build a `legacy_desc` string for the log line only, keeping `_legacy_run_key_present`'s return contract a clean `bool|raise`.
+
+### Changed (UX)
+
+- **Settings dialog now caches the autostart on-disk state at open time** instead of re-spawning a PS subprocess on every Save's change-detection. Previously, opening Settings + clicking Save triggered TWO PS subprocesses to answer "did the checkbox change?" — each potentially adding multiple seconds to the dialog's response time on cold-boot systems.
+- **Autostart-failure messagebox text fixed.** v1.7.0's text told the user to "Dismiss this dialog, then re-open Settings to retry" — but v1.7.0 also changed `_apply_settings` to return `False` on autostart failure, which keeps the dialog open. The messagebox is now consistent: "Your other settings were saved. Adjust and click Save again to retry — the dialog stays open."
+
+### Docs
+
+- `CLAUDE.md` Tech Stack section now reflects v1.7.0+ reality — `.lnk` shortcut via PowerShell + `WScript.Shell` COM is canonical; `winreg` is retained for legacy-cleanup only. LOC count bumped from "~1200" to "~2200" (the autostart hardening grew the file).
+
 ## [1.7.0] — 2026-05-14
 
 ### Fixed
