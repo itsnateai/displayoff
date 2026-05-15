@@ -162,9 +162,13 @@ if sys.platform == "win32":
     CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
     CloseHandle.restype = ctypes.wintypes.BOOL
 
-    GetLastError = _kernel32.GetLastError
-    GetLastError.argtypes = []
-    GetLastError.restype = ctypes.wintypes.DWORD
+    # NOTE: there is NO bound `GetLastError = _kernel32.GetLastError` here.
+    # `_kernel32` was created with `use_last_error=True`, which means ctypes
+    # captures the Win32 LastError into a thread-local immediately after each
+    # call. Read it via `ctypes.get_last_error()`. Calling a bound
+    # `GetLastError()` via ctypes would itself reset that thread-local with
+    # the GetLastError syscall's own (zero) result — silently poisoning the
+    # saved value. Don't add the binding back; use `ctypes.get_last_error()`.
 
     # DWORD restype matters: defaults to signed c_int which goes negative
     # after ~24.8 days of uptime, breaking idle-time arithmetic silently.
@@ -190,7 +194,6 @@ else:
     SetEvent = None
     WaitForSingleObject = None
     CloseHandle = None
-    GetLastError = None
     GetTickCount = None
     IsUserAnAdmin = None
 
@@ -1045,22 +1048,31 @@ def _start_idle_watcher(cfg_provider, poll_secs=15):
                 threshold_min = int(cfg.get("idle_blank_minutes", 0) or 0)
                 threshold = threshold_min * 60
                 if threshold <= 0:
+                    # Feature disabled — reset both gates so a re-enable
+                    # within _IDLE_REFIRE_COOLDOWN_SECS of a prior fire
+                    # isn't blocked by stale cooldown state.
                     fired = False
-                    continue
-                # Hard cooldown: never re-fire within _IDLE_REFIRE_COOLDOWN_SECS
-                # of the previous fire, regardless of idle state. The `fired`
-                # flag normally handles this (stays True while idle ≥ threshold,
-                # resets when user input drops it below), but the cooldown is a
-                # defense-in-depth belt against any future edit that reshapes
-                # the fired-reset semantics, and against rapid mouse-jitter loops
-                # that could otherwise bounce the blank in quick succession.
-                if time.monotonic() - last_fire < _IDLE_REFIRE_COOLDOWN_SECS:
+                    last_fire = 0.0
                     continue
                 idle = _idle_seconds()
+                # Reset `fired` whenever the user is active. This MUST run
+                # before the cooldown gate — otherwise during the cooldown
+                # window `continue` short-circuits past this reset and
+                # `fired` stays True until the next idle-drop, which never
+                # happens if the user remains idle past cooldown expiry.
                 if idle < threshold:
                     fired = False
                     continue
                 if fired:
+                    continue
+                # Hard cooldown wall: never re-fire within
+                # _IDLE_REFIRE_COOLDOWN_SECS of the previous fire, regardless
+                # of idle state. Placed AFTER the `fired` reset so user
+                # activity during cooldown is still observed; placed BEFORE
+                # the fire so back-to-back fires from rapid mouse-jitter
+                # loops are suppressed. The `fired` flag carries the common
+                # case, this is the belt-and-suspenders pair.
+                if time.monotonic() - last_fire < _IDLE_REFIRE_COOLDOWN_SECS:
                     continue
                 fired = True
                 last_fire = time.monotonic()

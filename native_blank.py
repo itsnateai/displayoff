@@ -136,11 +136,26 @@ def _blank_mutex(timeout_ms=0):
         return
     h = _CreateMutexW(None, False, _BLANK_MUTEX_NAME)
     if not h:
-        # Resource exhaustion / sandbox ACL on Local\ namespace. The tray-side
-        # _turn_off_lock still serializes per-process; cross-process race is
-        # the residual risk. Log loudly and proceed rather than hard-fail.
-        log.warning("native-blank mutex create failed (lastError=%d) — proceeding without cross-process guard",
-                    ctypes.get_last_error())
+        # Resource exhaustion / sandbox ACL on Local\ namespace.
+        #
+        # Fail-open here is deliberate, and asymmetric with displayoff.py's
+        # _acquire_single_instance which fail-CLOSES on the same condition.
+        # The asymmetry is justified by stakes:
+        #   - Single-instance mutex protects against TWO concurrent trays
+        #     fighting over the icon, hotkey, and config writes. Cost of a
+        #     false-negative ("no other tray exists") is HIGH — duplicate
+        #     trays. Fail-closed is correct.
+        #   - Blank mutex protects against the rare CLI-vs-tray sentinel
+        #     clobber. Cost of a false-negative ("no other process is
+        #     blanking") is LOW — a one-shot race; sentinel recovery on the
+        #     next launch repairs it. The cost of fail-CLOSED would be a
+        #     user-initiated blank silently doing nothing — a UX cliff in
+        #     the common case to defend against a rare edge.
+        # Per-process tray-side _turn_off_lock still serializes within-process.
+        log.error("native-blank mutex create failed (lastError=%d) — proceeding without "
+                  "cross-process guard. Sentinel-clobber race possible if a peer process "
+                  "blanks concurrently; next-launch recovery will repair it.",
+                  ctypes.get_last_error())
         yield True
         return
     try:
