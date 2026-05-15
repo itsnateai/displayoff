@@ -27,6 +27,7 @@ import argparse
 import atexit
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import subprocess
@@ -115,11 +116,17 @@ log = logging.getLogger("native_blank")
 
 
 def _setup_logging():
-    """File-backed logging so pythonw.exe runs are still debuggable."""
+    """File-backed logging so pythonw.exe runs are still debuggable.
+
+    RotatingFileHandler bounds growth at 1 MB × 3 backups to match
+    displayoff.log's policy — a 24/7 tray that fires idle-blank N times/day
+    would otherwise grow this file unbounded across the process lifetime.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(_LOG_PATH, encoding="utf-8"),
+        handlers=[RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000,
+                                      backupCount=3, encoding="utf-8"),
                   logging.StreamHandler()],
     )
 
@@ -137,7 +144,7 @@ def _ensure_module_logger_has_filehandler():
     for h in log.handlers:
         if isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, "baseFilename", "")) == os.path.abspath(_LOG_PATH):
             return
-    fh = logging.FileHandler(_LOG_PATH, encoding="utf-8")
+    fh = RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s [import] %(message)s"))
     log.addHandler(fh)

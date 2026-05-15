@@ -1,5 +1,20 @@
 # Changelog — Display Off
 
+## [1.7.2] — 2026-05-15
+
+24/7-readiness pass. Three-agent parallel audit (native handles / Python heap+threading / OS resources) ran against v1.7.1 with the program now expected to stay resident continuously. Two agents returned SHIP with no findings; the OS-resource agent caught one real unbounded-growth path.
+
+### Fixed
+
+- **`native_blank.log` would grow unbounded over the process lifetime.** `native_blank.py` used plain `logging.FileHandler` at both setup sites (`_setup_logging` and `_ensure_module_logger_has_filehandler`), while the sibling `displayoff.log` already used `RotatingFileHandler(maxBytes=1_000_000, backupCount=3)` with an explicit comment about why. With native idle-blank now the default path (v1.6.0+) every blank trigger writes ~10–15 log lines (pre-blank settle, idle samples every 250 ms during the 5-8 s blank, post-restore); at ~10 fires/day that's ~12 KB/day, ~4 MB/year — slow but unbounded, and the policy mismatch with `displayoff.log` was the real signal. Both handlers now use `RotatingFileHandler` with the same 1 MB × 3 budget. The `isinstance(h, logging.FileHandler)` idempotency check is preserved (RotatingFileHandler is a FileHandler subclass).
+- **PIL `Image.open(_ICON_PATH)` held a file descriptor on `displayoff.ico` for the entire process lifetime.** PIL's lazy-load keeps the source fd open until the image is consumed or closed; pystray's consumption path doesn't guarantee a prompt close. On a 24/7 tray, that means the .ico file is locked against any in-place icon refresh or asset replacement for as long as the program runs. Wrapped in `with Image.open(...) as _im: icon_image = _im.copy()` to release the fd immediately while keeping the pixel data live.
+
+### Verified (no change)
+
+- **No native Win32 / GDI handle leaks.** No `SetThreadExecutionState` calls (ES_DISPLAY_REQUIRED balance is vacuously satisfied). No `CreateWindow` / `RegisterClass` / `GetDC` paths in `native_blank.py` — the "native" in the name refers to the kernel's native idle-blank policy chain, not a Win32 window. The single-instance mutex and quit-event are held once for process lifetime and reaped by the kernel on exit.
+- **No Python heap / threading retention.** Every `threading.Thread` is daemon-flagged; the watchdog, idle-watcher, and quit-watch are single-instance; per-blank thread spawn is gated by `_turn_off_lock.acquire(blocking=False)` so duplicates drop. `current_keys` is capped at 20 (`_KEY_TRACKER_OVERFLOW_CAP`). The `atexit.register` / `atexit.unregister` pattern in `native_blank.py` was already hardened against per-invocation accumulation (named function, unregister-in-finally) — a previous hardening pass that the audit confirmed still holds. Tk roots (Settings / About / Update-check) are destroyed on every close path; `root.after(50, poll_capture)` self-terminates when the pynput record-listener stops.
+- **`subprocess.run` calls are fully waited.** No `Popen` fire-and-forget anywhere. Config JSON I/O is atomic (`.tmp` + `os.replace`) and `with`-guarded.
+
 ## [1.7.1] — 2026-05-14
 
 Patch release closing the gaps surfaced by the v1.7.0 audit pair-set's R2 sweep. v1.7.0 introduced new helpers (`_ps_sq_escape`, `_read_lnk_target_path`, `_normalize_path`, etc.) which themselves carried second-order bugs — this release closes them before they reach production.

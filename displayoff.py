@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 
 log = logging.getLogger("displayoff")
 
@@ -1913,7 +1913,8 @@ def run_tray():
 
     if os.path.isfile(_ICON_PATH):
         from PIL import Image
-        icon_image = Image.open(_ICON_PATH)
+        with Image.open(_ICON_PATH) as _im:
+            icon_image = _im.copy()
     else:
         log.warning("displayoff.ico not found — using programmatic fallback icon.")
         icon_image = _create_icon_image()
