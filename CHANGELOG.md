@@ -1,5 +1,11 @@
 # Changelog — Display Off
 
+## [1.7.3] — 2026-05-16
+
+### Changed
+
+- **Tray icon redesigned for visibility on the Windows 11 dark taskbar.** The previous icon was a `(15, 15, 30)` dark navy disc with a `(100, 100, 200)` muted blue monitor outline and a small yellow moon. Against the `(32, 32, 32)` Win11 dark-mode taskbar the disc and the monitor outline both fell below the contrast threshold and the icon read as "a small yellow dot you could miss." Redesign keeps the dark-mode aesthetic (dark monitor + gold crescent moon) but adds a bright cyan rim (`(130, 200, 255)`) so the silhouette is legible on any background. Outer shape is a rounded square (~14% corner radius, Win11 app-icon convention) instead of a circle — fills more of the tray cell and sits flush with the surrounding rectangular tray slot rather than floating. Multi-size `.ico` re-baked: 16/20/24 are hand-drawn (the rim + monitor outline + moon all blurred together when downsampled from 256 at tray sizes, so the small variants now drop progressively — 16 is a dominant gold crescent with no monitor; 20/24 add a hinted monitor; 32+ use the full design). Programmatic fallback in `_create_icon_image()` synced to the same palette + shape so bare clones without `displayoff.ico` don't render a second-class icon. Previous .ico preserved at `displayoff.ico.pre-v171-vis.bak` for rollback if needed.
+
 ## [1.7.2] — 2026-05-15
 
 24/7-readiness pass. Three-agent parallel audit (native handles / Python heap+threading / OS resources) ran against v1.7.1 with the program now expected to stay resident continuously. Two agents returned SHIP with no findings; the OS-resource agent caught one real unbounded-growth path.

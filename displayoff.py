@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.2"
+__version__ = "1.7.3"
 
 log = logging.getLogger("displayoff")
 
@@ -1297,25 +1297,43 @@ def _set_dpi_awareness():
 
 
 def _create_icon_image():
-    """Fallback icon used only when displayoff.ico is missing (e.g. bare clone)."""
+    """Fallback icon used only when displayoff.ico is missing (e.g. bare clone).
+
+    Mirrors the 64px design baked into displayoff.ico (cyan-rimmed dark disc,
+    bright monitor outline, gold crescent moon) so bare clones don't look
+    second-class. If you redesign the .ico, keep this in sync — same palette,
+    same proportions — so users never see two different icons.
+    """
     from PIL import Image, ImageDraw
+
+    DARK_BG    = (18, 24, 40, 255)
+    RIM        = (130, 200, 255, 255)
+    MONITOR_FG = (235, 240, 250, 255)
+    MOON_GOLD  = (255, 210, 95, 255)
 
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Dark circle background
-    draw.ellipse([2, 2, size - 2, size - 2], fill=(15, 15, 30, 255))
+    # Rounded-square silhouette with a bright cyan rim. The rim is the
+    # load-bearing visibility element against the Win11 dark taskbar.
+    draw.rounded_rectangle([1, 1, size - 2, size - 2], radius=9,
+                           fill=DARK_BG, outline=RIM, width=3)
 
-    # Monitor shape
-    draw.rectangle([14, 16, 50, 40], outline=(100, 100, 200, 255), width=2)
-    # Stand
-    draw.rectangle([28, 42, 36, 48], fill=(100, 100, 200, 255))
-    draw.rectangle([22, 48, 42, 50], fill=(100, 100, 200, 255))
+    # Monitor frame (rounded rect)
+    draw.rounded_rectangle([14, 18, 50, 42], radius=3,
+                           outline=MONITOR_FG, width=2)
+    # Stand neck + base
+    draw.rectangle([29, 42, 35, 47], fill=MONITOR_FG)
+    draw.rounded_rectangle([22, 47, 42, 50], radius=1, fill=MONITOR_FG)
 
-    # Moon crescent (sleep indicator)
-    draw.ellipse([30, 20, 46, 36], fill=(255, 200, 50, 200))
-    draw.ellipse([34, 18, 50, 34], fill=(15, 15, 30, 255))
+    # Gold crescent moon
+    moon_r = 7
+    cx, cy = 30, 29
+    draw.ellipse([cx - moon_r, cy - moon_r, cx + moon_r, cy + moon_r],
+                 fill=MOON_GOLD)
+    draw.ellipse([cx - moon_r + 4, cy - moon_r - 2,
+                  cx + moon_r + 4, cy + moon_r - 2], fill=DARK_BG)
 
     return img
 
