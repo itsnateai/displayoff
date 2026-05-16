@@ -58,12 +58,12 @@ Right-click the tray icon → **Settings** to open the settings window:
 
 - **Hotkey** — click the field, then press your desired combination. Esc cancels recording.
 - **Lock workstation when blanking** — when checked, Display Off will press Win+L before powering off the screens.
-- **Run at Windows startup** — when checked, Display Off is registered in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` to launch on logon (uses `pythonw.exe` so there's no console flash).
+- **Run at Windows startup** — when checked, Display Off creates a `.lnk` shortcut in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Display Off.lnk` so Windows launches it on logon (uses `pythonw.exe` so there's no console flash). v1.7.0+ uses the Startup folder; older installs that used the `HKCU\...\Run` registry key are auto-cleaned on first toggle.
 - **Auto-blank after N minutes idle** — when set above 0, Display Off polls Win32 `GetLastInputInfo` every 15 seconds and fires once when you've been idle for the threshold. Re-arms after any user activity. Set to 0 to disable.
 
 Click **Save** to apply and close, **Apply** to persist without closing, or **Cancel** to close the window. Cancel discards any in-dialog edits not yet Saved or Applied; changes that have already been Applied stay persisted on disk.
 
-Settings are stored in `displayoff_config.json` next to the script. Autostart is stored in the registry.
+Settings are stored in `displayoff_config.json` next to the script. Autostart is stored as a `.lnk` shortcut in the user's Startup folder (see above).
 
 ### Choosing the blank mechanism
 
@@ -127,7 +127,7 @@ For diagnostic purposes, `pythonw.exe`-mode runs (the default for the autostart 
 - **`displayoff.log`** — tray-app events: hotkey registration, click triggers, lock-collision drops, errors.
 - **`native_blank.log`** — native idle-blank events: scheme read, sentinel writes, timeout writes, sleep with idle-counter samples, restore verification.
 
-Both files are plain `FileHandler` (no rotation) — clear them manually if they grow large over weeks of uptime.
+Both files use `RotatingFileHandler` with a 1 MB cap and 3 backup files (v1.7.2+) — so each tops out at ~4 MB total before the oldest backup rolls off. No manual cleanup needed.
 
 ## Dependencies
 

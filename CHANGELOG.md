@@ -1,10 +1,42 @@
 # Changelog — Display Off
 
+## [1.7.4] — 2026-05-16
+
+Follow-up to v1.7.3 after a 6-agent verifier sweep (3 topics × Sonnet+Opus on identical prompts). Five real findings + four stale-doc claims fixed; the rest were either false positives or out of scope.
+
+### Fixed
+
+- **`--off` / `--lock-and-off` / `--no-lock-off` / `--native-off` / `--legacy-off` / `--start-off` CLI paths bypassed `recover_stale_sentinel()`.** Eager sentinel recovery normally fires inside `run_tray()`, but every one-shot CLI-blank path `return`ed before reaching it. If a previous tray process was killed mid-blank (BSOD, power loss, Task Manager), the on-disk sentinel still named the original AC/DC display-off timeouts to restore; running `--off` in that state would have written a fresh sentinel over the saved values and trapped the user in a 1-second display-off loop. `main()` now runs `recover_stale_sentinel()` up-front whenever any of the off-flags is present in `sys.argv`. Idempotent + safe no-op when no sentinel is on disk; layered with the existing in-`run_tray` call so tray-mode launches still get the same protection.
+- **`_run_update_check` blocked the Tk event loop for up to 5 seconds.** Clicking "Check for Updates" froze the Settings window during the GitHub API request; users would double-click thinking it had hung, queuing a second request, and the dialog window appeared crashed. Network call now runs in a `daemon=True` worker thread; result is marshalled back to the Tk thread via `parent_root.after(0, ...)` so the dialog stays responsive.
+- **`_resolve_key` silently returned `None` for `vkNNN` config values.** `_pynput_key_to_name` emits `f"vk{key.vk}"` for KeyCodes with no printable char (media keys, app-defined keys), but the round-trip path on next launch had no branch for the `vk` prefix — so the recorded hotkey silently disabled itself. Added `keyboard.KeyCode.from_vk(int(name[2:]))` for `vk*` inputs.
+- **`webbrowser.open()` return value was silently dropped** in three sites (Settings "GitHub" button, About dialog link, update-check "Open release page"). On locked-down user profiles where no URL handler is registered for `http://`, the click did nothing and there was no log entry to diagnose it. Extracted `_open_url(url)` wrapper that logs a warning when `webbrowser.open` returns False.
+- **`_create_icon_image()` would `AttributeError` on Pillow < 8.2.** `rounded_rectangle` was added in Pillow 8.2 (2021). Production installs use the pinned `pillow==12.2.0` from `requirements.txt` and are unaffected, but a bare clone that `pip install`ed Pillow loose on an old Python environment would crash inside the fallback path — which is itself the safety-net for missing `.ico`. Now wraps the rounded calls in try/except `AttributeError` and degrades to a plain `rectangle` (square corners instead of rounded), with a one-line warning telling the user to upgrade Pillow.
+
+### Cleanup
+
+- Removed dead `on_turn_off` function in `run_tray` — defined but never wired to any menu item (the right-click menu deliberately has no clickable "Turn Off Displays" item per v1.6.0 — empirically the menu-item path triggered the identical code chain but the kernel never acted on the policy change). The orphan function would have been a footgun on any future menu refactor.
+- `_RELEASES_API` was hardcoded in three places (`itsnateai/displayoff` URL duplicated in update-check, About dialog, GitHub-button). Consolidated to `_GITHUB_REPO`, `_GITHUB_REPO_URL`, `_GITHUB_RELEASES_URL`, `_RELEASES_API` — derived from one source-of-truth string. Renaming or forking the repo is now a one-line change.
+- Documented the `DARK_BG` color invariant in `_create_icon_image()`: the moon-bite ellipse uses `DARK_BG` to carve the crescent out of the gold disc, which works because the icon's interior fill is also `DARK_BG`. If a future change ever introduces a different fill inside the monitor frame, the bite would become visible as a pixel-mismatch — comment now makes the constraint explicit so it doesn't silently drift.
+
+### Documentation
+
+- `README.md`: "Run at Windows startup" entry corrected from "registered in `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`" to "creates a `.lnk` shortcut in the user's Startup folder" — the registry path was the pre-v1.7.0 mechanism. v1.7.0+ uses Startup-folder `.lnk` and auto-cleans the legacy registry key on first toggle.
+- `README.md`: Log-rotation note corrected from "plain `FileHandler` (no rotation) — clear them manually" to "`RotatingFileHandler` with 1 MB cap × 3 backups (v1.7.2+)". No manual cleanup needed.
+- `CHANGELOG.md` v1.7.3 entry: removed the "Previous .ico preserved at `displayoff.ico.pre-v171-vis.bak`" line — that backup file was deleted during the wrap-up cleanup, so the claim was false. Rollback path is git history (`git checkout b130492 -- displayoff.ico`). Also reformatted the entry from one giant paragraph to bullets for skim-readability, and softened the "legible on any background" claim — only tested against Win11 dark-mode taskbar.
+
 ## [1.7.3] — 2026-05-16
 
 ### Changed
 
-- **Tray icon redesigned for visibility on the Windows 11 dark taskbar.** The previous icon was a `(15, 15, 30)` dark navy disc with a `(100, 100, 200)` muted blue monitor outline and a small yellow moon. Against the `(32, 32, 32)` Win11 dark-mode taskbar the disc and the monitor outline both fell below the contrast threshold and the icon read as "a small yellow dot you could miss." Redesign keeps the dark-mode aesthetic (dark monitor + gold crescent moon) but adds a bright cyan rim (`(130, 200, 255)`) so the silhouette is legible on any background. Outer shape is a rounded square (~14% corner radius, Win11 app-icon convention) instead of a circle — fills more of the tray cell and sits flush with the surrounding rectangular tray slot rather than floating. Multi-size `.ico` re-baked: 16/20/24 are hand-drawn (the rim + monitor outline + moon all blurred together when downsampled from 256 at tray sizes, so the small variants now drop progressively — 16 is a dominant gold crescent with no monitor; 20/24 add a hinted monitor; 32+ use the full design). Programmatic fallback in `_create_icon_image()` synced to the same palette + shape so bare clones without `displayoff.ico` don't render a second-class icon. Previous .ico preserved at `displayoff.ico.pre-v171-vis.bak` for rollback if needed.
+- **Tray icon redesigned for visibility on the Windows 11 dark taskbar.** The previous icon was a `(15, 15, 30)` dark navy disc with a `(100, 100, 200)` muted blue monitor outline and a small yellow moon. Against the `(32, 32, 32)` Win11 dark-mode taskbar the disc and the monitor outline both fell below the contrast threshold and the icon read as "a small yellow dot you could miss."
+- **Design changes**:
+  - Rounded square (~14% corner radius, Win11 app-icon convention) instead of a circle — fills more of the tray cell.
+  - Bright cyan rim `(130, 200, 255)` is the load-bearing silhouette element on the Win11 dark taskbar (only tested against dark-mode; on light-mode taskbars the rim has lower contrast and the dark interior carries the silhouette instead).
+  - Dark monitor `(18, 24, 40)` interior with a near-white frame `(235, 240, 250)`.
+  - Gold crescent moon `(255, 210, 95)` inside the monitor.
+- **Multi-size `.ico` re-baked at 9 sizes (16/20/24/32/40/48/64/128/256).** 16/20/24 are hand-drawn since downsampling the 256 design at tray sizes produced mush — the small variants drop detail progressively (16 = dominant gold crescent, no monitor; 20/24 add a hinted monitor; 32+ use the full design).
+- **Programmatic fallback `_create_icon_image()` synced** to the same palette + shape so bare clones without `displayoff.ico` don't render a second-class icon. PIL < 8.2 lacks `rounded_rectangle`; the fallback now catches `AttributeError` and degrades to a plain `rectangle` so the tray still starts.
+- **Rollback path**: git history. The pre-v1.7.3 `.ico` lives at commit `b130492` (`git checkout b130492 -- displayoff.ico` to restore the previous icon).
 
 ## [1.7.2] — 2026-05-15
 

@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.3"
+__version__ = "1.7.4"
 
 log = logging.getLogger("displayoff")
 
@@ -748,7 +748,7 @@ def _get_modifier_map():
 
 
 def _resolve_key(key_name):
-    """Convert a config key name like 'f12' or 'a' to a pynput Key/KeyCode."""
+    """Convert a config key name like 'f12', 'a', or 'vk183' to a pynput Key/KeyCode."""
     from pynput import keyboard
     try:
         return getattr(keyboard.Key, key_name.lower())
@@ -756,6 +756,14 @@ def _resolve_key(key_name):
         pass
     if len(key_name) == 1:
         return keyboard.KeyCode.from_char(key_name.lower())
+    # `vkNNN` round-trip: _pynput_key_to_name emits this for KeyCodes with no
+    # printable char (media keys, app-defined keys). Without this branch the
+    # config would silently disable the hotkey on next launch.
+    if key_name.lower().startswith("vk"):
+        try:
+            return keyboard.KeyCode.from_vk(int(key_name[2:]))
+        except (ValueError, AttributeError):
+            pass
     return None
 
 
@@ -1157,7 +1165,10 @@ def _watch_quit_event(handle, on_signaled):
 
 # ── Update check (manual, via tray menu) ──────────────────────────────────
 
-_RELEASES_API = "https://api.github.com/repos/itsnateai/displayoff/releases/latest"
+_GITHUB_REPO = "itsnateai/displayoff"
+_GITHUB_REPO_URL = f"https://github.com/{_GITHUB_REPO}"
+_GITHUB_RELEASES_URL = f"{_GITHUB_REPO_URL}/releases"
+_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 
 
 def _version_tuple(v):
@@ -1299,10 +1310,17 @@ def _set_dpi_awareness():
 def _create_icon_image():
     """Fallback icon used only when displayoff.ico is missing (e.g. bare clone).
 
-    Mirrors the 64px design baked into displayoff.ico (cyan-rimmed dark disc,
+    Mirrors the 64px design baked into displayoff.ico (cyan-rimmed rounded square,
     bright monitor outline, gold crescent moon) so bare clones don't look
     second-class. If you redesign the .ico, keep this in sync — same palette,
     same proportions — so users never see two different icons.
+
+    The moon-bite ellipse uses DARK_BG to carve the crescent out of the gold
+    disc; this works because the icon's interior fill is also DARK_BG, so the
+    carved pixels match the surrounding background pixel-for-pixel. If you ever
+    introduce a different fill inside the monitor frame, the bite will become
+    visible — keep DARK_BG load-bearing for both surfaces or restructure the
+    carve to use a clipping mask.
     """
     from PIL import Image, ImageDraw
 
@@ -1315,19 +1333,26 @@ def _create_icon_image():
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Rounded-square silhouette with a bright cyan rim. The rim is the
-    # load-bearing visibility element against the Win11 dark taskbar.
-    draw.rounded_rectangle([1, 1, size - 2, size - 2], radius=9,
-                           fill=DARK_BG, outline=RIM, width=3)
+    # Rounded-square silhouette with a bright cyan rim. PIL added
+    # rounded_rectangle in 8.2 (2021-04); bare clones on older PIL fall
+    # through to a plain rectangle so the tray still starts.
+    try:
+        draw.rounded_rectangle([1, 1, size - 2, size - 2], radius=9,
+                               fill=DARK_BG, outline=RIM, width=3)
+        draw.rounded_rectangle([14, 18, 50, 42], radius=3,
+                               outline=MONITOR_FG, width=2)
+        draw.rounded_rectangle([22, 47, 42, 50], radius=1, fill=MONITOR_FG)
+    except AttributeError:
+        log.warning("Pillow < 8.2 detected (no rounded_rectangle) — using square fallback. "
+                    "Upgrade Pillow for the rounded design: pip install -U Pillow")
+        draw.rectangle([1, 1, size - 2, size - 2], fill=DARK_BG, outline=RIM, width=3)
+        draw.rectangle([14, 18, 50, 42], outline=MONITOR_FG, width=2)
+        draw.rectangle([22, 47, 42, 50], fill=MONITOR_FG)
 
-    # Monitor frame (rounded rect)
-    draw.rounded_rectangle([14, 18, 50, 42], radius=3,
-                           outline=MONITOR_FG, width=2)
-    # Stand neck + base
+    # Stand neck (works on any PIL version)
     draw.rectangle([29, 42, 35, 47], fill=MONITOR_FG)
-    draw.rounded_rectangle([22, 47, 42, 50], radius=1, fill=MONITOR_FG)
 
-    # Gold crescent moon
+    # Gold crescent moon — see docstring re: DARK_BG color invariant.
     moon_r = 7
     cx, cy = 30, 29
     draw.ellipse([cx - moon_r, cy - moon_r, cx + moon_r, cy + moon_r],
@@ -1526,7 +1551,7 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
     )
 
     tk.Button(footer, text="GitHub",
-              command=lambda: webbrowser.open("https://github.com/itsnateai/displayoff"),
+              command=lambda: _open_url(_GITHUB_REPO_URL),
               **_btn_kw).pack(side="left")
     if on_about is not None:
         tk.Button(footer, text="About", command=on_about,
@@ -1839,8 +1864,7 @@ def _show_about(parent_root):
                         bg=_THEME_BG, fg="#4ec9ff", cursor="hand2",
                         padx=20, pady=(0, 10))
         link.pack()
-        link.bind("<Button-1>",
-                  lambda _: webbrowser.open("https://github.com/itsnateai/displayoff"))
+        link.bind("<Button-1>", lambda _: _open_url(_GITHUB_REPO_URL))
 
         btn_frame = tk.Frame(about, bg=_THEME_BG)
         btn_frame.pack(pady=(0, 15))
@@ -1867,64 +1891,86 @@ def _show_about(parent_root):
         log.exception("About dialog crashed: %s", e)
 
 
+def _open_url(url):
+    """`webbrowser.open` returns False if no handler is registered (locked-down
+    profiles, kiosk mode, broken HKCR\\http association). Log it so the user
+    isn't left wondering why the GitHub button "did nothing"."""
+    if not webbrowser.open(url):
+        log.warning("webbrowser.open(%s) returned False — no URL handler registered.", url)
+
+
 def _run_update_check(parent_root):
     """Hit the GitHub releases API and show a result dialog as a child of
-    `parent_root`. Synchronous — the network call (~3s typical, 5s timeout)
-    blocks the Tk event loop. Acceptable for a Settings-driven user action."""
-    try:
-        from tkinter import messagebox
-        has_update, latest, html_url, err = check_for_updates()
-        if err:
-            err_text = str(err)
-            # GitHub returns 404 for both "private repo with no auth" and
-            # "no releases tagged yet" — they look identical to an
-            # unauthenticated caller. Spell out both possibilities instead
-            # of the generic "check your internet" message.
-            if "404" in err_text or "Not Found" in err_text:
-                msg = (
-                    "Could not check for updates — GitHub returned 404 (Not Found).\n\n"
-                    "This usually means one of:\n"
-                    "  • The repository (itsnateai/displayoff) is private and the\n"
-                    "    update check has no authentication token.\n"
-                    "  • The repository exists but has no published releases yet —\n"
-                    "    update-check needs at least one tagged release to compare against.\n"
-                    "  • The repository or owner name has changed.\n\n"
-                    "Manage releases at:\n"
-                    "https://github.com/itsnateai/displayoff/releases\n\n"
-                    f"Raw error: {err_text}"
-                )
-            elif "timeout" in err_text.lower() or "timed out" in err_text.lower():
-                msg = (
-                    "Could not check for updates — request timed out.\n\n"
-                    "Verify your internet connection and try again. GitHub may\n"
-                    "also be experiencing an outage — check https://www.githubstatus.com/"
-                )
+    `parent_root`. Network call runs in a daemon thread so the Tk event loop
+    stays responsive; result is marshalled back via `parent_root.after`."""
+    from tkinter import messagebox
+
+    def _show_result(has_update, latest, html_url, err):
+        try:
+            if err:
+                err_text = str(err)
+                # GitHub returns 404 for both "private repo with no auth" and
+                # "no releases tagged yet" — they look identical to an
+                # unauthenticated caller. Spell out both possibilities instead
+                # of the generic "check your internet" message.
+                if "404" in err_text or "Not Found" in err_text:
+                    msg = (
+                        "Could not check for updates — GitHub returned 404 (Not Found).\n\n"
+                        "This usually means one of:\n"
+                        f"  • The repository ({_GITHUB_REPO}) is private and the\n"
+                        "    update check has no authentication token.\n"
+                        "  • The repository exists but has no published releases yet —\n"
+                        "    update-check needs at least one tagged release to compare against.\n"
+                        "  • The repository or owner name has changed.\n\n"
+                        "Manage releases at:\n"
+                        f"{_GITHUB_RELEASES_URL}\n\n"
+                        f"Raw error: {err_text}"
+                    )
+                elif "timeout" in err_text.lower() or "timed out" in err_text.lower():
+                    msg = (
+                        "Could not check for updates — request timed out.\n\n"
+                        "Verify your internet connection and try again. GitHub may\n"
+                        "also be experiencing an outage — check https://www.githubstatus.com/"
+                    )
+                else:
+                    msg = (
+                        f"Could not check for updates.\n\n{err_text}\n\n"
+                        "Verify your internet connection and try again."
+                    )
+                messagebox.showwarning("Display Off", msg, parent=parent_root)
+            elif has_update:
+                if messagebox.askyesno(
+                    "Display Off — Update available",
+                    f"A newer version is available.\n\n"
+                    f"Current: v{__version__}\n"
+                    f"Latest:  v{latest}\n\n"
+                    "Open the release page in your browser?",
+                    parent=parent_root,
+                ):
+                    _open_url(html_url or _GITHUB_RELEASES_URL)
             else:
-                msg = (
-                    f"Could not check for updates.\n\n{err_text}\n\n"
-                    "Verify your internet connection and try again."
+                messagebox.showinfo(
+                    "Display Off — Up to date",
+                    f"You're on the latest release.\n\n"
+                    f"Current: v{__version__}\n"
+                    f"Latest:  v{latest}",
+                    parent=parent_root,
                 )
-            messagebox.showwarning("Display Off", msg, parent=parent_root)
-        elif has_update:
-            if messagebox.askyesno(
-                "Display Off — Update available",
-                f"A newer version is available.\n\n"
-                f"Current: v{__version__}\n"
-                f"Latest:  v{latest}\n\n"
-                "Open the release page in your browser?",
-                parent=parent_root,
-            ):
-                webbrowser.open(html_url or "https://github.com/itsnateai/displayoff/releases")
-        else:
-            messagebox.showinfo(
-                "Display Off — Up to date",
-                f"You're on the latest release.\n\n"
-                f"Current: v{__version__}\n"
-                f"Latest:  v{latest}",
-                parent=parent_root,
-            )
-    except Exception as e:
-        log.exception("Update check dialog crashed: %s", e)
+        except Exception as e:
+            log.exception("Update check dialog crashed: %s", e)
+
+    def _worker():
+        try:
+            result = check_for_updates()
+        except Exception as e:
+            result = (False, None, None, e)
+        # Marshal back to the Tk thread. parent_root.after is thread-safe.
+        try:
+            parent_root.after(0, lambda: _show_result(*result))
+        except Exception as e:
+            log.exception("Failed to schedule update-check result dialog: %s", e)
+
+    threading.Thread(target=_worker, daemon=True, name="displayoff-update-check").start()
 
 
 # ── Tray ───────────────────────────────────────────────────────────────────
@@ -2012,9 +2058,6 @@ def run_tray():
             t.start()
         except Exception as e:
             log.exception("failed to spawn blank thread (%s): %s", reason, e)
-
-    def on_turn_off(icon, item):
-        _spawn_blank_thread("menu-turn-off")
 
     # Hidden default-action item for left-click on the tray icon. pystray on
     # Windows fires this on EVERY left-click (single, double, triple) — there
@@ -2207,6 +2250,24 @@ def main():
         else:
             log.info("No config file to reset.")
         return
+
+    # The --off-family CLI paths blank the display and exit without entering
+    # run_tray(), which is where the eager stale-sentinel recovery normally
+    # lives. If a prior tray process was killed mid-blank, the on-disk
+    # sentinel still names a 1-second display-off timeout to restore; running
+    # `--off` in that state without recovery would clobber the saved AC/DC
+    # values via a fresh sentinel and trap the user in the 1-second loop.
+    # Run recovery up-front so all CLI-blank paths see a clean state.
+    _off_flags = {"--off", "--lock-and-off", "--no-lock-off",
+                  "--native-off", "--legacy-off", "--start-off"}
+    if _off_flags.intersection(sys.argv):
+        try:
+            from native_blank import recover_stale_sentinel
+            recover_stale_sentinel()
+        except ImportError as e:
+            log.warning("native_blank not available (%s) — skipping stale-sentinel recovery for CLI blank", e)
+        except Exception as e:
+            log.exception("stale-sentinel recovery raised (%s) — continuing with blank anyway", e)
 
     if "--off" in sys.argv:
         log.info("Turning off displays...")
