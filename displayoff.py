@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.4"
+__version__ = "1.7.5"
 
 log = logging.getLogger("displayoff")
 
@@ -1042,13 +1042,20 @@ def _idle_seconds():
 def _start_idle_watcher(cfg_provider, poll_secs=15):
     """Auto-blank the displays when the user has been idle ≥ idle_blank_minutes.
 
-    Only fires once per idle window — the user must move/type to re-arm it.
-    Threshold of 0 (the default) disables the feature; the watcher still runs
-    cheaply but skips firing.
+    Re-fires every `_IDLE_REFIRE_COOLDOWN_SECS` while the user remains idle
+    past threshold — covers the silent-failure case where our blank attempt
+    runs but the kernel's idle counter is reset by another process during the
+    5s policy window (PowerToys Awake, presentation tools, certain peripheral
+    drivers — all reset GetLastInputInfo on a timer and would otherwise leave
+    the monitor lit forever). Threshold of 0 (the default) disables the
+    feature; the watcher still runs cheaply but skips firing.
     """
     def _watch():
         fired = False
         last_fire = 0.0
+        last_heartbeat = 0.0
+        heartbeat_secs = 300  # log "still alive" every 5 min so a silently
+                              # dead watcher thread is easy to spot in the log
         while True:
             time.sleep(poll_secs)
             try:
@@ -1063,27 +1070,40 @@ def _start_idle_watcher(cfg_provider, poll_secs=15):
                     last_fire = 0.0
                     continue
                 idle = _idle_seconds()
+                now = time.monotonic()
+
+                # Heartbeat: log idle/threshold state every ~5 min so the log
+                # has a paper trail when "auto-blank didn't fire" reports
+                # come in. INFO level (not DEBUG) because pythonw.exe sessions
+                # may not ship a DEBUG-level handler.
+                if now - last_heartbeat >= heartbeat_secs:
+                    log.info("Idle watcher heartbeat: idle=%.0fs threshold=%ds fired=%s",
+                             idle, threshold, fired)
+                    last_heartbeat = now
+
                 # Reset `fired` whenever the user is active. This MUST run
                 # before the cooldown gate — otherwise during the cooldown
                 # window `continue` short-circuits past this reset and
-                # `fired` stays True until the next idle-drop, which never
-                # happens if the user remains idle past cooldown expiry.
+                # `fired` stays True until the next idle-drop.
                 if idle < threshold:
                     fired = False
                     continue
+                # If we already fired this idle window AND the cooldown
+                # hasn't expired, skip — covers the rapid-jitter case where
+                # the user's idle dips below threshold for one poll then
+                # climbs back.
+                if fired and (now - last_fire) < _IDLE_REFIRE_COOLDOWN_SECS:
+                    continue
+                # User is past threshold and either (a) we haven't fired yet
+                # this idle window, or (b) we did fire but cooldown expired
+                # AND user is STILL idle — meaning the previous blank
+                # evidently didn't take effect. Retry.
                 if fired:
-                    continue
-                # Hard cooldown wall: never re-fire within
-                # _IDLE_REFIRE_COOLDOWN_SECS of the previous fire, regardless
-                # of idle state. Placed AFTER the `fired` reset so user
-                # activity during cooldown is still observed; placed BEFORE
-                # the fire so back-to-back fires from rapid mouse-jitter
-                # loops are suppressed. The `fired` flag carries the common
-                # case, this is the belt-and-suspenders pair.
-                if time.monotonic() - last_fire < _IDLE_REFIRE_COOLDOWN_SECS:
-                    continue
+                    log.info("Idle %.0fs ≥ %ds threshold but previous blank didn't "
+                             "stick — retrying (kernel may have been overridden by a "
+                             "stay-awake tool or driver event).", idle, threshold)
                 fired = True
-                last_fire = time.monotonic()
+                last_fire = now
                 log.info("Idle %.0fs ≥ %ds threshold — blanking displays.", idle, threshold)
                 threading.Thread(target=turn_off_monitors, daemon=True).start()
             except Exception as e:
@@ -1375,6 +1395,105 @@ def _pynput_key_to_name(key):
     return None
 
 
+# ── Hotkey safety guard ───────────────────────────────────────────────────
+# OS-reserved combos are keyed by "modifier+modifier+key" with modifiers
+# sorted alphabetically (matches the canonical form produced below). Single
+# modifier-app conflicts only need one entry each.
+
+_RESERVED_HOTKEYS = {
+    "alt+f4": "Alt+F4 closes the active window",
+    "alt+tab": "Alt+Tab switches between windows",
+    "alt+space": "Alt+Space opens the active window's system menu",
+    "alt+esc": "Alt+Esc cycles windows in z-order",
+    "alt+escape": "Alt+Esc cycles windows in z-order",
+    "ctrl+esc": "Ctrl+Esc opens the Start menu",
+    "ctrl+escape": "Ctrl+Esc opens the Start menu",
+    "alt+ctrl+del": "Ctrl+Alt+Del is the secure-attention sequence",
+    "alt+ctrl+delete": "Ctrl+Alt+Del is the secure-attention sequence",
+    "alt+ctrl+esc": "Ctrl+Alt+Esc cycles windows",
+    "alt+ctrl+escape": "Ctrl+Alt+Esc cycles windows",
+    "ctrl+shift+esc": "Ctrl+Shift+Esc opens Task Manager",
+    "ctrl+shift+escape": "Ctrl+Shift+Esc opens Task Manager",
+}
+
+# Single-Ctrl-modifier combos that would clobber a near-universal app shortcut.
+# These warn-but-allow rather than hard-block — some users genuinely don't
+# care about Ctrl+P (Print) and want it as their blank-displays hotkey.
+_COMMON_APP_HOTKEYS = {
+    "ctrl+c": "Copy",
+    "ctrl+v": "Paste",
+    "ctrl+x": "Cut",
+    "ctrl+z": "Undo",
+    "ctrl+y": "Redo",
+    "ctrl+a": "Select All",
+    "ctrl+s": "Save",
+    "ctrl+p": "Print",
+    "ctrl+f": "Find",
+    "ctrl+w": "Close tab/document",
+    "ctrl+t": "New tab",
+    "ctrl+n": "New",
+    "ctrl+o": "Open",
+    "ctrl+q": "Quit (some apps)",
+}
+
+
+def _validate_hotkey_safety(captured):
+    """Check whether `captured` is a safe choice for a global hotkey.
+
+    Returns:
+      None            — safe, register it as-is
+      ("block", msg)  — refuse and show msg as an error
+      ("warn",  msg)  — show msg as a yes/no confirm; proceed only if user OKs
+
+    Rules:
+      1. A non-modifier key is required.
+      2. At least one of Ctrl/Alt must be in the modifier set — Shift alone
+         with a letter just types uppercase, and a bare key (e.g. F12 / 'a')
+         would intercept that key system-wide so the user could never type
+         the letter normally or use the F-key in any other app.
+      3. OS-reserved combos (Alt+Tab, Alt+F4, Ctrl+Esc, etc.) are blocked
+         outright — Windows gets them before pynput, so registering them
+         silently fails and the user is left wondering why nothing happens.
+      4. Common-app shortcuts (Ctrl+C/V/S/Z/...) warn but allow.
+    """
+    mods = set(captured.get("modifiers") or [])
+    key = (captured.get("key") or "").lower()
+
+    if not key:
+        return ("block", "Hotkey must include at least one non-modifier key.")
+
+    if not (mods & {"ctrl", "alt"}):
+        return (
+            "block",
+            "Hotkey must include Ctrl or Alt.\n\n"
+            "Without a Ctrl or Alt modifier the hotkey would intercept every "
+            "press of that key system-wide — you wouldn't be able to type "
+            "the letter normally or use the F-key in any other app.",
+        )
+
+    combo = "+".join(sorted(mods) + [key])
+    pretty = hotkey_display_name({"hotkey": captured})
+
+    if combo in _RESERVED_HOTKEYS:
+        return (
+            "block",
+            f"{pretty} is reserved by Windows — {_RESERVED_HOTKEYS[combo]}, "
+            f"so the OS would intercept it before Display Off ever sees it. "
+            f"Pick a different combo.",
+        )
+
+    if combo in _COMMON_APP_HOTKEYS:
+        return (
+            "warn",
+            f"{pretty} is widely used as the \"{_COMMON_APP_HOTKEYS[combo]}\" "
+            f"shortcut in most apps. Display Off would intercept it system-"
+            f"wide, so {_COMMON_APP_HOTKEYS[combo]} would stop working in "
+            f"every other app.\n\nUse this hotkey anyway?",
+        )
+
+    return None
+
+
 # ── Settings dialog ────────────────────────────────────────────────────────
 
 # Row layout (lets you add new rows without re-threading indices through the impl):
@@ -1651,13 +1770,15 @@ def _open_settings_impl(tray_icon, on_saved):
 
     def _apply_settings():
         """Validate + persist + apply. Returns True on success, False if dialog should stay open."""
-        if not captured.get("key"):
-            messagebox.showerror(
-                "Display Off",
-                "Hotkey must include at least one non-modifier key.",
-                parent=root,
-            )
-            return False
+        safety = _validate_hotkey_safety(captured)
+        if safety is not None:
+            severity, msg = safety
+            if severity == "block":
+                messagebox.showerror("Display Off", msg, parent=root)
+                return False
+            # severity == "warn" — give the user a chance to proceed anyway.
+            if not messagebox.askyesno("Display Off", msg, parent=root):
+                return False
         try:
             idle_minutes = max(0, int(idle_var.get() or 0))
         except (TypeError, ValueError):
@@ -1758,12 +1879,22 @@ def _open_settings_impl(tray_icon, on_saved):
     y = (root.winfo_screenheight() - h) // 2
     root.geometry(f"{w}x{h}+{x}+{y}")
 
-    # NOW show — everything is themed, sized, positioned. Re-asserting the
-    # dark title bar after deiconify is belt-and-suspenders: some Win11
-    # builds re-paint the title bar with default chrome when a previously-
-    # withdrawn window is first shown.
+    # Alpha trick to mask the deiconify → first-paint flash. Without this,
+    # Win11 briefly paints the window with default-light chrome on first show
+    # of a previously-withdrawn window before our DwmSetWindowAttribute call
+    # re-paints it dark — visible as a quick flash. By setting alpha=0 first
+    # and only restoring to 1 AFTER the dark titlebar has been re-asserted,
+    # all of that chrome-repaint churn happens while the window is invisible.
+    root.attributes("-alpha", 0.0)
     root.deiconify()
+    # Flush Tk's event queue so the window-shown notification reaches DWM
+    # before we re-apply the dark titlebar. Without this update(), some Win11
+    # builds queue the default-chrome paint AFTER our attribute write and
+    # the flash returns.
+    root.update()
     _apply_dark_titlebar(root)
+    root.update()
+    root.attributes("-alpha", 1.0)
 
     root.protocol("WM_DELETE_WINDOW", on_cancel)
     root.mainloop()
@@ -1835,12 +1966,23 @@ def _show_about(parent_root):
         idle_line = f"{idle_min} min" if idle_min > 0 else "off"
 
         about = tk.Toplevel(parent_root)
+        # Hide IMMEDIATELY so the user never sees default light-mode Tk chrome
+        # flash before the dark theme + DWM dark title bar apply, and so the
+        # window doesn't first paint at (0,0) before jumping to the centered
+        # position computed below. Re-shown via deiconify() at the end.
+        about.withdraw()
         about.title("About Display Off")
         about.configure(bg=_THEME_BG)
         about.resizable(False, False)
-        # Deliberately NOT transient(parent_root) and NOT -topmost — those
-        # would make the window stay above its parent and steal focus on
-        # parent activation. We want fully independent z-order.
+        # `-topmost True` is REQUIRED here because the parent Settings window
+        # already has -topmost True. Without matching it, About opens at
+        # normal Z-order, is immediately covered by the always-on-top Settings
+        # window, and from the user's perspective "the About button does
+        # nothing." Both windows now stay above other apps; the younger
+        # (About) renders above the elder (Settings). Closing About leaves
+        # Settings on top, as expected. Set early so deiconify happens in
+        # the correct Z-order rather than needing a post-show raise.
+        about.attributes("-topmost", True)
         _apply_dark_titlebar(about)
 
         body_text = (
@@ -1859,11 +2001,15 @@ def _show_about(parent_root):
         body.pack()
 
         # Clickable GitHub link styled as a label with hand cursor.
+        # Note: tuple-form padding (e.g. (0, 10)) is only valid on the geometry
+        # manager (pack/grid/place), NOT on the widget constructor — Tk parses
+        # the constructor pad-* values as a single screen-distance and raises
+        # TclError: bad screen distance "0 10" otherwise. Keep the asymmetric
+        # bottom padding on the pack() call below.
         link = tk.Label(about, text="https://github.com/itsnateai/displayoff",
                         font=("Segoe UI", 9, "underline"),
-                        bg=_THEME_BG, fg="#4ec9ff", cursor="hand2",
-                        padx=20, pady=(0, 10))
-        link.pack()
+                        bg=_THEME_BG, fg="#4ec9ff", cursor="hand2")
+        link.pack(padx=20, pady=(0, 10))
         link.bind("<Button-1>", lambda _: _open_url(_GITHUB_REPO_URL))
 
         btn_frame = tk.Frame(about, bg=_THEME_BG)
@@ -1880,12 +2026,25 @@ def _show_about(parent_root):
         about.bind("<Return>", lambda _: about.destroy())
         about.bind("<Escape>", lambda _: about.destroy())
 
-        # Center on screen.
+        # Center on screen before showing — sizing all widgets first means
+        # winfo_reqwidth/height returns final dimensions, so the window pops
+        # in at its final position rather than at (0,0) then jumping.
         about.update_idletasks()
         w, h = about.winfo_reqwidth(), about.winfo_reqheight()
         x = (about.winfo_screenwidth() - w) // 2
         y = (about.winfo_screenheight() - h) // 2
-        about.geometry(f"+{x}+{y}")
+        about.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Alpha=0 mask while deiconify + dark-titlebar reapply happens — see
+        # the matching block in `_open_settings_impl` for the full rationale.
+        # Without this, Win11 briefly paints default-light chrome between
+        # deiconify and our DWM dark-mode attribute write, visible as a flash.
+        about.attributes("-alpha", 0.0)
+        about.deiconify()
+        about.update()
+        _apply_dark_titlebar(about)
+        about.update()
+        about.attributes("-alpha", 1.0)
         close_btn.focus_set()
     except Exception as e:
         log.exception("About dialog crashed: %s", e)
@@ -2091,6 +2250,30 @@ def run_tray():
         threading.Thread(target=_open_settings, args=(icon, on_saved), daemon=True).start()
 
     def on_quit(icon, item):
+        # If a blank fired moments before Quit was clicked (e.g. via the
+        # hotkey, double-click, or idle watcher), the worker thread is
+        # currently inside `blank_via_idle_path` holding the
+        # `_turn_off_lock` and counting down its restore window. Letting
+        # icon.run() return immediately would tear down the interpreter
+        # mid-restore — the daemon thread gets killed, the powercfg restore
+        # never runs, and the user is left with a 1-second VIDEOIDLE
+        # timeout until the next launch's sentinel-recovery fires.
+        #
+        # native_blank registers a per-invocation atexit handler as a
+        # belt-and-suspenders restore, but atexit fires *after* main()
+        # returns — by then the in-flight thread is already racing the
+        # interpreter shutdown. Cleaner to wait briefly for the lock to
+        # release (blank finished its own try/finally restore) before
+        # exiting. Lock is held for ~5.5s during a native blank, so 6s
+        # covers a typical run with a small margin.
+        if _turn_off_lock.locked():
+            log.info("Quit requested while blank in progress — waiting up to 6s for restore.")
+            if _turn_off_lock.acquire(timeout=6.0):
+                _turn_off_lock.release()
+                log.info("In-flight blank finished restore — proceeding with quit.")
+            else:
+                log.warning("Blank still in progress after 6s — proceeding with quit; "
+                            "native_blank's atexit handler will attempt the restore.")
         icon.stop()
 
     # Why no clickable "Turn Off Displays" menu item:
@@ -2115,8 +2298,8 @@ def run_tray():
         MenuItem(f"Display Off v{__version__}", None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("Blank displays:", None, enabled=False),
-        MenuItem("  • Double-click this icon", None, enabled=False),
-        MenuItem(lambda item: f"  • {hotkey_name[0]}", None, enabled=False),
+        MenuItem("• Double-click icon", None, enabled=False),
+        MenuItem(lambda item: f"• {hotkey_name[0]}", None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("Settings...", on_settings),
         MenuItem("Quit", on_quit),
