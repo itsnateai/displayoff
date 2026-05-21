@@ -1,6 +1,7 @@
 # Display Off
 
 ![Release](https://img.shields.io/github/v/release/itsnateai/displayoff)
+[![Downloads](https://img.shields.io/github/downloads/itsnateai/displayoff/total?label=downloads&color=brightgreen)](https://github.com/itsnateai/displayoff/releases)
 ![License](https://img.shields.io/github/license/itsnateai/displayoff)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
