@@ -1,8 +1,7 @@
 r"""Win11 tray-icon auto-promote (Python port).
 
-Direct port of `_.claude/_templates/snippets/csharp/tray-icon-promoter.md`,
-v3 (the canonical version used by MicMute, SyncthingPause, EQSwitch, etc).
-The Python adaptation has one extra requirement compared to the C# version:
+Python adaptation of the C# tray-icon-promoter pattern. The Python version
+has one extra requirement compared to the C# original:
 **Python tray apps share `pythonw.exe` as their ExecutablePath**, so Phase 1
 must match on `(ExecutablePath, InitialTooltip)` instead of `ExecutablePath`
 alone — otherwise we'd promote every Python tray app the user has.
@@ -55,8 +54,6 @@ The 18-20-digit subkey name is an unsigned 64-bit hash of
 
 All registry interaction is wrapped in try/except so a schema change in a
 future Windows build silently no-ops instead of crashing.
-
-Canonical template: `_.claude/_templates/snippets/python/tray-icon-promoter.md`
 """
 import logging
 import os

@@ -23,7 +23,7 @@ UX + correctness pass.
 
 ## [1.7.4] — 2026-05-16
 
-Follow-up to v1.7.3 after a 6-agent verifier sweep (3 topics × Sonnet+Opus on identical prompts). Five real findings + four stale-doc claims fixed; the rest were either false positives or out of scope.
+Follow-up to v1.7.3 after a thorough code review. Five real findings + four stale-doc claims fixed; the rest were either false positives or out of scope.
 
 ### Fixed
 
@@ -61,16 +61,16 @@ Follow-up to v1.7.3 after a 6-agent verifier sweep (3 topics × Sonnet+Opus on i
 
 ## [1.7.2] — 2026-05-15
 
-24/7-readiness pass. Three-agent parallel audit (native handles / Python heap+threading / OS resources) ran against v1.7.1 with the program now expected to stay resident continuously. Two agents returned SHIP with no findings; the OS-resource agent caught one real unbounded-growth path.
+24/7-readiness pass. Three parallel reviews (native handles / Python heap+threading / OS resources) against v1.7.1 with the program now expected to stay resident continuously. Two reviews returned SHIP with no findings; the OS-resource review caught one real unbounded-growth path.
 
 ### Fixed
 
 - **`native_blank.log` would grow unbounded over the process lifetime.** `native_blank.py` used plain `logging.FileHandler` at both setup sites (`_setup_logging` and `_ensure_module_logger_has_filehandler`), while the sibling `displayoff.log` already used `RotatingFileHandler(maxBytes=1_000_000, backupCount=3)` with an explicit comment about why. With native idle-blank now the default path (v1.6.0+) every blank trigger writes ~10–15 log lines (pre-blank settle, idle samples every 250 ms during the 5-8 s blank, post-restore); at ~10 fires/day that's ~12 KB/day, ~4 MB/year — slow but unbounded, and the policy mismatch with `displayoff.log` was the real signal. Both handlers now use `RotatingFileHandler` with the same 1 MB × 3 budget. The `isinstance(h, logging.FileHandler)` idempotency check is preserved (RotatingFileHandler is a FileHandler subclass).
 - **PIL `Image.open(_ICON_PATH)` held a file descriptor on `displayoff.ico` for the entire process lifetime.** PIL's lazy-load keeps the source fd open until the image is consumed or closed; pystray's consumption path doesn't guarantee a prompt close. On a 24/7 tray, that means the .ico file is locked against any in-place icon refresh or asset replacement for as long as the program runs. Wrapped in `with Image.open(...) as _im: icon_image = _im.copy()` to release the fd immediately while keeping the pixel data live. The `.copy()` is wrapped in try/except — `with`-block forces eager decode, so a truncated / 0-byte / corrupt `.ico` (Syncthing partial, OneDrive placeholder, AV quarantine-restore mid-read) raises here instead of being deferred into pystray. Failures fall through to the `_create_icon_image()` programmatic fallback that previously only fired on `isfile=False`.
 
-### Hardened (follow-up to verifier round 2)
+### Hardened (follow-up to review round 2)
 
-Five surfaced concerns from the swarm audit, fixed in scope so the 24/7 runtime guarantees hold under more failure modes:
+Five surfaced concerns from the review, fixed in scope so the 24/7 runtime guarantees hold under more failure modes:
 
 - **`logging.StreamHandler()` would noisily emit-fail under `pythonw.exe`.** Both `displayoff.py:main` and `native_blank.py:_setup_logging` passed a bare `StreamHandler()` whose default `sys.stderr` is `None` under `pythonw.exe`. Every log emit raised `AttributeError: 'NoneType' object has no attribute 'write'` and was caught by `Handler.handleError`, but the swallowing path itself is wasteful and a footgun for future refactors. Both sites now conditionally append `StreamHandler()` only when `sys.stderr is not None`. File logging unchanged.
 - **Idle-watcher could re-fire faster than intended on rapid input-jitter.** The `fired` flag normally serves as the cooldown (stays True while idle ≥ threshold, resets when user input drops it below), but the reset semantics are fragile to future refactors. Added `_IDLE_REFIRE_COOLDOWN_SECS = 60` — a hard wall-clock floor between fires regardless of idle state, as a belt-and-suspenders defense.
@@ -80,7 +80,7 @@ Five surfaced concerns from the swarm audit, fixed in scope so the 24/7 runtime 
 
 ### Round 3 follow-up
 
-A third verifier round caught two ordering bugs the round-2 fixes introduced:
+A third review round caught two ordering bugs the round-2 fixes introduced:
 
 - **Idle-watcher cooldown gate ran BEFORE the `fired` reset.** During the 60 s cooldown window, the `continue` short-circuited past the `if idle < threshold: fired = False` reset — so a user who triggered a blank, woke the display, and then went idle again would never re-fire because `fired` stayed True past cooldown expiry. Reordered: `fired` reset now runs first (so user activity during cooldown is observed), `fired` check next, cooldown wall last (only blocks the actual fire). Also resets `last_fire = 0.0` when `idle_blank_minutes` is set to 0, so re-enabling within 60 s of a prior fire isn't blocked by stale cooldown state.
 - **`_blank_mutex` fail-open vs `_acquire_single_instance` fail-closed asymmetry on CreateMutexW NULL** is intentional (different stakes — duplicate-tray cost > sentinel-clobber cost) but was undocumented. Added an explicit comment in `_blank_mutex` explaining the asymmetry, and upgraded the fail-open log from `warning` to `error` so the rare condition is more visible if it ever fires in production.
@@ -93,7 +93,7 @@ A third verifier round caught two ordering bugs the round-2 fixes introduced:
 
 ## [1.7.1] — 2026-05-14
 
-Patch release closing the gaps surfaced by the v1.7.0 audit pair-set's R2 sweep. v1.7.0 introduced new helpers (`_ps_sq_escape`, `_read_lnk_target_path`, `_normalize_path`, etc.) which themselves carried second-order bugs — this release closes them before they reach production.
+Patch release closing the gaps surfaced by a v1.7.0 follow-up review. v1.7.0 introduced new helpers (`_ps_sq_escape`, `_read_lnk_target_path`, `_normalize_path`, etc.) which themselves carried second-order bugs — this release closes them before they reach production.
 
 ### Fixed
 
@@ -118,9 +118,9 @@ Patch release closing the gaps surfaced by the v1.7.0 audit pair-set's R2 sweep.
 
 - **"Run at Windows startup" + Save silently did nothing.** `_create_startup_lnk` referenced `subprocess.STARTUPINFO`, `subprocess.run`, and `subprocess.STARTF_USESHOWWINDOW` against an undefined name — `subprocess` was never imported at module top. Every Save click with the autostart checkbox ticked raised `NameError` inside Tk's button callback. Under `pythonw.exe` (no console), Tk's default `report_callback_exception` writes the traceback to a stderr that has nowhere to go, so the exception evaporated with no error dialog and no log entry. The Settings dialog stayed open because `root.destroy()` was never reached; the user saw "Save does nothing." Root-cause fix: `import subprocess` at module top, plus 3 layers of defense-in-depth listed below.
 
-### Changed (autostart subsystem hardening — Sonnet+Opus audit 2026-05-14)
+### Changed (autostart subsystem hardening — 2026-05-14)
 
-- **Switched from HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run registry entry to a `.lnk` shortcut in the user's Startup folder** (`%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\Display Off.lnk`). Matches how every other tray app in the workspace manages autostart (MicMute, SyncthingPause, MWBToggle, CapsNumTray, etc.) and is visible/manageable in File Explorer. Legacy HKCU Run entries from v1.6.0 are detected and removed automatically on first toggle (logged as `Removed legacy HKCU Run\\DisplayOff autostart entry (migrated to Startup-folder .lnk)`).
+- **Switched from HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run registry entry to a `.lnk` shortcut in the user's Startup folder** (`%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\Display Off.lnk`). The `.lnk` is visible and manageable in File Explorer. Legacy HKCU Run entries from v1.6.0 are detected and removed automatically on first toggle (logged as `Removed legacy HKCU Run\\DisplayOff autostart entry (migrated to Startup-folder .lnk)`).
 - **`autostart_enabled()` now validates the .lnk's `TargetPath`** against the current `pythonw.exe` path resolved by `_autostart_target_pythonw()`. A stale shortcut pointing at a Python install that was upgraded or moved is treated as "not enabled" so the next Save automatically refreshes it instead of silently leaving autostart broken. Validation uses the same `WScript.Shell` COM API to read `TargetPath`; if reading fails (PS missing / COM error / timeout) we conservatively assume the .lnk is valid and let the next user-initiated Save reconcile.
 - **PowerShell single-quote injection in `_create_startup_lnk`** — every interpolated value (`_STARTUP_LNK_PATH`, `py`, `script`, `working_dir`, `icon_path`) is now run through new `_ps_sq_escape` helper which doubles every `'` per PS literal rules. Paths containing single-quotes (legal NTFS, e.g., `C:\\Users\\O'Brien\\...`) previously would have terminated the PS string early, producing either a parse error or — in a pathological hostile-path case — arbitrary PS execution.
 - **`_remove_startup_lnk` is now TOCTOU-safe** — uses `try: os.remove ... except FileNotFoundError: pass` instead of an `os.path.exists` precheck. Added a post-removal verify-back symmetric to the create-side verify, so a sync-software replication (OneDrive, Syncthing) or AV restore-from-quarantine putting the .lnk back gets surfaced as an error instead of silently flipping autostart back on at next logon.
@@ -146,7 +146,7 @@ Patch release closing the gaps surfaced by the v1.7.0 audit pair-set's R2 sweep.
 ### Notes
 
 - The v1.6.0 `HKCU\\...\\Run\\DisplayOff` autostart code was the only path that ever shipped. The `.lnk`-based code in v1.6.0's source tree was staged but broken from the first commit (missing import, never tested via the Settings GUI under pythonw); no user ever successfully used the .lnk path on v1.6.0. v1.7.0 is the actual first working release of the Startup-folder shortcut migration.
-- Cross-stack pattern note `memory/reference_tk_callback_silent_under_pythonw.md` captures the Tk-silent-swallow trap for every sibling tray app in the workspace that uses Tk dialogs under pythonw — every one of them is a candidate for the same `report_callback_exception` hook.
+- The Tk-silent-swallow trap under pythonw is a general risk for any Python tray app using Tk dialogs — the `report_callback_exception` hook here is the recommended defense pattern.
 
 ## [1.6.0] — 2026-05-14
 
@@ -162,7 +162,7 @@ Patch release closing the gaps surfaced by the v1.7.0 audit pair-set's R2 sweep.
 - **`native_blank.py` import-path logging** — when imported by displayoff.py (rather than run as a script) it now attaches a FileHandler to its own logger so log entries still reach `native_blank.log`. Without this, blank invocations from the tray left zero forensic trail.
 - **Idle-counter sampling during the sleep window** — `_sleep_with_idle_log` polls `GetLastInputInfo` every 250ms and logs the idle-seconds samples. Made it possible to prove that the menu-item path's failure was NOT an idle-reset issue (samples cleanly accumulate past threshold) but a kernel-policy-refresh issue.
 
-### Hardening (from post-implementation multi-agent review)
+### Hardening (post-implementation review)
 
 - **`_fire_native_idle_blank` no longer falls back to `SC_MONITORPOWER` on `ImportError`.** The whole reason v1.6.0 exists is that `SC_MONITORPOWER` cycles the display on affected hardware; silently falling back to it on a broken install would re-introduce the very bug v1.6.0 ships to fix. Now refuses to blank, logs loudly.
 - **`native_blank()` finally block is now resilient.** Previous version called `_write_display_timeouts(saved_ac, saved_dc)` followed by `_clear_sentinel()`. If powercfg failed during restore, the un-wrapped `RuntimeError` propagated out before `_clear_sentinel()` could run — leaving the sentinel orphaned on disk forever. Wrapped in try/except; verifies values match before clearing sentinel; logs manual-recovery command if restore fails.
@@ -189,7 +189,7 @@ The v1.5.0 changelog explained why the native path is required on some hardware 
 
 ### New Features
 
-- **`--native-off` CLI flag** — turns off displays via Windows' own idle-display-off code path instead of `SC_MONITORPOWER`. Temporarily writes `GUID_VIDEO_POWERDOWN_TIMEOUT = 1s` via `PowerWriteACValueIndex` + `PowerSetActiveScheme`, waits ~8s for the kernel to fire its native idle-blank, then restores the original AC/DC timeouts. No `SC_MONITORPOWER` message is sent — uses the exact mechanism wired to **Settings ▸ Power ▸ "Turn off the display after N minutes."** Required on hardware where `SC_MONITORPOWER` triggers a wake-handshake loop (verified on ASUS ROG Strix G614JV with Modern Standby + Intel UHD/RTX 4060 hybrid GPU, where 20× SC_MONITORPOWER events fired in 38s with no input recovery).
+- **`--native-off` CLI flag** — turns off displays via Windows' own idle-display-off code path instead of `SC_MONITORPOWER`. Temporarily writes `GUID_VIDEO_POWERDOWN_TIMEOUT = 1s` via `PowerWriteACValueIndex` + `PowerSetActiveScheme`, waits ~8s for the kernel to fire its native idle-blank, then restores the original AC/DC timeouts. No `SC_MONITORPOWER` message is sent — uses the exact mechanism wired to **Settings ▸ Power ▸ "Turn off the display after N minutes."** Required on Modern Standby + hybrid-GPU hardware where `SC_MONITORPOWER` triggers a wake-handshake loop (verified empirically — repeated SC_MONITORPOWER events fire in rapid succession with no input recovery).
 - **`native_blank.py`** — standalone helper module with three modes:
   - `--read` — print current AC/DC display-off timeouts (zero risk, no writes)
   - `--toggle` — write 1s timeouts, sleep 0.5s (too short to actually blank), restore (plumbing test)
@@ -240,9 +240,9 @@ The v1.5.0 changelog explained why the native path is required on some hardware 
 - **Settings dialog decomposed** into row builders (`_build_header`, `_build_hotkey_row`, `_build_options_section`, `_build_footer`). The orchestrating `_open_settings_impl` shrank from 168 lines to 74. Adding a new option row is now a one-line `_build_*(root, row=N, ...)` call in the impl plus a sibling builder.
 - **UIPI hint at startup**: when running unelevated, logs a one-line note that the hotkey may not fire while an elevated window has focus (Task Manager, admin terminals, UAC consent). Documented in README's Caveats section.
 
-### Verifier-pair closeout (post-audit hardening)
+### Review closeout (post-audit hardening)
 
-The above v1.4.0 changes were audited by four parallel verifier agents (concurrency, Win32, functional walkthrough, doc-vs-code gap) before tag. The following hardening followed from their findings:
+The above v1.4.0 changes were reviewed (concurrency, Win32, functional walkthrough, doc-vs-code gap) before tag. The following hardening followed:
 
 - **Win32 HANDLE truncation** — `CreateMutexW`, `CreateEventW`, `OpenEventW` were called via raw `ctypes.windll.*` lookups, defaulting `restype` to `c_int` (4 bytes). On 64-bit Windows the kernel could in theory return a HANDLE with bit 31 set, which would round-trip incorrectly through `c_int` and cause `CloseHandle` on a stale value. Now bound with `restype = HANDLE` (`c_void_p`) in the platform-guarded block.
 - **`GetTickCount` signed arithmetic** — without a `restype = DWORD` binding, ctypes returned signed `c_int`, which goes negative after ~24.8 days of uptime and silently breaks idle-blank arithmetic. Now bound `restype = DWORD`; the subtraction is also masked with `& 0xFFFFFFFF` so the wraparound at ~49.7 days produces correct elapsed time.

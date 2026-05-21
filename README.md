@@ -14,10 +14,10 @@ Tiny system tray utility that turns off all monitors without putting the PC to s
 - **Lock-on-blank** — optional, locks the workstation before powering off displays
 - **Auto-blank when idle** — optional, fires after N minutes of inactivity
 - **Autostart toggle** — register/unregister Display Off in Windows startup with one click
-- **Win11 tray-icon auto-promote** — uses the same `IsPromoted=1` registry pattern as the developer's other tray apps (MicMute, SyncthingPause, etc.) to skip the "icon hidden in overflow on first run" experience. See [Caveats](#caveats) for the Win11 cataloging quirk specific to `pythonw.exe`-based apps.
+- **Win11 tray-icon auto-promote** — writes the undocumented `IsPromoted=1` registry value so the icon isn't hidden in the overflow flyout on first run. See [Caveats](#caveats) for the Win11 cataloging quirk specific to `pythonw.exe`-based apps.
 - **Sentinel-based crash recovery** — if the native blank path is killed mid-write (hard reboot, process kill, etc.), the next launch restores the original timeouts from a sentinel file before doing anything else
 - **Listener watchdog** — 30-second-poll auto-restart of the global hotkey listener if its thread dies (e.g. after a session lock, RDP transition, or fast-user-switch)
-- **Check for Updates** — manual via tray menu (no automatic phone-home)
+- **Check for Updates** — manual via Settings dialog (no automatic phone-home)
 - **No admin required** — uses standard Win32 API
 - **Lightweight** — single Python file, minimal dependencies
 
@@ -27,7 +27,7 @@ Tiny system tray utility that turns off all monitors without putting the PC to s
 pip install -r requirements.txt
 ```
 
-Requires **Python 3.14+** and **Windows**.
+Requires **Python 3.8+** and **Windows**.
 
 ## Usage
 
@@ -76,7 +76,7 @@ The `displayoff_config.json` file has one additional key not exposed in the GUI:
 ```
 
 - `false` (default) — every blank trigger routes through the **native idle-display-off path** (`PowerWriteACValueIndex` + `PowerSetActiveScheme` with a 1-second timeout, then restore). Safe on every Windows version since Win95; required on hardware where the legacy mechanism cycles.
-- `true` — every blank trigger routes through the **legacy `SC_MONITORPOWER`** path (`SendMessageTimeoutW(WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF)`). Slightly faster blank (~0.5s vs ~5s) but **may cycle to reboot-required on Modern Standby + hybrid-GPU laptops** (verified failure on ASUS ROG Strix G614JV, 2026-05-14). Only flip this on if you've confirmed the legacy path works on your hardware.
+- `true` — every blank trigger routes through the **legacy `SC_MONITORPOWER`** path (`SendMessageTimeoutW(WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF)`). Slightly faster blank (~0.5s vs ~5s) but **may cycle to reboot-required on Modern Standby + hybrid-GPU laptops** (verified failure mode on at least one such device, 2026-05). Only flip this on if you've confirmed the legacy path works on your hardware.
 
 You can also force a specific path one-shot via `--native-off` / `--legacy-off` CLI flags without touching the config.
 
@@ -94,7 +94,7 @@ The native path lives in [`native_blank.py`](./native_blank.py) and does this da
 4. Sleep ~5 seconds. Windows itself fires its native display-off code as the kernel's idle counter crosses the 1-second threshold (same path that fires after your normal 10-minute idle).
 5. Restore the original AC/DC timeouts via the same `powercfg` calls. Verify the restore succeeded via a follow-up read; only clear the sentinel on affirmative match.
 
-**No `SC_MONITORPOWER` message is ever sent.** That's the whole point — the legacy mechanism breaks on certain hardware (the developer's ROG Strix G614JV in particular: Modern Standby S0ix + Intel UHD/NVIDIA RTX 4060 Optimus hybrid). The native idle-display-off code path has been working reliably on every Windows version since Win95 and is the same one OEM drivers expect to see.
+**No `SC_MONITORPOWER` message is ever sent.** That's the whole point — the legacy mechanism breaks on certain Modern Standby + hybrid-GPU hardware. The native idle-display-off code path has been working reliably on every Windows version since Win95 and is the same one OEM drivers expect to see.
 
 Both `powercfg.exe` invocations and the rest of the work happen under `subprocess.run` with `creationflags=CREATE_NO_WINDOW` + `STARTUPINFO(SW_HIDE)` so the ~5 child processes per blank don't flash console windows under `pythonw.exe`.
 

@@ -1,8 +1,8 @@
 """Native Windows display-off via the power-policy idle path.
 
-Why this exists: on Nate's ROG Strix G614JV (Modern Standby only, hybrid
-Intel UHD + NVIDIA RTX 4060), `SC_MONITORPOWER MONITOR_OFF` triggers a
-display on/off cycle that input cannot recover from. The Windows-native
+Why this exists: on Modern Standby laptops with hybrid-GPU configurations,
+`SC_MONITORPOWER MONITOR_OFF` can trigger a display on/off cycle that
+input cannot recover from. The Windows-native
 idle-display-off path (the one wired to Settings ▸ Power ▸ "Turn off the
 display after N minutes") works correctly on the same hardware.
 

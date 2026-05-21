@@ -304,12 +304,11 @@ def hotkey_display_name(cfg):
     return "+".join(parts)
 
 
-# ── Autostart (Startup-folder .lnk, matching the rest of the tray-app set) ─
-# v1.7.0+ uses the user's Startup folder (a .lnk next to MicMute.lnk,
-# SyncthingPause.lnk, CapsNumTray.lnk, MWBToggle.lnk, etc.) instead of the
+# ── Autostart (Startup-folder .lnk) ─
+# v1.7.0+ uses the user's Startup folder (a .lnk in
+# %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup) instead of the
 # HKCU Run registry key. Same effect at logon, but the .lnk is visible /
-# manageable in File Explorer, which matches how Nate manages every other
-# tray app in the workspace. The legacy `HKCU\...\Run\DisplayOff` registry
+# manageable in File Explorer. The legacy `HKCU\...\Run\DisplayOff` registry
 # entry is detected for backward compat and cleaned up on next toggle.
 
 _RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -445,7 +444,7 @@ def _create_startup_lnk():
     # break the script or inject arbitrary PS. `_ps_sq_escape` doubles every
     # `'` per PS literal rules. The Arguments field's content also gets
     # escaped because the inner double-quotes wrap a value that goes into a
-    # *different* PS string parser (verified by Sonnet+Opus audit 2026-05-14).
+    # *different* PS string parser (verified by code review 2026-05-14).
     lnk_q = _ps_sq_escape(_STARTUP_LNK_PATH)
     py_q = _ps_sq_escape(py)
     # script_q is embedded inside `'"{script_q}"'` — the OUTER context is PS
@@ -597,7 +596,7 @@ def _read_lnk_target_path():
     # `pythonw.exe` (no console) often prepends `﻿` to the first line,
     # which makes the path comparison in `autostart_enabled()` fail forever
     # → user sees "stale shortcut" log spam on every Settings open and the
-    # .lnk gets re-created every Save. Caught by Sonnet+Opus R2 audit
+    # .lnk gets re-created every Save. Caught by code review R2
     # 2026-05-14. Also strip BOM defensively in case PS env overrides the
     # encoding directive.
     ps_script = (
@@ -699,7 +698,7 @@ def set_autostart(enabled):
     best-effort and never raises (warnings go to displayoff.log)."""
     # Build a string description for the log line — keep `_legacy_run_key_present`'s
     # return contract a clean bool|raise and confine the "unreadable" sentinel
-    # to log presentation only. (Caught by Opus R2 audit: prior version
+    # to log presentation only. (Caught by R2 code review: prior version
     # rebound the same variable name to both bool and str, a future-refactor
     # footgun where `if legacy_state:` would treat a locked hive as "present".)
     try:
@@ -1725,7 +1724,6 @@ def _open_settings_impl(tray_icon, on_saved):
     # / Updates), a key-bind, an `after()` callback, or a hotkey-recording
     # event would silently evaporate. This single line ensures every
     # swallowed exception lands in `displayoff.log` instead of /dev/null.
-    # (Defense #2 from `memory/reference_tk_callback_silent_under_pythonw.md`.)
     def _log_tk_callback_exc(exc_type, exc_val, exc_tb):
         log.error("Tk callback exception (Settings dialog)",
                   exc_info=(exc_type, exc_val, exc_tb))
@@ -2280,8 +2278,8 @@ def run_tray():
     #
     # In v1.6.0+ the blank routes through the Win32 native idle-display-off
     # path (PowerWriteACValueIndex + PowerSetActiveScheme writing a 1-second
-    # timeout). On this developer's hardware (ASUS ROG Strix G614JV, Modern
-    # Standby + Intel UHD/RTX 4060 hybrid), the menu-item path fired the
+    # timeout). On Modern Standby + hybrid-GPU laptop hardware, the
+    # menu-item path fired the
     # underlying call chain perfectly — idle counter accumulated past the
     # threshold cleanly per GetLastInputInfo polling, nothing held the
     # display awake per `powercfg /requests` — but the kernel did not act on
@@ -2338,8 +2336,7 @@ def run_tray():
              hotkey_name[0])
 
     # Win11 hides new tray icons in the overflow flyout by default. Auto-promote
-    # via the shared tray_promoter module (canonical pattern at
-    # _.claude/_templates/snippets/python/tray-icon-promoter.md). pystray uses
+    # via the shared tray_promoter module. pystray uses
     # pythonw.exe as the executable path, so the promoter matches on
     # (ExecutablePath, tooltip) rather than path alone to distinguish from
     # other Python tray apps the user might have. Guarded above against

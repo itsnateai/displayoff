@@ -39,3 +39,9 @@ displayoff_config.json
 
 # Environment
 .env
+
+# Workspace-internal docs (LOCAL ONLY — never publish)
+CLAUDE.md
+
+# swarmaudit artifacts (audit cache, never publish)
+.swarmaudit/
