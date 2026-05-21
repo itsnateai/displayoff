@@ -65,7 +65,7 @@ if sys.platform == "win32":
     class _LASTINPUTINFO(ctypes.Structure):
         _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
-    _user32 = ctypes.windll.user32
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
     # use_last_error=True so CreateMutexW's LastError survives ctypes' GIL
     # release into ctypes.get_last_error(). Without it, a stray Python GIL
     # cycle between CreateMutexW(...) and a separate GetLastError() binding
