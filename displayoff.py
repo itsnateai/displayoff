@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.9"
+__version__ = "1.7.10"
 
 log = logging.getLogger("displayoff")
 
@@ -2975,6 +2975,20 @@ def main():
             _MIGRATION_LOG.clear()
     if sys.stderr is not None:
         _handlers.append(logging.StreamHandler())
+    if not _handlers:
+        # pythonw.exe (no stderr) + RotatingFileHandler init failed (no
+        # writable _DATA_DIR). `logging.basicConfig(handlers=[])` is a no-op
+        # — it skips configuration entirely and leaves the root logger with
+        # its default WARNING threshold and no handlers, so every subsequent
+        # `log.info(...)` silently drops via the lastResort handler (which
+        # only fires at WARNING+). That defeats the whole point of the
+        # fallback. NullHandler keeps basicConfig in its happy path: the
+        # logger gets configured at INFO level, calls succeed (going to
+        # /dev/null), and `lastResort` no longer suppresses anything. The
+        # tray still launches; the migration breadcrumbs are still lost
+        # (no destination exists to hold them), but the rest of the app
+        # remains observable to any future logging.* reconfiguration.
+        _handlers.append(logging.NullHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(name)s] %(message)s",

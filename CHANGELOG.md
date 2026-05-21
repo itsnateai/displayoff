@@ -1,5 +1,23 @@
 # Changelog — Display Off
 
+## [1.7.10] — 2026-05-21
+
+Closes a silent-zombie failure mode introduced by v1.7.9's hardening commit (`5650712`), and retroactively documents that hardening commit (which v1.7.9's CHANGELOG entry omitted).
+
+### Fixed
+
+- **Logging fallback no longer silently drops every log call under `pythonw.exe` + unwritable `%APPDATA%`.** v1.7.9 wrapped the `RotatingFileHandler` init in a `try/except OSError` so an unwritable `_DATA_DIR` wouldn't crash `main()`. But when both the file handler failed AND `sys.stderr is None` (the exact case `pythonw.exe` lands in), the resulting `_handlers` list was empty, and `logging.basicConfig(handlers=[])` is a documented no-op — it leaves the root logger at its default `WARNING` threshold with no handlers attached. Every subsequent `log.info(...)` then dropped silently via Python's `lastResort` handler, which only fires at `WARNING` or higher. The tray ran but produced zero log output for its entire lifetime — exactly the silent-zombie state the hardening was supposed to prevent. Now: a `NullHandler` is appended when `_handlers` would otherwise be empty, so `basicConfig` stays in its happy path. The migration breadcrumbs are still lost (no destination exists to hold them), but the rest of the app remains observable to any later logging reconfiguration. Surfaced by 4 of 6 verifiers (T2 Sonnet+Opus, T3 Sonnet+Opus convergent CRITICAL) on the v1.7.9 round-2 audit.
+
+### Notes — retroactive documentation for v1.7.9 hardening (commit `5650712`)
+
+The v1.7.9 CHANGELOG entry below describes only the original v1.7.9 scope (APPDATA migration, right-click reset, `_themed_dialog` typo guard, tooltip non-BMP comment). It omits the three verifier-hardening fixes that shipped in v1.7.9 commit `5650712`:
+
+- `RotatingFileHandler` init wrapped in `try/except OSError`, falling back to console + stderr breadcrumb dump. (The bug v1.7.10 closes above is a degenerate case of THIS fallback.)
+- `_migrate_legacy_data` race-loss handling: if `shutil.move` raises but `dst` exists post-failure, log as benign concurrent-launch race rather than user-facing migration failure. Mirrored in `displayoff.py` and `native_blank.py`.
+- `_menu_header_text` body wrapped in `try/except Exception` so a callable failure on pystray's menu-paint thread doesn't render an empty header label (pystray's Win32 backend silently swallows exceptions from dynamic-property callables).
+
+Future releases will document hardening commits in their own CHANGELOG section.
+
 ## [1.7.9] — 2026-05-21
 
 Closes the two items v1.7.8 deferred: relocation of per-user state to `%APPDATA%\displayoff\`, and right-click reset of the double-click timer. Plus two non-blocking nits from the v1.7.8 verifier pass — `_themed_dialog` typo'd-kind hardening and a tooltip non-BMP analysis comment.
