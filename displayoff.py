@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.11"
+__version__ = "1.7.12"
 
 log = logging.getLogger("displayoff")
 
@@ -60,6 +60,13 @@ _CONFIG_PATH = os.path.join(_DATA_DIR, "displayoff_config.json")
 # handler. main() flushes this list once the logger is live. Module-level
 # so both ensure_data_dir and _migrate_legacy_data can append.
 _MIGRATION_LOG: list[str] = []
+
+# One-shot gate (v1.7.12): _migrate_legacy_data is idempotent by design (each
+# file check is `src exists AND dst missing`), but the existence-check loop
+# still runs every call — wasted ~5 stat syscalls per blank fire on a fully-
+# migrated install. This flag short-circuits the whole loop after first
+# successful pass. Resets only on process restart.
+_MIGRATED = False
 
 
 def _ensure_data_dir():
@@ -102,8 +109,17 @@ def _migrate_legacy_data():
     Called from main() AFTER _ensure_data_dir() but BEFORE basicConfig
     so the freshly-attached log handler reads the migrated file rather
     than re-creating an empty one at the new path while the old log
-    sits orphaned in _HERE."""
+    sits orphaned in _HERE.
+
+    v1.7.12: gated on the module-level _MIGRATED flag so repeated calls
+    in the same process (e.g. main() then native_blank's lazy migrate
+    when imported for blank_via_idle_path) short-circuit the existence-
+    check loop entirely after the first pass."""
+    global _MIGRATED
+    if _MIGRATED:
+        return
     if _DATA_DIR == _HERE:
+        _MIGRATED = True
         return
     import shutil
     legacy_names = [
@@ -149,6 +165,12 @@ def _migrate_legacy_data():
                 _MIGRATION_LOG.append(
                     f"could not migrate {src!r} -> {dst!r}: {e}"
                 )
+    # Mark the migration complete regardless of per-file failures — any
+    # source file still in _HERE after this point either failed to move
+    # (logged above) or didn't exist to begin with. A retry on next call
+    # would replay the same loop with the same outcome; the flag spares
+    # the syscalls.
+    _MIGRATED = True
 
 # ── Single-instance guard ──────────────────────────────────────────────────
 # Local\ scope = per-session. Each Windows user gets their own instance,
@@ -303,6 +325,20 @@ if sys.platform == "win32":
     OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL,
                             ctypes.wintypes.DWORD]
     OpenProcess.restype = ctypes.wintypes.HANDLE
+
+    # shcore.dll only exists on Win8.1+. Try-import so the module still loads
+    # on Win7. _set_dpi_awareness checks for None before calling, and falls
+    # through to the user32 SetProcessDPIAware path (which always exists).
+    try:
+        _shcore = ctypes.WinDLL("shcore", use_last_error=True)
+    except OSError:
+        _shcore = None
+
+    # SetProcessDpiAwarenessContext is a Win10 1607+ symbol on user32.dll;
+    # SetProcessDPIAware exists on every Windows back to Vista. Both are
+    # resolved lazily inside _set_dpi_awareness via getattr — they're
+    # rarely-called and the AttributeError fallback chain is part of the
+    # API contract here (older Windows = quieter DPI awareness).
 
     _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     OpenProcessToken = _advapi32.OpenProcessToken
@@ -1726,26 +1762,44 @@ def _set_dpi_awareness():
 
     Cascades V2 → Per-Monitor → System Aware → silent fallback so we cope
     with older Win10 builds that lack the newer entry points.
+
+    v1.7.12: converted from `ctypes.windll.*` to bound WinDLL names per the
+    workspace convention "Never call ctypes.windll.* directly outside the
+    bindings block." The bound names (_user32, _shcore) have explicit
+    use_last_error=True so any future LastError inspection sees the
+    intended thread-local. _shcore is None on Win7 (no shcore.dll); the
+    second-tier path is skipped on those systems, falling through to the
+    third tier (SetProcessDPIAware, universally available).
     """
     if sys.platform != "win32":
         return
+    # Tier 1 — Win10 1607+ per-monitor V2.
     try:
-        # DPI_AWARENESS_CONTEXT is a pseudo-handle (pointer-sized); pass via
-        # c_void_p so -4 sign-extends correctly on 64-bit Windows.
-        fn = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        fn = _user32.SetProcessDpiAwarenessContext
         fn.argtypes = [ctypes.c_void_p]
         fn.restype = ctypes.wintypes.BOOL
+        # DPI_AWARENESS_CONTEXT is a pseudo-handle (pointer-sized); pass via
+        # c_void_p so -4 sign-extends correctly on 64-bit Windows.
         fn(ctypes.c_void_p(-4))  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
         return
     except (AttributeError, OSError):
         pass
+    # Tier 2 — Win8.1+ per-monitor (no V2).
+    if _shcore is not None:
+        try:
+            fn = _shcore.SetProcessDpiAwareness
+            fn.argtypes = [ctypes.c_int]   # PROCESS_DPI_AWARENESS enum
+            fn.restype = ctypes.c_long      # HRESULT
+            fn(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+            return
+        except (AttributeError, OSError):
+            pass
+    # Tier 3 — Vista+ system-aware (every supported Windows).
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
-        return
-    except (AttributeError, OSError):
-        pass
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        fn = _user32.SetProcessDPIAware
+        fn.argtypes = []
+        fn.restype = ctypes.wintypes.BOOL
+        fn()
     except (AttributeError, OSError):
         pass
 

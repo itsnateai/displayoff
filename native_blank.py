@@ -204,6 +204,13 @@ _SENTINEL_PATH = os.path.join(_DATA_DIR, ".native_blank_in_progress.json")
 # _ensure_module_logger_has_filehandler).
 _MIGRATION_LOG: list[str] = []
 
+# One-shot gate (v1.7.12): mirrors displayoff.py. _migrate_legacy_data is
+# called from both _setup_logging (standalone CLI) and
+# _ensure_module_logger_has_filehandler (import path); when displayoff.main()
+# also already migrated everything, this avoids burning ~5 stat syscalls per
+# blank fire on a fully-migrated install.
+_MIGRATED = False
+
 
 def _ensure_data_dir():
     """Idempotent. Creates _DATA_DIR if APPDATA-based; no-op for _HERE
@@ -229,8 +236,17 @@ def _migrate_legacy_data():
     moved these files (it migrates the union of both modules' state). This
     function exists for the standalone-CLI path (`python native_blank.py
     --read/--toggle/--blank`) so the tool works after a v1.7.9 upgrade
-    even if the tray was never relaunched."""
+    even if the tray was never relaunched.
+
+    v1.7.12: gated on the module-level _MIGRATED flag so repeated calls
+    (the lazy-from-_setup_logging-and-from-_ensure_module_logger_has_filehandler
+    pattern, plus displayoff.main()'s own pass) short-circuit the existence-
+    check loop entirely after the first run."""
+    global _MIGRATED
+    if _MIGRATED:
+        return
     if _DATA_DIR == _HERE:
+        _MIGRATED = True
         return
     import shutil
     for name in ("native_blank.log",
@@ -258,6 +274,9 @@ def _migrate_legacy_data():
                 _MIGRATION_LOG.append(
                     f"could not migrate {src!r} -> {dst!r}: {e}"
                 )
+    # Mark complete regardless of per-file outcomes — a retry would replay
+    # the same loop with the same outcome. Mirrors displayoff.py.
+    _MIGRATED = True
 
 
 _ensure_data_dir()

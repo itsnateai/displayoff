@@ -1,5 +1,26 @@
 # Changelog — Display Off
 
+## [1.7.12] — 2026-05-21
+
+Pre-existing-cleanup pass. Two real fixes from carried-forward backlog plus a Notes section correcting documentation drift in v1.7.11's CHANGELOG entry.
+
+### Changed
+
+- **`_migrate_legacy_data` now short-circuits on a module-level `_MIGRATED` flag** in both `displayoff.py` and `native_blank.py`. Previously, the migration function ran its 9-entry file-existence loop on every invocation — idempotent, but wasted ~5 `os.path.exists` syscalls per blank fire on a fully-migrated install. On an active workstation firing the idle-blank watcher 40-60 times/day, that's a few hundred wasted stat calls. The flag short-circuits the entire loop after the first successful pass; mirrors the standard "one-shot completion gate" pattern. Resets only on process restart. Surfaced by T2 Opus round 4.
+- **`_set_dpi_awareness` now uses bound `WinDLL` names instead of raw `ctypes.windll.user32` / `ctypes.windll.shcore`** — converted to the workspace convention "Never call `ctypes.windll.*` directly outside the bindings block." The bindings block gained a lazy `_shcore = ctypes.WinDLL("shcore", use_last_error=True)` wrapped in `try/except OSError` so Win7 (no `shcore.dll`) still loads the module — the per-monitor Win8.1+ tier is silently skipped on those systems, falling through to the universally-available `SetProcessDPIAware` third tier. Bound function declarations replace the inline `getattr`-via-`windll` pattern. No live bug (DPI awareness returns are not currently `LastError`-inspected), but the consistency closes a future-bug surface where a downstream `ctypes.get_last_error()` call could read a stale value from a different DLL's syscall. Surfaced by T3 Opus round 1.
+
+### Notes — corrections to v1.7.11 CHANGELOG entry
+
+The v1.7.11 entry below carries two documentation inaccuracies surfaced by the round-4 verifier dispatch but not corrected in-place to avoid divergence with the v1.7.11 GitHub release notes (extracted at tag time):
+
+- v1.7.11 "Removed" section says `restore_ok` lived at `native_blank.py:639-642`. The actual range of the removed variable was lines 639 + 642 (set to False then True around the `_write_display_timeouts` call); the line that now remains is the historical reference at line 648 of the post-removal file. (T2 Opus round 4.)
+- v1.7.11 "Fixed" section describes the `_MIGRATION_LOG.clear()` gate as "gated on whether any non-`NullHandler` is attached to the root logger" — accurate for `displayoff.main()` (which inspects `logging.getLogger().handlers`), but `native_blank._flush_migration_log` uses a local `drained` flag set before `basicConfig` runs. The two implementations are functionally equivalent but the prose described only the displayoff mechanism. (T2 Sonnet round 4.)
+
+### Backlog for v1.7.13+
+
+- **`_set_pystray_dark_titlebar` / dark-mode menu setup uses `ctypes.windll.uxtheme` for ordinal lookups** (line 2397). Different shape from `_set_dpi_awareness`'s named-symbol pattern (uxtheme symbols 135 + 136 are name-less exports, only resolvable by ordinal), so the conversion is non-trivial. Same convention violation, lower priority — uxtheme failures fall through to a try/except with no `LastError` consultation.
+- **Rename-dance updater** — applies once frozen to `.exe`, currently inapplicable.
+
 ## [1.7.11] — 2026-05-21
 
 Backlog cleanup pass — five small fixes from the v1.7.9 + v1.7.10 verifier rounds that were deferred. No new features.
