@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.6"
+__version__ = "1.7.7"
 
 log = logging.getLogger("displayoff")
 
@@ -1340,6 +1340,96 @@ def _apply_dark_titlebar(root):
         log.warning("Could not apply dark title bar: %s", e)
 
 
+def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0):
+    """Dark-themed modal replacement for `tkinter.messagebox.*`.
+
+    `tkinter.messagebox` uses the native Win32 MessageBox primitive, which
+    paints stock light-mode chrome regardless of the app's theme — produces
+    a jarring white flash next to our dark Settings / About windows. This
+    helper builds an equivalent dialog as a `tk.Toplevel` so the same dark
+    palette + DWM titlebar trick applies.
+
+    `buttons`: tuple of button labels. `default_idx`: which one fires on
+    Enter and gets initial keyboard focus. Returns the clicked label, or
+    `None` if the user closed via the X / Esc. For yes/no usage, default
+    to "No" (`default_idx=1`) so Enter is a safe non-action.
+    """
+    import tkinter as tk
+    dlg = tk.Toplevel(parent)
+    dlg.withdraw()  # build invisibly to avoid light-mode flash before dark titlebar
+    dlg.title(title)
+    dlg.configure(bg=_THEME_BG)
+    dlg.resizable(False, False)
+    dlg.transient(parent)
+    dlg.attributes("-topmost", True)
+    _apply_dark_titlebar(dlg)
+
+    result = [None]  # mutable closure capture; messages-box-style return
+
+    body = tk.Label(dlg, text=message, justify="left", wraplength=460,
+                    font=("Segoe UI", 10),
+                    bg=_THEME_BG, fg=_THEME_FG,
+                    padx=20, pady=15)
+    body.pack()
+
+    btn_frame = tk.Frame(dlg, bg=_THEME_BG)
+    btn_frame.pack(pady=(0, 15))
+
+    def _make_handler(label):
+        def _handler():
+            result[0] = label
+            dlg.destroy()
+        return _handler
+
+    btn_widgets = []
+    for label in buttons:
+        btn = tk.Button(btn_frame, text=label, command=_make_handler(label),
+                        font=("Segoe UI", 9), width=10,
+                        bg=_THEME_BTN_BG, fg=_THEME_BTN_FG,
+                        activebackground=_THEME_BTN_ACTIVE_BG,
+                        activeforeground=_THEME_BTN_ACTIVE_FG,
+                        relief="flat", borderwidth=1,
+                        highlightthickness=1, highlightbackground=_THEME_SEP)
+        btn.pack(side="left", padx=5)
+        btn_widgets.append(btn)
+
+    if btn_widgets:
+        # Defer focus until after deiconify so the highlight ring renders.
+        default_btn = btn_widgets[min(default_idx, len(btn_widgets) - 1)]
+        dlg.bind("<Return>", lambda _: default_btn.invoke())
+    # Escape and the close button both produce result=None (the
+    # "dismissed without choosing" case). For yes/no dialogs callers check
+    # `== "Yes"`, so None correctly maps to "user said No / closed".
+    dlg.bind("<Escape>", lambda _: dlg.destroy())
+    dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+
+    # Center on parent (or screen if no parent geometry) before the alpha-mask
+    # deiconify pattern (matches Settings + About).
+    dlg.update_idletasks()
+    w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+    try:
+        px = parent.winfo_rootx() + max((parent.winfo_width() - w) // 2, 0)
+        py = parent.winfo_rooty() + max((parent.winfo_height() - h) // 2, 0)
+    except (AttributeError, tk.TclError):
+        px = (dlg.winfo_screenwidth() - w) // 2
+        py = (dlg.winfo_screenheight() - h) // 2
+    dlg.geometry(f"{w}x{h}+{px}+{py}")
+
+    dlg.attributes("-alpha", 0)
+    dlg.deiconify()
+    dlg.update()
+    _apply_dark_titlebar(dlg)  # re-assert after deiconify (Win11 repaint quirk)
+    dlg.update()
+    dlg.attributes("-alpha", 1)
+
+    if btn_widgets:
+        btn_widgets[min(default_idx, len(btn_widgets) - 1)].focus_set()
+
+    dlg.grab_set()
+    parent.wait_window(dlg)
+    return result[0]
+
+
 # ── UI helpers ─────────────────────────────────────────────────────────────
 
 def _set_dpi_awareness():
@@ -1765,7 +1855,6 @@ def _open_settings(tray_icon, on_saved=None):
 def _open_settings_impl(tray_icon, on_saved):
     """Build and run the settings dialog. Wires the row builders into a Tk root."""
     import tkinter as tk
-    from tkinter import messagebox
 
     cfg = load_config()
     captured = {"modifiers": list(cfg["hotkey"]["modifiers"]), "key": cfg["hotkey"]["key"]}
@@ -1829,19 +1918,16 @@ def _open_settings_impl(tray_icon, on_saved):
         if safety is not None:
             severity, msg = safety
             if severity == "block":
-                messagebox.showerror("Display Off", msg, parent=root)
+                _themed_dialog(root, "Display Off", msg)
                 return False
             # severity == "warn" — give the user a chance to proceed anyway.
-            if not messagebox.askyesno("Display Off", msg, parent=root):
+            if _themed_dialog(root, "Display Off", msg, ("Yes", "No"), default_idx=1) != "Yes":
                 return False
         try:
             idle_minutes = max(0, int(idle_var.get() or 0))
         except (TypeError, ValueError):
-            messagebox.showerror(
-                "Display Off",
-                "Idle-blank minutes must be a non-negative number.",
-                parent=root,
-            )
+            _themed_dialog(root, "Display Off",
+                           "Idle-blank minutes must be a non-negative number.")
             return False
         cfg["hotkey"] = dict(captured)
         cfg["lock_on_off"] = bool(lock_var.get())
@@ -1849,11 +1935,8 @@ def _open_settings_impl(tray_icon, on_saved):
         try:
             save_config(cfg)
         except OSError as e:
-            messagebox.showerror(
-                "Display Off",
-                f"Could not save settings:\n{e}",
-                parent=root,
-            )
+            _themed_dialog(root, "Display Off",
+                           f"Could not save settings:\n{e}")
             return False
         # Autostart is a separate side effect — config is already persisted
         # whether or not this succeeds. Catch broadly: Tk's default
@@ -1873,13 +1956,10 @@ def _open_settings_impl(tray_icon, on_saved):
                 autostart_state["enabled"] = desired_autostart
         except Exception as e:
             log.exception("Autostart toggle failed")
-            messagebox.showerror(
-                "Display Off",
-                f"Autostart toggle failed:\n{type(e).__name__}: {e}\n\n"
-                f"Your other settings were saved. Adjust and click Save "
-                f"again to retry — the dialog stays open.",
-                parent=root,
-            )
+            _themed_dialog(root, "Display Off",
+                           f"Autostart toggle failed:\n{type(e).__name__}: {e}\n\n"
+                           f"Your other settings were saved. Adjust and click Save "
+                           f"again to retry — the dialog stays open.")
             # Refresh the checkbox to the actual on-disk state so the user
             # sees the real state (not what they thought they'd set) and
             # the cached state matches reality for the next change-check.
@@ -2126,7 +2206,6 @@ def _run_update_check(parent_root):
     """Hit the GitHub releases API and show a result dialog as a child of
     `parent_root`. Network call runs in a daemon thread so the Tk event loop
     stays responsive; result is marshalled back via `parent_root.after`."""
-    from tkinter import messagebox
 
     def _show_result(has_update, latest, html_url, err):
         try:
@@ -2169,16 +2248,18 @@ def _run_update_check(parent_root):
                         f"Could not check for updates.\n\n{err_text}\n\n"
                         "Verify your internet connection and try again."
                     )
-                messagebox.showwarning("Display Off", msg, parent=parent_root)
+                _themed_dialog(parent_root, "Display Off", msg)
             elif has_update:
-                if messagebox.askyesno(
+                if _themed_dialog(
+                    parent_root,
                     "Display Off — Update available",
                     f"A newer version is available.\n\n"
                     f"Current: v{__version__}\n"
                     f"Latest:  v{latest}\n\n"
                     "Open the release page in your browser?",
-                    parent=parent_root,
-                ):
+                    buttons=("Yes", "No"),
+                    default_idx=0,
+                ) == "Yes":
                     # html_url comes from GitHub API response — validate it
                     # before passing to webbrowser.open. A compromised release
                     # or MITM-injected JSON could set html_url to a
@@ -2191,12 +2272,12 @@ def _run_update_check(parent_root):
                     else:
                         _open_url(_GITHUB_RELEASES_URL)
             else:
-                messagebox.showinfo(
+                _themed_dialog(
+                    parent_root,
                     "Display Off — Up to date",
                     f"You're on the latest release.\n\n"
                     f"Current: v{__version__}\n"
                     f"Latest:  v{latest}",
-                    parent=parent_root,
                 )
         except Exception as e:
             log.exception("Update check dialog crashed: %s", e)

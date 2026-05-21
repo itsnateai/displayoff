@@ -1,5 +1,13 @@
 # Changelog — Display Off
 
+## [1.7.7] — 2026-05-21
+
+UX polish: all in-app dialogs now render in the dark theme.
+
+### Fixed
+
+- **Update-check result, settings-save error, hotkey-safety warning, and autostart-failure dialogs all stopped being white-themed.** Every previous use of `tkinter.messagebox.*` (which delegates to the native Win32 MessageBox primitive) painted stock light-mode chrome regardless of our app theme — a visible white flash next to the dark Settings/About windows. Replaced with `_themed_dialog`, a `tk.Toplevel`-based modal that reuses the same dark palette + DWM titlebar trick the Settings and About dialogs already use. All 8 dialog sites converted. Enter fires the default button, Esc / window-close dismiss without action.
+
 ## [1.7.6] — 2026-05-21
 
 Audit-driven correctness + security pass. Seven fixes surfaced by a pre-public-release code audit; no functional behavior changes beyond closing the bugs.
