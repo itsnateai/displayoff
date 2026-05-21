@@ -1,10 +1,10 @@
 # Display Off
 
-![Release](https://img.shields.io/github/v/release/itsnateai/displayoff)
-[![Downloads](https://img.shields.io/github/downloads/itsnateai/displayoff/total?label=downloads&color=brightgreen)](https://github.com/itsnateai/displayoff/releases)
-![License](https://img.shields.io/github/license/itsnateai/displayoff)
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
-![Platform](https://img.shields.io/badge/platform-Windows-blue)
+[![GitHub Release](https://img.shields.io/github/v/release/itsnateai/displayoff)](https://github.com/itsnateai/displayoff/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
+[![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)](https://github.com/itsnateai/displayoff)
+[![GitHub Downloads](https://img.shields.io/github/downloads/itsnateai/displayoff/total)](https://github.com/itsnateai/displayoff/releases)
 
 Tiny system tray utility that turns off all monitors without putting the PC to sleep.
 
