@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.10"
+__version__ = "1.7.11"
 
 log = logging.getLogger("displayoff")
 
@@ -2978,13 +2978,21 @@ def main():
     if not _handlers:
         # pythonw.exe (no stderr) + RotatingFileHandler init failed (no
         # writable _DATA_DIR). `logging.basicConfig(handlers=[])` is a no-op
-        # — it skips configuration entirely and leaves the root logger with
-        # its default WARNING threshold and no handlers, so every subsequent
-        # `log.info(...)` silently drops via the lastResort handler (which
-        # only fires at WARNING+). That defeats the whole point of the
-        # fallback. NullHandler keeps basicConfig in its happy path: the
-        # logger gets configured at INFO level, calls succeed (going to
-        # /dev/null), and `lastResort` no longer suppresses anything. The
+        # — it skips configuration entirely (the empty list passes the
+        # truthiness check that `handlers is None` would have rejected, and
+        # `basicConfig` documented behavior is to do nothing once any
+        # configuration argument is "effectively unset"). Result: the root
+        # logger keeps its bootstrap state (no handlers attached, level
+        # WARNING). A subsequent `log.info(...)` then dispatches past the
+        # implicit per-logger level filter, finds NO handlers in the chain,
+        # and falls through to the module-level `lastResort` handler — which
+        # itself filters at WARNING. So INFO calls silently drop with no
+        # visible artifact. (NB: this is subtler than "root stays at
+        # WARNING" — `basicConfig(level=INFO, handlers=[])` doesn't take the
+        # level either; the silence comes from `lastResort`'s WARNING gate.)
+        # NullHandler keeps basicConfig in its happy path: the logger gets
+        # configured at INFO level, log.info calls find a handler (a no-op
+        # one, but a handler), and `lastResort` is never consulted. The
         # tray still launches; the migration breadcrumbs are still lost
         # (no destination exists to hold them), but the rest of the app
         # remains observable to any future logging.* reconfiguration.
@@ -2999,7 +3007,19 @@ def main():
     # Skipped if the stderr-fallback above already drained _MIGRATION_LOG.
     for _msg in _MIGRATION_LOG:
         log.info("data-dir migration: %s", _msg)
-    _MIGRATION_LOG.clear()
+    # v1.7.11 refinement: only clear the buffer when at least one real handler
+    # consumed the messages. In the NullHandler-only degenerate path
+    # (pythonw + unwritable _DATA_DIR) the log.info calls above went to
+    # /dev/null — wiping the buffer there strands the breadcrumbs with no
+    # forensic surface. Keep them so a future About-dialog readout, a
+    # `/diagnostics` CLI flag, or an exception handler can surface "we
+    # tried to migrate these files and nothing got written" to the user.
+    _root_has_real_handler = any(
+        not isinstance(_h, logging.NullHandler)
+        for _h in logging.getLogger().handlers
+    )
+    if _root_has_real_handler:
+        _MIGRATION_LOG.clear()
 
     if "--version" in sys.argv:
         print(f"displayoff {__version__}")

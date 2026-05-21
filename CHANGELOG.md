@@ -1,5 +1,23 @@
 # Changelog — Display Off
 
+## [1.7.11] — 2026-05-21
+
+Backlog cleanup pass — five small fixes from the v1.7.9 + v1.7.10 verifier rounds that were deferred. No new features.
+
+### Fixed
+
+- **`native_blank.py` logging fallback is now symmetric with `displayoff.py main()`.** v1.7.10 hardened `displayoff.main()` against an unwritable `%APPDATA%` via a `try/except OSError` around `RotatingFileHandler` + `NullHandler` degenerate-case fallback. `native_blank.py`'s `_setup_logging()` (standalone-CLI entry point, `python native_blank.py --blank`) and `_ensure_module_logger_has_filehandler()` (import-driven entry point) had the same vulnerability — they would raise `OSError` uncaught from the `RotatingFileHandler` constructor when `_DATA_DIR` was unwritable, crashing the standalone CLI with a traceback or the import with an uncaught exception. Both functions now mirror `displayoff.main()`'s posture: `try/except OSError` around the file-handler creation, stderr breadcrumb dump when stderr is attached, NullHandler fallback when it isn't. Surfaced by 2 of 6 round-3 verifiers (T2 Sonnet+Opus convergent).
+- **`_MIGRATION_LOG.clear()` no longer wipes the buffer when nothing drained it.** When the NullHandler degenerate path fires (pythonw + unwritable `%APPDATA%`), `log.info("data-dir migration: %s", ...)` calls go to `/dev/null`. The previous unconditional `_MIGRATION_LOG.clear()` then erased the breadcrumbs with no forensic surface for the user. The clear is now gated on whether any non-`NullHandler` is attached to the root logger; the buffer survives in the silent path so a future About-dialog readout, `/diagnostics` CLI flag, or exception handler could surface what migration was attempted.
+
+### Changed
+
+- **`native_blank.py` no longer mutates the filesystem at module-import time.** Previously `_ensure_data_dir()` and `_migrate_legacy_data()` both ran unconditionally at module-level scope, so any `import native_blank` from a test harness, REPL, or peer module triggered `os.makedirs` + `shutil.move` calls under `%APPDATA%`. `_migrate_legacy_data()` is now invoked lazily from inside the two logging-setup entry points (`_setup_logging` for standalone-CLI usage, `_ensure_module_logger_has_filehandler` for imported usage), each running before the file handler attaches. Both calls are idempotent, so duplicate invocation across both entry points (the imported case where displayoff.main() already migrated) is a safe no-op. `_ensure_data_dir()` still runs at module load — it's a cheap idempotent `os.makedirs(exist_ok=True)` with no destructive side effects. Surfaced by T3 Opus rounds 1+2.
+- **Code-comment precision at the v1.7.10 `basicConfig(handlers=[])` fallback site.** The previous comment said `basicConfig(handlers=[])` "leaves the root logger with its default WARNING threshold." Empirically not quite right — `basicConfig` *also* fails to apply the `level=INFO` kwarg when it bails on the empty handlers list, but the silence-on-INFO behavior comes from `lastResort`'s WARNING gate (the module-level fallback handler at `logging.lastResort` that fires when no handlers exist), not from any threshold on root itself. Comment now describes the actual mechanism so a future maintainer reading it doesn't misdiagnose a regression. Surfaced by T2 Sonnet round 3.
+
+### Removed
+
+- **Dead `restore_ok` boolean in `native_blank.py:639-642`.** The variable was set in the `try`/`except` around `_write_display_timeouts` but never read — the verification gate that actually decides whether to clear the sentinel is the post-restore `_read_display_timeouts` comparison, not the boolean. Deleting it removes a misleading read-signal that suggested it was load-bearing. Surfaced by T3 Sonnet round 1.
+
 ## [1.7.10] — 2026-05-21
 
 Closes a silent-zombie failure mode introduced by v1.7.9's hardening commit (`5650712`), and retroactively documents that hardening commit (which v1.7.9's CHANGELOG entry omitted).

@@ -261,7 +261,14 @@ def _migrate_legacy_data():
 
 
 _ensure_data_dir()
-_migrate_legacy_data()
+# NOTE: _migrate_legacy_data() is NOT called at module import time. Migration
+# is a filesystem-mutating side effect — letting `import native_blank` from a
+# test harness, REPL, or peer module trigger shutil.move calls under %APPDATA%
+# is hostile to test isolation. Migration now happens lazily inside the two
+# logging-setup entry points (_setup_logging for standalone-CLI usage,
+# _ensure_module_logger_has_filehandler for imported usage), each of which
+# runs BEFORE attaching a file handler. Both are idempotent so duplicate
+# invocations are safe.
 
 # ── Tunables ──────────────────────────────────────────────────────────────
 _BLANK_TIMEOUT_SECONDS = 1   # value we write into AC/DC display-off timeout
@@ -273,14 +280,23 @@ _POWERCFG_TIMEOUT_SECONDS = 5
 log = logging.getLogger("native_blank")
 
 
-def _flush_migration_log():
+def _flush_migration_log(*, drained=True):
     """Drain the migration breadcrumb buffer once a real log handler is
-    attached. Called by both setup paths; idempotent."""
+    attached. Called by both setup paths; idempotent.
+
+    `drained=False` (v1.7.11+): we attached a NullHandler fallback, so
+    `log.info(...)` calls go to /dev/null. Emit the log lines anyway (in
+    case some future handler reconfiguration captures them) but skip the
+    `.clear()` so a future diagnostic surface — About-dialog readout, a
+    `/diagnostics` CLI flag, exception-handler dump — can still show the
+    user what migration was attempted. Buffer is small (≤9 entries × few
+    hundred chars), no GC pressure."""
     if not _MIGRATION_LOG:
         return
     for _msg in _MIGRATION_LOG:
         log.info("data-dir migration: %s", _msg)
-    _MIGRATION_LOG.clear()
+    if drained:
+        _MIGRATION_LOG.clear()
 
 
 def _setup_logging():
@@ -293,17 +309,45 @@ def _setup_logging():
     Under pythonw.exe sys.stderr is None and a bare StreamHandler() noisily
     fails every emit (caught by handleError but wasteful) — only attach it
     when there's a real stream behind it.
+
+    v1.7.11 symmetric hardening (with displayoff.py main()): the
+    RotatingFileHandler init is wrapped in try/except OSError so a
+    standalone `python native_blank.py --blank` against an unwritable
+    %APPDATA% degrades to console-only logging instead of crashing.
+    NullHandler fills the empty-handlers degenerate case to keep
+    basicConfig in its happy path (`basicConfig(handlers=[])` is a
+    documented no-op that would otherwise leave the root logger
+    unconfigured — silently dropping every subsequent log.info call).
     """
-    handlers = [RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000,
-                                    backupCount=3, encoding="utf-8")]
+    # Run migration before opening the log file — log file path lives in
+    # _DATA_DIR so the migration shim must complete first.
+    _migrate_legacy_data()
+
+    handlers = []
+    drained = True
+    try:
+        handlers.append(RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000,
+                                            backupCount=3, encoding="utf-8"))
+    except OSError as _e:
+        if sys.stderr is not None:
+            sys.stderr.write(
+                f"native_blank: log file at {_LOG_PATH!r} unavailable "
+                f"({_e}) — running without file logging\n"
+            )
+            for _m in _MIGRATION_LOG:
+                sys.stderr.write(f"native_blank: data-dir migration: {_m}\n")
+            _MIGRATION_LOG.clear()
     if sys.stderr is not None:
         handlers.append(logging.StreamHandler())
+    if not handlers:
+        handlers.append(logging.NullHandler())
+        drained = False
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(message)s",
         handlers=handlers,
     )
-    _flush_migration_log()
+    _flush_migration_log(drained=drained)
 
 
 def _ensure_module_logger_has_filehandler():
@@ -315,12 +359,35 @@ def _ensure_module_logger_has_filehandler():
 
     Idempotent: returns early if any FileHandler pointing at our log path
     already exists on this logger.
+
+    v1.7.11 symmetric hardening: RotatingFileHandler init wrapped in
+    try/except OSError so an unwritable %APPDATA% degrades to a
+    NullHandler on the module logger rather than raising out of the
+    caller. The migration runs first so the file-handler attach reads
+    the migrated log if it exists.
     """
+    _migrate_legacy_data()
     for h in log.handlers:
         if isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, "baseFilename", "")) == os.path.abspath(_LOG_PATH):
             _flush_migration_log()  # log already wired up earlier; still drain
             return
-    fh = RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    try:
+        fh = RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    except OSError as _e:
+        # Symmetric with _setup_logging's fallback. Attach NullHandler on
+        # the module logger so subsequent log.* calls succeed (going to
+        # /dev/null) rather than propagating to root and re-running the
+        # whole resolution chain on each call.
+        log.addHandler(logging.NullHandler())
+        log.setLevel(logging.INFO)
+        log.propagate = False
+        if sys.stderr is not None:
+            sys.stderr.write(
+                f"native_blank: import-time log file at {_LOG_PATH!r} "
+                f"unavailable ({_e}) — module logger silenced\n"
+            )
+        _flush_migration_log(drained=False)
+        return
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s [import] %(message)s"))
     log.addHandler(fh)
@@ -569,10 +636,8 @@ def native_blank(sleep_seconds, dry_label, hands_off_countdown=0):
         # Wrap defensively, log loudly, but ALWAYS clear the sentinel if we
         # got the values back to expected (verified by post-restore read).
         log.info("restoring AC=%ds DC=%ds", saved_ac, saved_dc)
-        restore_ok = False
         try:
             _write_display_timeouts(saved_ac, saved_dc)
-            restore_ok = True
         except Exception as e:
             log.error("RESTORE FAILED — display timeout may be stuck at 1s. "
                       "Manual fix: powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE %d ; "
@@ -580,12 +645,14 @@ def native_blank(sleep_seconds, dry_label, hands_off_countdown=0):
                       "powercfg /setactive SCHEME_CURRENT. Error: %s",
                       saved_ac, saved_dc, e)
         # Verification: re-read and check. Clear sentinel ONLY on affirmative
-        # match. The earlier "conservatively clear on verification failure"
-        # path was a footgun — `restore_ok=True` only proves the powercfg
-        # subprocess returned 0, not that the active scheme reflects the
-        # values we wrote. If we can't verify and we still clear the sentinel,
-        # the user could be silently stuck at AC=1 with no recovery trail on
-        # next launch. Better to leave the sentinel on disk and let the next
+        # match. Earlier versions held a `restore_ok` boolean reflecting
+        # whether _write_display_timeouts raised — but that only proves the
+        # powercfg subprocess returned 0, not that the active scheme reflects
+        # the values we wrote. The post-restore re-read below is the real
+        # gate; the boolean was misleading dead weight. If we can't verify
+        # and we still clear the sentinel, the user could be silently stuck
+        # at AC=1 with no recovery trail on next launch. Better to leave the
+        # sentinel on disk and let the next
         # launch's `_recover_from_stale_sentinel` retry the restore than to
         # paper over an unknown state.
         try:
