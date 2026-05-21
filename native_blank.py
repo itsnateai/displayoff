@@ -367,9 +367,22 @@ def _ensure_module_logger_has_filehandler():
     the migrated log if it exists.
     """
     _migrate_legacy_data()
+    # Two early-return conditions, both idempotent:
+    #   1. A FileHandler at _LOG_PATH is already attached (the happy path —
+    #      this function was already called with a writable _DATA_DIR).
+    #   2. A NullHandler is already attached (the OSError fallback path on
+    #      a previous call — re-running this function would re-attempt the
+    #      RotatingFileHandler, fail the same way, and stack a duplicate
+    #      NullHandler. The first call already configured propagate=False
+    #      and level=INFO; subsequent calls have nothing new to do.)
+    # The second guard is v1.7.11's belt-and-suspenders for repeated invocation
+    # under persistent OSError (T2 Sonnet + T2 Opus + T3 Opus convergent).
     for h in log.handlers:
         if isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, "baseFilename", "")) == os.path.abspath(_LOG_PATH):
             _flush_migration_log()  # log already wired up earlier; still drain
+            return
+        if isinstance(h, logging.NullHandler):
+            _flush_migration_log(drained=False)  # silent path; preserve buffer
             return
     try:
         fh = RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
