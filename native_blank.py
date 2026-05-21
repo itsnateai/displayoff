@@ -187,9 +187,70 @@ def _sleep_with_idle_log(sleep_seconds, poll_interval=0.25):
              poll_interval, ", ".join(f"{s:.2f}" for s in samples))
 
 # ── Paths ──────────────────────────────────────────────────────────────────
+# Mirrors the _DATA_DIR scheme in displayoff.py — per-user state lives in
+# %APPDATA%\displayoff\ since v1.7.9 so a shared install doesn't leak one
+# user's idle log + crash-recovery sentinel into another user's session.
+# Resolution is duplicated rather than imported to avoid a circular import
+# when native_blank is run standalone (`python native_blank.py --blank`).
+# Both modules read the same APPDATA env var, so they always agree.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_LOG_PATH = os.path.join(_HERE, "native_blank.log")
-_SENTINEL_PATH = os.path.join(_HERE, ".native_blank_in_progress.json")
+_DATA_DIR = (os.path.join(os.environ.get("APPDATA", ""), "displayoff")
+             if os.environ.get("APPDATA") else _HERE)
+_LOG_PATH = os.path.join(_DATA_DIR, "native_blank.log")
+_SENTINEL_PATH = os.path.join(_DATA_DIR, ".native_blank_in_progress.json")
+
+# Buffer for migration messages emitted before _setup_logging wires up the
+# file handler. Flushed once logging is live (see _setup_logging /
+# _ensure_module_logger_has_filehandler).
+_MIGRATION_LOG: list[str] = []
+
+
+def _ensure_data_dir():
+    """Idempotent. Creates _DATA_DIR if APPDATA-based; no-op for _HERE
+    fallback. Errors are buffered, not raised — the real failure surfaces
+    when an open() under the missing dir fails."""
+    if _DATA_DIR == _HERE:
+        return
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+    except OSError as e:
+        _MIGRATION_LOG.append(
+            f"could not create data dir {_DATA_DIR!r}: {e}"
+        )
+
+
+def _migrate_legacy_data():
+    """One-shot move of native_blank.log (+ rotated .1/.2/.3) and the
+    in-progress sentinel from _HERE to _DATA_DIR. Idempotent — only moves
+    when source exists and destination doesn't. No-op when _DATA_DIR ==
+    _HERE.
+
+    When displayoff.py launches first, ITS _migrate_legacy_data already
+    moved these files (it migrates the union of both modules' state). This
+    function exists for the standalone-CLI path (`python native_blank.py
+    --read/--toggle/--blank`) so the tool works after a v1.7.9 upgrade
+    even if the tray was never relaunched."""
+    if _DATA_DIR == _HERE:
+        return
+    import shutil
+    for name in ("native_blank.log",
+                 "native_blank.log.1", "native_blank.log.2", "native_blank.log.3",
+                 ".native_blank_in_progress.json"):
+        src = os.path.join(_HERE, name)
+        dst = os.path.join(_DATA_DIR, name)
+        if not os.path.exists(src) or os.path.exists(dst):
+            continue
+        try:
+            shutil.move(src, dst)
+            _MIGRATION_LOG.append(f"migrated {src!r} -> {dst!r}")
+        except OSError as e:
+            _MIGRATION_LOG.append(
+                f"could not migrate {src!r} -> {dst!r}: {e}"
+            )
+
+
+_ensure_data_dir()
+_migrate_legacy_data()
 
 # ── Tunables ──────────────────────────────────────────────────────────────
 _BLANK_TIMEOUT_SECONDS = 1   # value we write into AC/DC display-off timeout
@@ -199,6 +260,16 @@ _BLANK_HANDS_OFF_COUNTDOWN_SECONDS = 6  # pre-blank countdown so the user can st
 _POWERCFG_TIMEOUT_SECONDS = 5
 
 log = logging.getLogger("native_blank")
+
+
+def _flush_migration_log():
+    """Drain the migration breadcrumb buffer once a real log handler is
+    attached. Called by both setup paths; idempotent."""
+    if not _MIGRATION_LOG:
+        return
+    for _msg in _MIGRATION_LOG:
+        log.info("data-dir migration: %s", _msg)
+    _MIGRATION_LOG.clear()
 
 
 def _setup_logging():
@@ -221,6 +292,7 @@ def _setup_logging():
         format="[%(asctime)s] %(levelname)s %(message)s",
         handlers=handlers,
     )
+    _flush_migration_log()
 
 
 def _ensure_module_logger_has_filehandler():
@@ -235,6 +307,7 @@ def _ensure_module_logger_has_filehandler():
     """
     for h in log.handlers:
         if isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, "baseFilename", "")) == os.path.abspath(_LOG_PATH):
+            _flush_migration_log()  # log already wired up earlier; still drain
             return
     fh = RotatingFileHandler(_LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     fh.setLevel(logging.INFO)
@@ -242,6 +315,7 @@ def _ensure_module_logger_has_filehandler():
     log.addHandler(fh)
     log.setLevel(logging.INFO)
     log.propagate = False  # don't double-log via root
+    _flush_migration_log()
 
 
 # ── powercfg shell-out ────────────────────────────────────────────────────

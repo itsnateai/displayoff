@@ -35,14 +35,110 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.8"
+__version__ = "1.7.9"
 
 log = logging.getLogger("displayoff")
 
 # ── Paths ──────────────────────────────────────────────────────────────────
+# _HERE = script directory. Holds repo-tracked assets (the icon) which travel
+# with the install and are never written to at runtime.
+# _DATA_DIR = per-user state (%APPDATA%\displayoff\). Holds config, logs,
+# crash-recovery sentinel — anything the running process writes. Split since
+# v1.7.9 so a shared install (e.g. one clone under Program Files used by two
+# Windows accounts) doesn't leak one user's idle-pattern history, log file,
+# or in-progress sentinel into another user's session. Matches the per-user
+# %APPDATA% discipline already used for the Startup-folder .lnk (see the
+# autostart section below — both use the same `APPDATA` env var, so when the
+# fallback to _HERE fires here it also fires for autostart).
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = (os.path.join(os.environ.get("APPDATA", ""), "displayoff")
+             if os.environ.get("APPDATA") else _HERE)
 _ICON_PATH = os.path.join(_HERE, "displayoff.ico")
-_CONFIG_PATH = os.path.join(_HERE, "displayoff_config.json")
+_CONFIG_PATH = os.path.join(_DATA_DIR, "displayoff_config.json")
+
+# Buffer for migration messages emitted before basicConfig wires up the file
+# handler. main() flushes this list once the logger is live. Module-level
+# so both ensure_data_dir and _migrate_legacy_data can append.
+_MIGRATION_LOG: list[str] = []
+
+
+def _ensure_data_dir():
+    """Idempotent. Creates _DATA_DIR if APPDATA-based; no-op when falling
+    back to _HERE. Best-effort: a failure here surfaces as a real error
+    when the first config/log write tries to open a file in the missing
+    directory, so we don't need to bail out — just buffer the warning.
+
+    Called at module load + again from main() before the migration shim,
+    so a directory removed between launches re-appears."""
+    if _DATA_DIR == _HERE:
+        return
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+    except OSError as e:
+        _MIGRATION_LOG.append(
+            f"could not create data dir {_DATA_DIR!r}: {e}"
+        )
+
+
+_ensure_data_dir()
+
+
+def _migrate_legacy_data():
+    """One-shot migration of state files from the v1.7.8 _HERE layout to
+    the v1.7.9+ %APPDATA%\\displayoff\\ layout.
+
+    Idempotent: a file is moved only if it exists in _HERE AND does not
+    already exist in _DATA_DIR, so a partially-completed migration resumes
+    safely on the next launch.
+
+    No-op when _DATA_DIR == _HERE (the APPDATA fallback) — both ends of
+    the move are the same path.
+
+    Files moved: displayoff_config.json, displayoff.log (+ rotated
+    .1/.2/.3 from RotatingFileHandler), native_blank.log (+ rotated),
+    .native_blank_in_progress.json. The icon stays in _HERE as a code
+    asset.
+
+    Called from main() AFTER _ensure_data_dir() but BEFORE basicConfig
+    so the freshly-attached log handler reads the migrated file rather
+    than re-creating an empty one at the new path while the old log
+    sits orphaned in _HERE."""
+    if _DATA_DIR == _HERE:
+        return
+    import shutil
+    legacy_names = [
+        "displayoff_config.json",
+        "displayoff.log",
+        "displayoff.log.1", "displayoff.log.2", "displayoff.log.3",
+        "native_blank.log",
+        "native_blank.log.1", "native_blank.log.2", "native_blank.log.3",
+        ".native_blank_in_progress.json",
+    ]
+    for name in legacy_names:
+        src = os.path.join(_HERE, name)
+        dst = os.path.join(_DATA_DIR, name)
+        if not os.path.exists(src):
+            continue
+        if os.path.exists(dst):
+            # Already migrated on a previous launch (or destination was
+            # created fresh under _DATA_DIR before any legacy file could be
+            # moved into it). Leave the legacy copy alone — touching it
+            # risks clobbering the canonical destination.
+            _MIGRATION_LOG.append(
+                f"legacy {src!r} ignored — destination {dst!r} already present"
+            )
+            continue
+        try:
+            shutil.move(src, dst)
+            _MIGRATION_LOG.append(f"migrated {src!r} -> {dst!r}")
+        except OSError as e:
+            # Common failure: shared install in Program Files where _HERE is
+            # read-only for the current user. The destination at _DATA_DIR
+            # is still fresh, so first launch just writes new state there.
+            # Log it so support can diagnose missing history.
+            _MIGRATION_LOG.append(
+                f"could not migrate {src!r} -> {dst!r}: {e}"
+            )
 
 # ── Single-instance guard ──────────────────────────────────────────────────
 # Local\ scope = per-session. Each Windows user gets their own instance,
@@ -1528,7 +1624,14 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
     care about severity.
     """
     import tkinter as tk
-    glyph = _THEMED_DIALOG_KIND_GLYPHS.get(kind, "")
+    # Defensive: silently rendering no glyph for a typo'd kind (e.g. "warn"
+    # vs "warning", "err" vs "error") hides bugs in call sites. Log + coerce
+    # to "info" so the caller still sees a glyph and a human can chase the
+    # typo via the log. Surfaced by v1.7.8 T2 Sonnet+Opus verification.
+    if kind not in _THEMED_DIALOG_KIND_GLYPHS:
+        log.debug("_themed_dialog: unknown kind=%r, coercing to 'info'", kind)
+        kind = "info"
+    glyph = _THEMED_DIALOG_KIND_GLYPHS[kind]
     display_message = f"{glyph}{message}" if glyph else message
 
     dlg = tk.Toplevel(parent)
@@ -2633,6 +2736,32 @@ def run_tray():
             else:
                 last_icon_click[0] = now
 
+    def _menu_header_text(item):
+        """Dynamic-text callable for the header menu item. Pystray evaluates
+        this every time the right-click menu is painted on Windows — which
+        gives us our only handle on "right-click happened" since pystray
+        doesn't expose a menu-open event. We piggyback the eval and clear
+        any half-finished double-click sequence (last_icon_click != 0).
+
+        Why this matters: a user who double-clicks (fires blank), then
+        immediately right-clicks to open the menu, then left-clicks twice
+        more inside the 500ms double-click window risks the second pair
+        being interpreted as a fresh double-click and firing a second blank
+        WHILE the context menu is on screen. Resetting the timestamp on
+        menu render means the user must start a brand-new click pair
+        post-menu before the next blank can fire.
+
+        Pystray left-clicks bypass the menu render path entirely (they go
+        straight to the `default=True` hidden item), so this callable does
+        NOT interfere with legitimate double-click detection."""
+        with icon_click_lock:
+            if last_icon_click[0] != 0.0:
+                log.info("menu render — resetting pending icon-click state "
+                         "(was %.3f, defeats double+right+double race)",
+                         last_icon_click[0])
+                last_icon_click[0] = 0.0
+        return f"Display Off v{__version__}"
+
     def on_settings(icon, item):
         if not _claim_dialog():
             return
@@ -2689,7 +2818,11 @@ def run_tray():
     # menu item that silently fails, we replace it with a disabled label
     # documenting the two paths that work.
     menu = Menu(
-        MenuItem(f"Display Off v{__version__}", None, enabled=False),
+        # Dynamic text — see _menu_header_text. Side-effect: clears any
+        # half-finished icon-click pair on menu render (right-click only,
+        # since pystray bypasses the menu paint path for the default-action
+        # left-click handler).
+        MenuItem(_menu_header_text, None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("Blank displays:", None, enabled=False),
         MenuItem("• Double-click icon", None, enabled=False),
@@ -2784,7 +2917,16 @@ def main():
     # idle-watcher sample. Without rotation the log would grow ~MB/day on
     # an active workstation. 1MB × 3 backups = ~4MB total budget.
     from logging.handlers import RotatingFileHandler
-    _displayoff_log = os.path.join(_HERE, "displayoff.log")
+    # State migration (v1.7.9): move config/logs/sentinel from _HERE to
+    # _DATA_DIR. Must run BEFORE basicConfig so the freshly-attached
+    # RotatingFileHandler opens the migrated log file rather than creating
+    # a brand-new empty one at the new path while the old log sits orphaned.
+    # _ensure_data_dir is already called at module-load time, but we re-run
+    # it here in case the data dir was removed between launches (rare, but
+    # cheap to defend against).
+    _ensure_data_dir()
+    _migrate_legacy_data()
+    _displayoff_log = os.path.join(_DATA_DIR, "displayoff.log")
     _file_handler = RotatingFileHandler(
         _displayoff_log, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
     )
@@ -2800,6 +2942,11 @@ def main():
         format="[%(asctime)s] [%(name)s] %(message)s",
         handlers=_handlers,
     )
+    # Flush any migration breadcrumbs buffered before the log handler existed.
+    # INFO level so a clean upgrade leaves a one-time trail in the new log.
+    for _msg in _MIGRATION_LOG:
+        log.info("data-dir migration: %s", _msg)
+    _MIGRATION_LOG.clear()
 
     if "--version" in sys.argv:
         print(f"displayoff {__version__}")

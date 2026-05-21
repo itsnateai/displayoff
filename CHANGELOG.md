@@ -1,5 +1,23 @@
 # Changelog — Display Off
 
+## [1.7.9] — 2026-05-21
+
+Closes the two items v1.7.8 deferred: relocation of per-user state to `%APPDATA%\displayoff\`, and right-click reset of the double-click timer. Plus two non-blocking nits from the v1.7.8 verifier pass — `_themed_dialog` typo'd-kind hardening and a tooltip non-BMP analysis comment.
+
+### Changed
+
+- **Config, logs, and the crash-recovery sentinel now live in `%APPDATA%\displayoff\` instead of the script directory.** A shared install (e.g. one clone in `C:\Program Files\` used by two Windows accounts) previously had every user reading and writing the same `displayoff_config.json`, `displayoff.log` (+ rotated `.1`/`.2`/`.3`), `native_blank.log` (+ rotated), and `.native_blank_in_progress.json` — leaking one user's idle-pattern history, log file, and in-progress sentinel into another user's session. Each user now has their own private `%APPDATA%\displayoff\` directory, matching the per-user discipline that's already used for the Startup-folder `.lnk`. The icon `displayoff.ico` stays bundled with the script as a read-only asset. Existing files in the script directory are auto-migrated to the new location on first launch of v1.7.9; the migration is one-shot and idempotent — a partial migration safely resumes on the next launch, and breadcrumbs land in the new `displayoff.log` so support can diagnose any moves that failed. If you're upgrading in-place, quit the running v1.7.8 tray first (otherwise the held log handle blocks its own migration until the next clean launch).
+
+### Fixed
+
+- **Right-click on the tray icon now resets the pending double-click timer.** A user who double-clicked (firing a blank), then immediately right-clicked to open the menu, then left-clicked twice more inside the 500ms double-click window could see the second left-click pair interpreted as a fresh double-click — firing a second blank while the context menu was on screen. Pystray doesn't expose a menu-open event, so the fix piggybacks on the existing dynamic-text callable that pystray re-evaluates whenever it paints the right-click menu: a side effect on the version-header item clears `last_icon_click` if it's nonzero. Left-clicks bypass menu rendering entirely (they route to the hidden `default=True` item), so legitimate double-click detection is unaffected.
+- **`_themed_dialog` now logs and coerces unknown `kind` values instead of silently rendering no glyph.** Typos like `kind="warn"` (vs `"warning"`) or `kind="err"` (vs `"error"`) previously fell through the dict lookup and produced a glyph-less dialog with no indication anything was wrong. Now: a `log.debug` line records the unknown kind and the call is coerced to `"info"` so the user still gets a severity glyph. Surfaced by both Sonnet and Opus T2 verifiers during v1.7.8 review.
+
+### Notes
+
+- **Tooltip 127-character truncation** in `tray_promoter.py` now carries a comment explaining the non-BMP-codepoint analysis (Python `str[:127]` counts code points; Win32 NIF_TIP truncates by `wchar_t` / UTF-16 code unit, so an emoji-bearing tooltip would diverge between the two paths). The comparison is symmetric on both sides of `==`, so equality still holds for any tooltip Display Off produces, and Microsoft documents `NotifyIconData_W` as never truncating mid-surrogate-pair on the Win32 side. Defer the real `wchar_t`-aware truncation until / if Display Off ever needs a non-BMP tooltip.
+- Still on the backlog for a future release: the rename-dance self-updater (`.tmp` → rename current `.exe` to `.old` → move new in place → relaunch with `--after-update` → clean up `.old` on next launch), required once Display Off eventually freezes from Python source to a single `.exe`. Currently inapplicable.
+
 ## [1.7.8] — 2026-05-21
 
 P2/P3 backlog from the pre-public-release audit. Seven items: five tray-correctness fixes, one network-fingerprint reduction, one dialog-severity affordance. No functional behavior changes beyond closing the bugs and clarifying the surface.

@@ -259,6 +259,24 @@ def try_promote(exe_path, tooltip, baseline):
                             # both sides through the same strip + 127-char cap
                             # so the comparison matches what Explorer would
                             # have written.
+                            #
+                            # Non-BMP caveat (v1.7.8 audit, T3 Opus): Python
+                            # `str[:127]` slices by code points while Win32
+                            # NIF_TIP truncates by wchar_t (UTF-16 code units).
+                            # Surrogate-pair characters (most emoji, U+10000+)
+                            # count as 1 code point in Python but 2 wchar_t
+                            # units, so the two truncations would diverge on a
+                            # tooltip containing emoji. Symmetric on BOTH sides
+                            # of the compare though — `norm_expected` and
+                            # `norm_existing` both use the same Python slice —
+                            # so equality still holds for any tooltip we
+                            # produce. The actual Win32-side stored value also
+                            # only mismatches if Explorer truncated mid-pair,
+                            # which Microsoft documents as never happening
+                            # (NotifyIconData_W tooltip enforces full surrogate
+                            # pairs). Defer wchar_t-aware truncation until /
+                            # if displayoff's tooltip ever contains non-BMP
+                            # characters.
                             norm_expected = (tooltip or "").strip()[:127]
                             norm_existing = (existing_tooltip or "").strip()[:127]
                             if path.lower() != exe_path.lower() or norm_existing != norm_expected:
