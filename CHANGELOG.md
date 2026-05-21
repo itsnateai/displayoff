@@ -1,5 +1,29 @@
 # Changelog — Display Off
 
+## [1.7.8] — 2026-05-21
+
+P2/P3 backlog from the pre-public-release audit. Seven items: five tray-correctness fixes, one network-fingerprint reduction, one dialog-severity affordance. No functional behavior changes beyond closing the bugs and clarifying the surface.
+
+### Fixed
+
+- **Hotkey-capture state no longer gets stuck if pynput fails to import or initialize.** Companion to the TclError variant fixed in v1.7.6. If a broken/partial install or AV quarantine left `pynput` un-importable, clicking the hotkey field set `recording["active"] = True`, ran the import at line 1693, raised ImportError out of the function, and stranded the UI in the "Press your hotkey..." state for the rest of the session — the field would not accept further clicks. Now: import and listener startup are each wrapped in a guard that restores the UI (display text, sunken relief) and clears the recording flag on failure, with the ImportError path also surfacing a themed dialog pointing the user at `pip install --upgrade pynput`.
+- **Update-check dialog no longer logs ERROR when the user closes Settings mid-request.** The result-marshalling and dialog-creation paths in `_run_update_check` both raise `tkinter.TclError` once `parent_root` is destroyed — entirely expected when the user dismisses Settings before the GitHub API call lands. v1.7.7 caught these under the catch-all `except Exception` and routed them through `log.exception`, producing noisy ERROR-level traceback spam every time someone closed Settings during the 5-second update window. Now: a dedicated `except tk.TclError` branch logs at DEBUG with "(expected when parent window closed mid-request)".
+- **Tray-promoter tooltip comparison normalizes whitespace and applies the NIF_TIP 127-char cap to both sides.** Phase 1 of `tray_promoter.try_promote` matched the `(ExecutablePath, InitialTooltip)` tuple byte-for-byte against the stored registry value. Explorer normalizes whitespace and truncates at 127 chars before persisting the InitialTooltip — comparing the raw 130-char tooltip we passed at `NIM_ADD` against the 127-char stored value would silently miss the otherwise-perfectly-matched subkey, stranding the poll thread on the every-30-seconds backoff interval. Both sides now flow through `.strip()[:127]` so the comparison matches what Explorer actually wrote.
+- **`ctypes.WinDLL` `use_last_error=True` is now uniformly applied** to `user32`, `kernel32`, `shell32`, `dwmapi`, and `advapi32`. Previously `user32` and `shell32` were loaded via the global `ctypes.windll.*` shortcut, which does NOT enable the LastError thread-local capture — a `ctypes.get_last_error()` call following a user32 syscall would read 0 or a stale value from a different binding's syscall. No live bug from this in 1.7.7 (kernel32 was the only call site reading LastError), but the consistency closes a future-bug surface.
+- **Foreground-elevation watcher logs a per-miss hint** when an elevated window has focus and the global hotkey is being silently suppressed by UIPI. Previously a single INFO line at startup told the user "may not fire while elevated window has focus" — users would routinely miss it 30 minutes into a session, fail to fire the hotkey while Task Manager / an admin terminal was foreground, and assume the app was broken. Now: a 30-second-poll daemon thread queries `GetForegroundWindow → GetWindowThreadProcessId → OpenProcess → OpenProcessToken → GetTokenInformation(TokenElevation)` and re-emits the same INFO line, rate-limited to once per 60 seconds while exposure continues. Probe is no-op when we ourselves are elevated. ACCESS_DENIED across the UIPI boundary is treated as evidence of elevation, since a non-admin OpenProcess can't probe a higher-IL process.
+
+### Added
+
+- **Themed dialog severity glyphs.** `_themed_dialog` now accepts a `kind` parameter (`info` / `warning` / `error` / `none`, default `info`) that prepends a Unicode glyph (ℹ︎ / ⚠︎ / ❌) to the body text. Saves-failure, hotkey-block, and update-error dialogs surface as errors; idle-validation, hotkey-safety warning, and autostart-failure dialogs surface as warnings; update-available and up-to-date as info. Replaces the v1.7.7 visual-monotony of every dialog looking identical regardless of severity.
+
+### Changed
+
+- **Update-check User-Agent is now `displayoff-updater` instead of `DisplayOff/{version}`.** GitHub requires a non-empty UA on API requests and ignores its content; the previous value let any passive network observer (corporate proxy, ISP, GitHub's own request log) fingerprint the exact installed build of every Display Off user behind the same exit IP. The generic value still satisfies the API and removes the version side-channel.
+
+### Notes
+
+- This release closes all but two items from the v1.7.6 P2/P3 backlog. Deferred to v1.7.9: (1) config + log + sentinel relocation from script directory to `%APPDATA%\displayoff\` (needs careful migration testing across multi-user installs), (2) right-click reset of the double-click timer (needs pystray-API spelunking to confirm the event hook). Also added to the v1.7.9+ backlog: if/when displayoff ships as a frozen `.exe`, the self-updater must follow the workspace rename-dance pattern — download to `.tmp`, rename current exe to `.old`, move new in place, relaunch with `--after-update`, cleanup `.old` on next launch — with the same allowlist of `github.com/itsnateai/` + `objects.githubusercontent.com/` used elsewhere in the workspace.
+
 ## [1.7.7] — 2026-05-21
 
 UX polish: all in-app dialogs now render in the dark theme.

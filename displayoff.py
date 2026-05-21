@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.7"
+__version__ = "1.7.8"
 
 log = logging.getLogger("displayoff")
 
@@ -87,15 +87,17 @@ _NATIVE_PROD_SETTLE_SECS = 0.5  # Pause before writing the 1s timeout. Same idea
 if sys.platform == "win32":
     import ctypes.wintypes
 
-    _user32 = ctypes.windll.user32
-    # use_last_error=True: ctypes captures the Win32 LastError into a thread-
-    # local IMMEDIATELY after the call returns, before the GIL release or any
-    # other ctypes call can clobber it. Without this, `GetLastError()` from a
-    # separate binding can race with Python's own kernel calls between
-    # CreateMutexW(...) and the error check, returning a misleading value.
-    # Read the saved value via `ctypes.get_last_error()` at the call site.
+    # use_last_error=True on every binding: ctypes captures the Win32
+    # LastError into a thread-local IMMEDIATELY after the call returns,
+    # before the GIL release or any other ctypes call can clobber it.
+    # Without this, `GetLastError()` from a separate binding can race with
+    # Python's own kernel calls between CreateMutexW(...) and the error
+    # check, returning a misleading value. Read the saved value via
+    # `ctypes.get_last_error()` at the call site. Applied uniformly so any
+    # future call site can rely on get_last_error regardless of which DLL.
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _shell32 = ctypes.windll.shell32
+    _shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
     # ── user32 ──
     SendMessageTimeoutW = _user32.SendMessageTimeoutW
@@ -180,6 +182,35 @@ if sys.platform == "win32":
     IsUserAnAdmin = _shell32.IsUserAnAdmin
     IsUserAnAdmin.argtypes = []
     IsUserAnAdmin.restype = ctypes.wintypes.BOOL
+
+    # ── Foreground-window elevation probing (UIPI miss-detection) ──
+    # Used by the foreground-elevation watcher (v1.7.8+) to log when an
+    # elevated window has focus and our global hotkey is being silently
+    # suppressed by UIPI. All four entry-points are lazy — bound here but
+    # only invoked from the watcher.
+    GetWindowThreadProcessId = _user32.GetWindowThreadProcessId
+    GetWindowThreadProcessId.argtypes = [ctypes.wintypes.HWND,
+                                          ctypes.POINTER(ctypes.wintypes.DWORD)]
+    GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+
+    OpenProcess = _kernel32.OpenProcess
+    OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL,
+                            ctypes.wintypes.DWORD]
+    OpenProcess.restype = ctypes.wintypes.HANDLE
+
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    OpenProcessToken = _advapi32.OpenProcessToken
+    OpenProcessToken.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+                                  ctypes.POINTER(ctypes.wintypes.HANDLE)]
+    OpenProcessToken.restype = ctypes.wintypes.BOOL
+
+    GetTokenInformation = _advapi32.GetTokenInformation
+    GetTokenInformation.argtypes = [ctypes.wintypes.HANDLE,
+                                     ctypes.c_int,    # TOKEN_INFORMATION_CLASS
+                                     ctypes.c_void_p,  # TokenInformation
+                                     ctypes.wintypes.DWORD,
+                                     ctypes.POINTER(ctypes.wintypes.DWORD)]
+    GetTokenInformation.restype = ctypes.wintypes.BOOL
 else:
     SendMessageTimeoutW = None
     GetForegroundWindow = None
@@ -196,6 +227,10 @@ else:
     CloseHandle = None
     GetTickCount = None
     IsUserAnAdmin = None
+    GetWindowThreadProcessId = None
+    OpenProcess = None
+    OpenProcessToken = None
+    GetTokenInformation = None
 
 # Win32 wait-result sentinels
 _WAIT_OBJECT_0 = 0x00000000
@@ -204,6 +239,15 @@ _WAIT_TIMEOUT = 0x00000102
 _WAIT_FAILED = 0xFFFFFFFF
 _INFINITE = 0xFFFFFFFF
 _EVENT_MODIFY_STATE = 0x0002
+
+# Process access + token-info constants for foreground-elevation probing.
+# PROCESS_QUERY_LIMITED_INFORMATION (0x1000) is the post-Vista minimum-scope
+# access that lets a non-admin OpenProcess a higher-IL process — anything
+# stronger fails with ACCESS_DENIED across the UIPI boundary we're trying to
+# detect. TOKEN_QUERY (0x0008) is the only token access we need.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+_TOKEN_ELEVATION = 20  # TOKEN_INFORMATION_CLASS::TokenElevation
 
 
 # ── Cross-thread state ─────────────────────────────────────────────────────
@@ -1124,6 +1168,112 @@ def _is_elevated():
         return False
 
 
+def _foreground_is_elevated():
+    """Probe the current foreground window's process for elevation.
+
+    Returns True if the foreground window is owned by a higher-integrity
+    process than us (i.e., our global hotkey can't reach it because of
+    UIPI), False otherwise — including the "we can't tell" case (the
+    foreground process is also elevated to a peer level, the desktop, or
+    OpenProcess was denied). Treating ambiguity as False avoids logging
+    false positives every poll cycle.
+
+    Closed exclusively over win32 bindings; safe to call from any thread.
+    All handles closed via try/finally — leaking a process handle every
+    30s would dwarf the rest of the tray's footprint inside a day.
+    """
+    if (sys.platform != "win32" or
+            GetForegroundWindow is None or
+            GetWindowThreadProcessId is None or
+            OpenProcess is None or
+            OpenProcessToken is None or
+            GetTokenInformation is None):
+        return False
+    hwnd = GetForegroundWindow()
+    if not hwnd:
+        return False
+    pid = ctypes.wintypes.DWORD(0)
+    GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return False
+    h_proc = OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not h_proc:
+        # ACCESS_DENIED across UIPI is itself a STRONG hint that the
+        # foreground IS more elevated than us. ERROR_ACCESS_DENIED == 5.
+        # GetLastError() must be read via ctypes.get_last_error() because
+        # kernel32 was loaded with use_last_error=True.
+        return ctypes.get_last_error() == 5
+    try:
+        h_tok = ctypes.wintypes.HANDLE(0)
+        if not OpenProcessToken(h_proc, _TOKEN_QUERY, ctypes.byref(h_tok)):
+            return False
+        try:
+            # TOKEN_ELEVATION is a single-DWORD struct (TokenIsElevated).
+            elevation = ctypes.wintypes.DWORD(0)
+            ret_len = ctypes.wintypes.DWORD(0)
+            ok = GetTokenInformation(h_tok, _TOKEN_ELEVATION,
+                                     ctypes.byref(elevation),
+                                     ctypes.sizeof(elevation),
+                                     ctypes.byref(ret_len))
+            if not ok:
+                return False
+            return bool(elevation.value)
+        finally:
+            CloseHandle(h_tok)
+    finally:
+        CloseHandle(h_proc)
+
+
+# Rate-limited per-miss log state. The watcher logs at most once per
+# _UIPI_LOG_INTERVAL_SECS when elevated foreground is detected so that
+# (a) users see a fresh nudge when they're actually in the problematic
+# state — not just one INFO buried in startup — and (b) the log doesn't
+# fill with one line every poll cycle.
+_UIPI_POLL_INTERVAL_SECS = 30.0
+_UIPI_LOG_INTERVAL_SECS = 60.0
+_uipi_last_logged = [0.0]  # mutable closure capture
+
+
+def _start_foreground_elevation_watcher():
+    """Daemon thread that polls foreground-window elevation every 30s.
+
+    When an elevated foreground is observed, logs a per-miss hint at INFO
+    rate-limited to once per 60s. Replaces the one-shot startup INFO log
+    that users routinely missed — now the message lands when they're
+    actually in the affected state and re-fires after each minute of
+    continued exposure so it isn't lost in scrolled-back logs.
+
+    No-op when WE are elevated (UIPI doesn't bite us) or when running
+    elevated on a single-user system without an unelevated peer to fall
+    back to.
+    """
+    if sys.platform != "win32" or _is_elevated():
+        return None
+
+    def _watch():
+        while True:
+            try:
+                if _foreground_is_elevated():
+                    now = time.monotonic()
+                    if now - _uipi_last_logged[0] >= _UIPI_LOG_INTERVAL_SECS:
+                        log.info(
+                            "Foreground window is elevated — global hotkey may be "
+                            "silently suppressed by UIPI until you switch focus to a "
+                            "non-elevated window. Double-clicking the tray icon still works."
+                        )
+                        _uipi_last_logged[0] = now
+            except Exception as e:
+                # The probe is best-effort; if it throws we don't want the
+                # watcher to die — that would silently disable the warning
+                # signal users rely on.
+                log.debug("UIPI watcher probe raised: %s", e)
+            time.sleep(_UIPI_POLL_INTERVAL_SECS)
+
+    t = threading.Thread(target=_watch, daemon=True, name="displayoff-uipi-watch")
+    t.start()
+    return t
+
+
 # ── Cross-instance "quit" signal (named event IPC) ────────────────────────
 
 _QUIT_EVENT_NAME = r"Local\DisplayOff_QuitSignal"
@@ -1248,7 +1398,12 @@ def check_for_updates(timeout=5, force=False):
     req = urllib.request.Request(
         _RELEASES_API,
         headers={
-            "User-Agent": f"DisplayOff/{__version__}",
+            # Generic UA — previously embedded the running version
+            # ("DisplayOff/{__version__}") which let any passive observer on
+            # the network path (corporate proxy, ISP, GitHub log) fingerprint
+            # the exact installed build. GitHub only requires *some* UA on
+            # API requests; the value is otherwise unused.
+            "User-Agent": "displayoff-updater",
             "Accept": "application/vnd.github+json",
         },
     )
@@ -1340,7 +1495,17 @@ def _apply_dark_titlebar(root):
         log.warning("Could not apply dark title bar: %s", e)
 
 
-def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0):
+_THEMED_DIALOG_KIND_GLYPHS = {
+    "info":    "ℹ︎ ",   # ℹ︎  variation selector to suppress emoji-style fallback
+    "warning": "⚠︎ ",   # ⚠︎
+    "error":   "❌ ",          # ❌ — only emoji-style for "error", since the cross
+                                   # is visually distinct enough without VS15
+    "none":    "",
+}
+
+
+def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
+                   kind="info"):
     """Dark-themed modal replacement for `tkinter.messagebox.*`.
 
     `tkinter.messagebox` uses the native Win32 MessageBox primitive, which
@@ -1353,8 +1518,19 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0):
     Enter and gets initial keyboard focus. Returns the clicked label, or
     `None` if the user closed via the X / Esc. For yes/no usage, default
     to "No" (`default_idx=1`) so Enter is a safe non-action.
+
+    `kind`: visual severity hint, one of {"info", "warning", "error",
+    "none"}. Prepends a Unicode glyph (ℹ︎ / ⚠︎ / ❌) to the body so users
+    can tell at a glance whether the dialog is informational ("update
+    available"), a soft warning ("autostart toggle failed but settings
+    were saved"), or a hard error ("could not save settings"). Default
+    "info" preserves the previous look-and-feel for callers that don't
+    care about severity.
     """
     import tkinter as tk
+    glyph = _THEMED_DIALOG_KIND_GLYPHS.get(kind, "")
+    display_message = f"{glyph}{message}" if glyph else message
+
     dlg = tk.Toplevel(parent)
     dlg.withdraw()  # build invisibly to avoid light-mode flash before dark titlebar
     dlg.title(title)
@@ -1366,7 +1542,7 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0):
 
     result = [None]  # mutable closure capture; messages-box-style return
 
-    body = tk.Label(dlg, text=message, justify="left", wraplength=460,
+    body = tk.Label(dlg, text=display_message, justify="left", wraplength=460,
                     font=("Segoe UI", 10),
                     bg=_THEME_BG, fg=_THEME_FG,
                     padx=20, pady=15)
@@ -1690,7 +1866,32 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
         display_var.set("Press your hotkey...")
         hotkey_display.config(bg=_THEME_BG_RECORD, relief="solid")
 
-        from pynput import keyboard as kb
+        # pynput may legitimately fail to import on a broken / partial install
+        # (Pillow/pynput pulled but the platform-specific listener .pyd is
+        # missing or has been quarantined by AV). Without this guard we'd
+        # leave recording["active"]=True and the hotkey field locked in the
+        # "Press your hotkey..." state for the rest of the session — companion
+        # to the TclError variant fixed in v1.7.6.
+        try:
+            from pynput import keyboard as kb
+        except ImportError as e:
+            log.warning("pynput import failed during hotkey capture (%s) — aborting capture", e)
+            display_var.set(hotkey_display_name(cfg))
+            hotkey_display.config(bg=_THEME_BG_SUNKEN, relief="sunken")
+            recording["active"] = False
+            try:
+                _themed_dialog(
+                    root,
+                    "Display Off",
+                    "Could not start hotkey capture — pynput failed to load.\n\n"
+                    "Reinstall the dependency:\n"
+                    "    pip install --upgrade pynput\n\n"
+                    f"Details: {e}",
+                    kind="error",
+                )
+            except Exception:
+                pass
+            return
 
         pressed_mods = set()
         final_key = [None]
@@ -1715,9 +1916,18 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
             if final_key[0] is not None:
                 listener.stop()
 
-        listener = kb.Listener(on_press=on_press, on_release=on_release)
-        listener.daemon = True
-        listener.start()
+        try:
+            listener = kb.Listener(on_press=on_press, on_release=on_release)
+            listener.daemon = True
+            listener.start()
+        except Exception as e:
+            # Listener init can fail under broken backends (X11-less containers,
+            # WSLg, Wayland on Linux ports) even when the import itself succeeds.
+            log.warning("pynput listener start failed during hotkey capture (%s) — aborting capture", e)
+            display_var.set(hotkey_display_name(cfg))
+            hotkey_display.config(bg=_THEME_BG_SUNKEN, relief="sunken")
+            recording["active"] = False
+            return
 
         def poll_capture():
             # If the Settings dialog is destroyed while a capture is in
@@ -1918,16 +2128,18 @@ def _open_settings_impl(tray_icon, on_saved):
         if safety is not None:
             severity, msg = safety
             if severity == "block":
-                _themed_dialog(root, "Display Off", msg)
+                _themed_dialog(root, "Display Off", msg, kind="error")
                 return False
             # severity == "warn" — give the user a chance to proceed anyway.
-            if _themed_dialog(root, "Display Off", msg, ("Yes", "No"), default_idx=1) != "Yes":
+            if _themed_dialog(root, "Display Off", msg, ("Yes", "No"),
+                              default_idx=1, kind="warning") != "Yes":
                 return False
         try:
             idle_minutes = max(0, int(idle_var.get() or 0))
         except (TypeError, ValueError):
             _themed_dialog(root, "Display Off",
-                           "Idle-blank minutes must be a non-negative number.")
+                           "Idle-blank minutes must be a non-negative number.",
+                           kind="warning")
             return False
         cfg["hotkey"] = dict(captured)
         cfg["lock_on_off"] = bool(lock_var.get())
@@ -1936,7 +2148,8 @@ def _open_settings_impl(tray_icon, on_saved):
             save_config(cfg)
         except OSError as e:
             _themed_dialog(root, "Display Off",
-                           f"Could not save settings:\n{e}")
+                           f"Could not save settings:\n{e}",
+                           kind="error")
             return False
         # Autostart is a separate side effect — config is already persisted
         # whether or not this succeeds. Catch broadly: Tk's default
@@ -1959,7 +2172,8 @@ def _open_settings_impl(tray_icon, on_saved):
             _themed_dialog(root, "Display Off",
                            f"Autostart toggle failed:\n{type(e).__name__}: {e}\n\n"
                            f"Your other settings were saved. Adjust and click Save "
-                           f"again to retry — the dialog stays open.")
+                           f"again to retry — the dialog stays open.",
+                           kind="warning")
             # Refresh the checkbox to the actual on-disk state so the user
             # sees the real state (not what they thought they'd set) and
             # the cached state matches reality for the next change-check.
@@ -2208,6 +2422,7 @@ def _run_update_check(parent_root):
     stays responsive; result is marshalled back via `parent_root.after`."""
 
     def _show_result(has_update, latest, html_url, err):
+        import tkinter as _tk_local
         try:
             if err:
                 err_text = str(err)
@@ -2248,7 +2463,7 @@ def _run_update_check(parent_root):
                         f"Could not check for updates.\n\n{err_text}\n\n"
                         "Verify your internet connection and try again."
                     )
-                _themed_dialog(parent_root, "Display Off", msg)
+                _themed_dialog(parent_root, "Display Off", msg, kind="error")
             elif has_update:
                 if _themed_dialog(
                     parent_root,
@@ -2259,6 +2474,7 @@ def _run_update_check(parent_root):
                     "Open the release page in your browser?",
                     buttons=("Yes", "No"),
                     default_idx=0,
+                    kind="info",
                 ) == "Yes":
                     # html_url comes from GitHub API response — validate it
                     # before passing to webbrowser.open. A compromised release
@@ -2278,7 +2494,15 @@ def _run_update_check(parent_root):
                     f"You're on the latest release.\n\n"
                     f"Current: v{__version__}\n"
                     f"Latest:  v{latest}",
+                    kind="info",
                 )
+        except _tk_local.TclError as e:
+            # User closed Settings while the API call was in flight — the
+            # parent_root is destroyed and any _themed_dialog(parent_root, ...)
+            # call raises TclError. Expected, not an error. v1.7.7 logged this
+            # at ERROR via log.exception which made the log noisy whenever
+            # users closed Settings before the response landed.
+            log.debug("Update check dialog skipped (expected when parent window closed mid-request): %s", e)
         except Exception as e:
             log.exception("Update check dialog crashed: %s", e)
 
@@ -2288,8 +2512,14 @@ def _run_update_check(parent_root):
         except Exception as e:
             result = (False, None, None, e)
         # Marshal back to the Tk thread. parent_root.after is thread-safe.
+        import tkinter as _tk_local
         try:
             parent_root.after(0, lambda: _show_result(*result))
+        except _tk_local.TclError as e:
+            # Same "user closed Settings mid-request" race, just from the
+            # scheduling side rather than the dialog side. Either path lands
+            # on the user closing the parent before we can render.
+            log.debug("Update check result not delivered (expected when parent window closed mid-request): %s", e)
         except Exception as e:
             log.exception("Failed to schedule update-check result dialog: %s", e)
 
@@ -2650,9 +2880,14 @@ def main():
 
     # UIPI hint: under standard user, low-level keyboard hook can't see input
     # to elevated windows. Inform once so users aren't mystified when the
-    # hotkey appears dead while Task Manager / an admin terminal has focus.
+    # hotkey appears dead while Task Manager / an admin terminal has focus,
+    # then start a foreground-elevation watcher that logs a per-miss hint
+    # (rate-limited to once per minute) when we observe the affected state.
+    # The watcher replaces the previous single startup log — users would
+    # routinely miss the startup line and assume the hotkey was broken.
     if not _is_elevated():
         log.info("Running unelevated — hotkey may not fire while an elevated window has focus (UIPI).")
+        _start_foreground_elevation_watcher()
 
     if "--start-off" in sys.argv:
         log.info("Turning off displays, then starting tray...")

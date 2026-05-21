@@ -249,7 +249,19 @@ def try_promote(exe_path, tooltip, baseline):
 
                         # Phase 1 — match by (path, tooltip).
                         if path:
-                            if path.lower() != exe_path.lower() or existing_tooltip != tooltip:
+                            # NIF_TIP truncates at 127 chars and Explorer
+                            # normalizes whitespace before persisting the
+                            # InitialTooltip value. Comparing the raw strings
+                            # byte-for-byte misses an otherwise-perfectly-matched
+                            # subkey whose stored tooltip has been trimmed or
+                            # truncated, stranding the poll thread until the
+                            # backoff interval forever fires no-ops. Normalize
+                            # both sides through the same strip + 127-char cap
+                            # so the comparison matches what Explorer would
+                            # have written.
+                            norm_expected = (tooltip or "").strip()[:127]
+                            norm_existing = (existing_tooltip or "").strip()[:127]
+                            if path.lower() != exe_path.lower() or norm_existing != norm_expected:
                                 continue
                             identified = True
                             current = _safe_read(sub, "IsPromoted", int)
