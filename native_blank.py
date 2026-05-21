@@ -244,9 +244,20 @@ def _migrate_legacy_data():
             shutil.move(src, dst)
             _MIGRATION_LOG.append(f"migrated {src!r} -> {dst!r}")
         except OSError as e:
-            _MIGRATION_LOG.append(
-                f"could not migrate {src!r} -> {dst!r}: {e}"
-            )
+            # Race-loss check: a concurrent launcher (e.g. displayoff.py's
+            # own _migrate_legacy_data running in parallel with this
+            # standalone-CLI import) could have materialized dst between
+            # our existence check and shutil.move call. Treat that as
+            # benign rather than user-facing failure.
+            if os.path.exists(dst):
+                _MIGRATION_LOG.append(
+                    f"benign race: {src!r} -> {dst!r} (dst materialized "
+                    f"during our move; concurrent launch won): {e}"
+                )
+            else:
+                _MIGRATION_LOG.append(
+                    f"could not migrate {src!r} -> {dst!r}: {e}"
+                )
 
 
 _ensure_data_dir()

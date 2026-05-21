@@ -135,10 +135,20 @@ def _migrate_legacy_data():
             # Common failure: shared install in Program Files where _HERE is
             # read-only for the current user. The destination at _DATA_DIR
             # is still fresh, so first launch just writes new state there.
-            # Log it so support can diagnose missing history.
-            _MIGRATION_LOG.append(
-                f"could not migrate {src!r} -> {dst!r}: {e}"
-            )
+            # Also covers the TOCTOU race where a concurrent launch (e.g. a
+            # standalone `native_blank.py --read` running parallel to the
+            # tray's own startup) won the move between our existence-check
+            # and shutil.move call — re-check dst, and treat post-failure
+            # existence as benign race-loss rather than a corrupted state.
+            if os.path.exists(dst):
+                _MIGRATION_LOG.append(
+                    f"benign race: {src!r} -> {dst!r} (dst materialized "
+                    f"during our move; concurrent launch won): {e}"
+                )
+            else:
+                _MIGRATION_LOG.append(
+                    f"could not migrate {src!r} -> {dst!r}: {e}"
+                )
 
 # ── Single-instance guard ──────────────────────────────────────────────────
 # Local\ scope = per-session. Each Windows user gets their own instance,
@@ -2753,13 +2763,23 @@ def run_tray():
 
         Pystray left-clicks bypass the menu render path entirely (they go
         straight to the `default=True` hidden item), so this callable does
-        NOT interfere with legitimate double-click detection."""
-        with icon_click_lock:
-            if last_icon_click[0] != 0.0:
-                log.info("menu render — resetting pending icon-click state "
-                         "(was %.3f, defeats double+right+double race)",
-                         last_icon_click[0])
-                last_icon_click[0] = 0.0
+        NOT interfere with legitimate double-click detection.
+
+        Exception guard: pystray's Win32 backend catches exceptions raised
+        from dynamic-property callables and renders an empty label. If we
+        let an exception unwind here, the side-effect reset never fires and
+        the user sees a broken-looking menu. Wrap the whole body so a
+        worst-case bug still returns the header string."""
+        try:
+            with icon_click_lock:
+                if last_icon_click[0] != 0.0:
+                    log.info("menu render — resetting pending icon-click state "
+                             "(was %.3f, defeats double+right+double race)",
+                             last_icon_click[0])
+                    last_icon_click[0] = 0.0
+        except Exception:
+            log.exception("menu header callable raised — ignoring; "
+                          "last_icon_click may not have been reset")
         return f"Display Off v{__version__}"
 
     def on_settings(icon, item):
@@ -2927,14 +2947,32 @@ def main():
     _ensure_data_dir()
     _migrate_legacy_data()
     _displayoff_log = os.path.join(_DATA_DIR, "displayoff.log")
-    _file_handler = RotatingFileHandler(
-        _displayoff_log, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
-    )
     # Under pythonw.exe sys.stderr is None — StreamHandler() defaults to
     # sys.stderr and every emit would call None.write(...), which logging's
     # handleError catches but noisily. Only attach the StreamHandler when
     # there's a real stream behind it.
-    _handlers = [_file_handler]
+    _handlers = []
+    try:
+        _handlers.append(RotatingFileHandler(
+            _displayoff_log, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        ))
+    except OSError as _e:
+        # File-handler init can fail if _DATA_DIR is unwritable (rare —
+        # roaming-profile sync mid-conflict, disk full, locked-down policy).
+        # Without this guard the OSError unwinds out of main() and a
+        # pythonw.exe launch shows nothing — no tray, no error, no log.
+        # Degrade to console-only logging so the tray still launches; the
+        # error message and any buffered migration breadcrumbs go to stderr
+        # if attached (console launches catch it; pythonw silently loses
+        # them, but at least the app runs).
+        if sys.stderr is not None:
+            sys.stderr.write(
+                f"displayoff: log file at {_displayoff_log!r} unavailable "
+                f"({_e}) — running without file logging\n"
+            )
+            for _m in _MIGRATION_LOG:
+                sys.stderr.write(f"displayoff: data-dir migration: {_m}\n")
+            _MIGRATION_LOG.clear()
     if sys.stderr is not None:
         _handlers.append(logging.StreamHandler())
     logging.basicConfig(
@@ -2944,6 +2982,7 @@ def main():
     )
     # Flush any migration breadcrumbs buffered before the log handler existed.
     # INFO level so a clean upgrade leaves a one-time trail in the new log.
+    # Skipped if the stderr-fallback above already drained _MIGRATION_LOG.
     for _msg in _MIGRATION_LOG:
         log.info("data-dir migration: %s", _msg)
     _MIGRATION_LOG.clear()
