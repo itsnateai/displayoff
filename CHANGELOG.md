@@ -1,5 +1,26 @@
 # Changelog — Display Off
 
+## [1.7.6] — 2026-05-21
+
+Audit-driven correctness + security pass. Seven fixes surfaced by a pre-public-release code audit; no functional behavior changes beyond closing the bugs.
+
+### Fixed
+
+- **Sentinel file write is now atomic.** `_write_sentinel` previously wrote the saved AC/DC display-off timeouts directly via `open(..., "w") + json.dump`. A kill mid-write (BSOD, OOM, Task Manager) left a partial JSON on disk; `_recover_from_stale_sentinel` would catch the JSONDecodeError and **delete the corrupt sentinel** — permanently losing the saved values and leaving the user trapped in a 1-second display-off timeout. Now: write to `_SENTINEL_PATH + ".tmp"` + `f.flush()` + `os.fsync()` + `os.replace()`. Either the full sentinel commits to disk or nothing does.
+- **GitHub API "rate limit reached" now shows a specific error message** instead of the misleading generic "Verify your internet connection". GitHub's unauthenticated API limit is 60 req/hr/IP, shared across `gh`, GitHub Desktop, VS Code extensions, and any other tool hitting the API from the same network. The 403/rate-limit error path now spells this out and points the user to the releases page.
+- **`html_url` from GitHub API response is now validated before being opened** in the browser. A compromised release or MITM-injected JSON could previously set `html_url` to a `file://` or `javascript:` URI which `webbrowser.open` would hand to the OS handler. Now: allowlist `https://github.com/` prefix; fall back to the hardcoded releases URL otherwise.
+- **Hotkey-capture state no longer gets stuck if the Settings dialog is closed mid-recording.** Clicking Cancel while "Press your hotkey…" was active left `recording["active"] = True` (because the queued `poll_capture` raised TclError into Tk's report_callback_exception, never reaching the cleanup line) AND left the pynput listener alive consuming input. Now: `poll_capture` catches TclError, stops the listener, and resets the flag.
+- **About dialog no longer hangs the Tk event loop on cold-boot Win11.** `_show_about` was re-calling `autostart_enabled()` on the Tk thread — that helper spawns a PowerShell subprocess with a 30-second timeout, which on a cold-boot Win11 system with AV scanning can take 10-30s and visibly hangs the About dialog. Now: the Settings dialog passes its already-cached `autostart_state["enabled"]` value into `_show_about`. The optional parameter falls back to the helper call when no cached value is provided.
+- **`DwmSetWindowAttribute` is now bound with explicit `argtypes`/`restype`.** Previously called via raw `ctypes.windll.dwmapi.DwmSetWindowAttribute(...)`; HWND is pointer-sized on x64, default-c_int argtype silently truncates handles above 2 GB. HRESULT restype default (c_int) was actually correct, but the binding hygiene matches the workspace convention "never call ctypes.windll.* directly outside a bound-name pattern".
+
+### Added
+
+- **Update check is now cached for 6 hours.** Repeated clicks of *Settings → Updates → Check for Updates* within the cache TTL hit the in-memory cache instead of GitHub's API, avoiding burns of GitHub's 60-req/hr unauthenticated rate-limit budget. Errors are NOT cached — a transient outage doesn't poison future checks. Internal `force=True` kwarg bypasses the cache (not currently wired to any UI affordance).
+
+### Notes
+
+- This release closes all P1 items raised during the pre-public-release code audit. The audit also surfaced ~10 P2/P3 items (UIPI per-miss logging, dwmapi `use_last_error=True`, multi-user file-permission consideration, etc.) — those are non-urgent polish and may land in a future release.
+
 ## [1.7.5] — 2026-05-20
 
 UX + correctness pass.

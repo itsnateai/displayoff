@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.5"
+__version__ = "1.7.6"
 
 log = logging.getLogger("displayoff")
 
@@ -1189,6 +1189,17 @@ _GITHUB_REPO_URL = f"https://github.com/{_GITHUB_REPO}"
 _GITHUB_RELEASES_URL = f"{_GITHUB_REPO_URL}/releases"
 _RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 
+# Cache the last successful /releases/latest response to avoid burning
+# GitHub's 60-req/hr unauthenticated rate limit on repeated manual clicks.
+# That quota is shared per-IP with `gh`, GitHub Desktop, VS Code extension
+# update checks, and any other tool hitting the API from the same network.
+# A user behind a corporate NAT can find the quota near-empty before they
+# ever click Check-for-Updates; caching turns "click N times in a session"
+# from "N API calls" into "1 API call + N-1 cache hits".
+_UPDATE_CHECK_CACHE_TTL = 6 * 3600  # 6 hours
+_update_check_cache = {"timestamp": 0.0, "result": None}
+_update_check_cache_lock = threading.Lock()
+
 
 def _version_tuple(v):
     """Parse 'v1.4.0' / '1.4.0' / '1.4' / '1.4.0-beta1' into a (major, minor, patch)
@@ -1212,13 +1223,28 @@ def _version_tuple(v):
     return tuple(out[:3])
 
 
-def check_for_updates(timeout=5):
+def check_for_updates(timeout=5, force=False):
     """Query GitHub releases for the latest version.
 
     Returns (has_update: bool, latest: str|None, html_url: str|None, error: str|None).
     Network failures return (False, None, None, '<error>').
+
+    Successful results are cached for `_UPDATE_CHECK_CACHE_TTL` seconds —
+    repeated clicks within that window hit the cache instead of GitHub's
+    API. Errors are NOT cached so a transient outage doesn't poison future
+    checks. Pass `force=True` to bypass the cache (not currently wired to
+    any UI affordance — internal hook).
     """
     import urllib.request, urllib.error
+
+    now = time.monotonic()
+    if not force:
+        with _update_check_cache_lock:
+            cached = _update_check_cache["result"]
+            age = now - _update_check_cache["timestamp"]
+            if cached is not None and age < _UPDATE_CHECK_CACHE_TTL:
+                return cached
+
     req = urllib.request.Request(
         _RELEASES_API,
         headers={
@@ -1236,7 +1262,13 @@ def check_for_updates(timeout=5):
     if not latest:
         return False, None, None, "no tag in response"
     has_update = _version_tuple(latest) > _version_tuple(__version__)
-    return has_update, latest.lstrip("vV"), html_url, None
+    result = (has_update, latest.lstrip("vV"), html_url, None)
+
+    with _update_check_cache_lock:
+        _update_check_cache["timestamp"] = now
+        _update_check_cache["result"] = result
+
+    return result
 
 
 # ── Dark theme palette + helpers ──────────────────────────────────────────
@@ -1278,19 +1310,32 @@ def _apply_dark_titlebar(root):
         # HWNDs above 2GB on 64-bit. Bound name per workspace constraint:
         # "Never call ctypes.windll.* directly outside the bindings block".
         hwnd = GetParent(hwnd_inner) or hwnd_inner
-        dwmapi = ctypes.windll.dwmapi
+        # Bind DwmSetWindowAttribute with explicit argtypes/restype rather
+        # than calling `ctypes.windll.dwmapi.DwmSetWindowAttribute(...)`
+        # directly — HWND is pointer-sized on x64 and default-c_int argtype
+        # silently truncates handles above 2 GB. HRESULT default-c_int
+        # restype is actually correct (HRESULT is 32-bit signed), but
+        # binding it explicitly matches the workspace constraint: never
+        # call `ctypes.windll.*` directly outside a bound-name pattern.
+        _dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        DwmSetWindowAttribute = _dwmapi.DwmSetWindowAttribute
+        DwmSetWindowAttribute.argtypes = [
+            ctypes.wintypes.HWND, ctypes.wintypes.DWORD,
+            ctypes.c_void_p, ctypes.wintypes.DWORD,
+        ]
+        DwmSetWindowAttribute.restype = ctypes.HRESULT
         # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 on Win10 2004+ / Win11.
         # Earlier Win10 builds (1903–1909) used 19 — try 20 first, fall back
         # to 19 only if 20 returns nonzero (failure).
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         value = ctypes.c_int(1)
-        result = dwmapi.DwmSetWindowAttribute(
+        result = DwmSetWindowAttribute(
             hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
             ctypes.byref(value), ctypes.sizeof(value))
         if result != 0:
             # Try the legacy attribute index used on early Win10 1903-1909.
-            dwmapi.DwmSetWindowAttribute(hwnd, 19,
-                                         ctypes.byref(value), ctypes.sizeof(value))
+            DwmSetWindowAttribute(hwnd, 19,
+                                  ctypes.byref(value), ctypes.sizeof(value))
     except (AttributeError, OSError) as e:
         log.warning("Could not apply dark title bar: %s", e)
 
@@ -1585,8 +1630,20 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
         listener.start()
 
         def poll_capture():
-            if listener.running:
-                root.after(50, poll_capture)
+            # If the Settings dialog is destroyed while a capture is in
+            # flight (user clicks Cancel mid-recording), `root.after` raises
+            # TclError and Tk's report_callback_exception logs it — but the
+            # cleanup at the bottom of this function never runs, leaving
+            # `recording["active"] = True` AND the pynput listener alive.
+            # Catch the TclError, stop the listener, and reset state so the
+            # listener doesn't leak across dialog sessions.
+            try:
+                if listener.running:
+                    root.after(50, poll_capture)
+                    return
+            except tk.TclError:
+                listener.stop()
+                recording["active"] = False
                 return
             key_name = _pynput_key_to_name(final_key[0])
             if key_name:
@@ -1859,7 +1916,11 @@ def _open_settings_impl(tray_icon, on_saved):
     # root. Settings already holds the dialog-slot, so these don't need
     # separate slot machinery.
     def on_about_btn():
-        _show_about(root)
+        # Pass the cached autostart state captured at dialog open so About
+        # doesn't re-spawn the 30-second PowerShell subprocess on the Tk
+        # event-loop thread (was visibly hanging the About dialog on
+        # cold-boot Win11 with AV scanning).
+        _show_about(root, autostart_enabled_value=autostart_state["enabled"])
 
     def on_updates_btn():
         _run_update_check(root)
@@ -1949,14 +2010,19 @@ def _enable_dark_mode_menus():
 # top-level root, and the parent's dialog-slot (already held by Settings)
 # covers them too — no separate slot mgmt needed.
 
-def _show_about(parent_root):
+def _show_about(parent_root, autostart_enabled_value=None):
     """Open a modeless About window as a child of `parent_root`.
 
-    Modeless = no `grab_set`, no `transient`, no `-topmost`. The user can
-    click away to other windows while About stays visible, and can dismiss
-    it whenever — same affordance as a typical About dialog in Office, VS
-    Code, etc. Replaces the prior `messagebox.showinfo` which was
-    application-modal and stole focus until dismissed."""
+    `autostart_enabled_value` is an optional pre-computed value from the
+    caller (e.g., the Settings dialog already caches it). When provided,
+    we skip the PowerShell subprocess `autostart_enabled()` would otherwise
+    spawn — that subprocess has a 30s timeout and on cold-boot Win11 with
+    AV scanning can take 10-30s, blocking the Tk event loop and making
+    About appear to hang. Pass the cached value to keep About snappy.
+
+    Modeless = no `grab_set`, no `transient`. The user can click away to
+    other windows while About stays visible, and can dismiss it whenever —
+    same affordance as a typical About dialog in Office, VS Code, etc."""
     try:
         import tkinter as tk
         cfg = load_config()
@@ -1990,7 +2056,7 @@ def _show_about(parent_root):
             f"Hotkey: {hotkey_display_name(cfg)}\n"
             f"Lock on blank: {'on' if cfg.get('lock_on_off') else 'off'}\n"
             f"Auto-blank when idle: {idle_line}\n"
-            f"Autostart: {'on' if autostart_enabled() else 'off'}"
+            f"Autostart: {'on' if (autostart_enabled_value if autostart_enabled_value is not None else autostart_enabled()) else 'off'}"
         )
         body = tk.Label(about, text=body_text, justify="left",
                         font=("Segoe UI", 10),
@@ -2083,6 +2149,15 @@ def _run_update_check(parent_root):
                         f"{_GITHUB_RELEASES_URL}\n\n"
                         f"Raw error: {err_text}"
                     )
+                elif "403" in err_text or "rate limit" in err_text.lower():
+                    msg = (
+                        "Could not check for updates — GitHub API rate limit reached.\n\n"
+                        "GitHub limits unauthenticated requests to 60 per hour per IP.\n"
+                        "Other tools on this network (gh CLI, GitHub Desktop, VS Code\n"
+                        "extensions, etc.) share the same quota.\n\n"
+                        "Try again in an hour, or check releases directly:\n"
+                        f"{_GITHUB_RELEASES_URL}"
+                    )
                 elif "timeout" in err_text.lower() or "timed out" in err_text.lower():
                     msg = (
                         "Could not check for updates — request timed out.\n\n"
@@ -2104,7 +2179,17 @@ def _run_update_check(parent_root):
                     "Open the release page in your browser?",
                     parent=parent_root,
                 ):
-                    _open_url(html_url or _GITHUB_RELEASES_URL)
+                    # html_url comes from GitHub API response — validate it
+                    # before passing to webbrowser.open. A compromised release
+                    # or MITM-injected JSON could set html_url to a
+                    # `file://` or `javascript:` URI; the OS handler then
+                    # opens whatever the attacker wants. Allowlist
+                    # https://github.com/ prefix; otherwise fall back to
+                    # the hardcoded releases page.
+                    if html_url and html_url.startswith("https://github.com/"):
+                        _open_url(html_url)
+                    else:
+                        _open_url(_GITHUB_RELEASES_URL)
             else:
                 messagebox.showinfo(
                     "Display Off — Up to date",

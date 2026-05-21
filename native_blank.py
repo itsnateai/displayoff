@@ -311,9 +311,21 @@ def _write_display_timeouts(ac_seconds, dc_seconds):
 
 def _write_sentinel(saved_ac, saved_dc):
     """Persist the original timeouts to a sentinel file so a crash mid-run
-    doesn't leave the user stuck with a 1-second display timeout."""
-    with open(_SENTINEL_PATH, "w", encoding="utf-8") as f:
+    doesn't leave the user stuck with a 1-second display timeout.
+
+    Atomic via write-to-`.tmp` + `os.replace` so a partial-write kill
+    (BSOD / OOM / Task Manager between Python's open and close) doesn't
+    leave a corrupt sentinel. `_recover_from_stale_sentinel` treats
+    corrupt JSON as "delete the sentinel" — without atomicity, a crash
+    inside `json.dump` would discard the saved AC/DC values forever and
+    trap the user with the 1-second timeout. `os.fsync` defends the
+    same scenario against the OS-level writeback window."""
+    tmp_path = _SENTINEL_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump({"ac": saved_ac, "dc": saved_dc, "pid": os.getpid()}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, _SENTINEL_PATH)
 
 
 def _clear_sentinel():
