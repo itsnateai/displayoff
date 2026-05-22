@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.13"
+__version__ = "1.7.14"
 
 log = logging.getLogger("displayoff")
 
@@ -3771,11 +3771,23 @@ def run_tray():
         # One-time welcome notification + persist defaults so this won't fire again.
         # Don't clobber: check the file again after the notification fires, since the
         # user could have opened Settings and saved their own config in the meantime.
+        # v1.7.14: pre-set `_frozen_promoted_pinged` under freeze so the welcome
+        # notification's own NIF_INFO balloon doubles as the catalog-forcing ping
+        # — without this, a first-run frozen user gets the welcome on launch N
+        # and the SEPARATE promotion ping on launch N+1 (two toasts for one
+        # install). Surfaced by T3-Opus MEDIUM: the `elif _is_frozen() and ...`
+        # branch wouldn't fire on first_run (different elif arm), so the flag
+        # stayed False, so launch N+1 re-fired the ping. Pre-setting here closes
+        # the gap.
+        if _is_frozen():
+            cfg["_frozen_promoted_pinged"] = True
+        welcome_hotkey = hotkey_name[0]
+
         def _welcome():
             time.sleep(1.0)  # let the tray icon attach before notifying
             try:
                 icon.notify(
-                    f"Press {hotkey_name[0]} to blank all displays.",
+                    f"Press {welcome_hotkey} to blank all displays.",
                     "Display Off is running",
                 )
             except Exception as e:
@@ -3786,44 +3798,90 @@ def run_tray():
                 except OSError as e:
                     log.warning("Could not write initial config: %s", e)
         threading.Thread(target=_welcome, daemon=True).start()
-    elif _is_frozen() and not cfg.get("_frozen_promoted_pinged", False):
-        # v1.7.13: first launch under the frozen .exe build for a user who
-        # already has a config from a previous source-mode install. Win11
-        # 22H2+ treats the .exe as a brand-new ExecutablePath in
-        # NotifyIconSettings (separate from the previous pythonw.exe entry)
-        # and defaults it to hidden-in-overflow. Fire a one-shot
-        # notification to force Explorer to catalog the icon synchronously
-        # — without that catalog, tray_promoter has nothing to set
-        # IsPromoted=1 on and the icon stays hidden indefinitely. See
-        # _DEFAULT_CONFIG `_frozen_promoted_pinged` comment for the full
-        # backstory.
+    elif _is_frozen() and cfg.get("_frozen_promoted_pinged") is not True:
+        # v1.7.13 (initial) + v1.7.14 (hardening): first launch under the
+        # frozen .exe build for a user who already has a config from a
+        # previous source-mode install. Win11 22H2+ treats the .exe as a
+        # brand-new ExecutablePath in NotifyIconSettings (separate from
+        # the previous pythonw.exe entry) and defaults it to hidden-in-
+        # overflow. Fire a one-shot notification to force Explorer to
+        # catalog the icon synchronously — without that catalog,
+        # tray_promoter has nothing to set IsPromoted=1 on and the icon
+        # stays hidden indefinitely. See _DEFAULT_CONFIG
+        # `_frozen_promoted_pinged` comment for the full backstory.
+        #
+        # v1.7.14 verifier-round hardening (T2 + T3 pair convergent):
+        #   - Gate via `is not True` rather than `not cfg.get(...)`: a
+        #     hand-edited config with `null` / `0` / `""` was previously
+        #     re-firing the toast every launch (truthiness false-match).
+        #     Strict identity-check means ONLY a literal Python True
+        #     suppresses; everything else re-tries.
+        #   - Flag-set moved INSIDE the notify try-block: previously the
+        #     flag was set unconditionally after the try, so an exception
+        #     during `icon.notify()` (icon not yet registered, Focus
+        #     Assist blocking NIF_INFO) burned the one-shot silently and
+        #     the icon stayed hidden. Now the flag only flips on
+        #     successful notify, so retry happens on next launch.
+        #   - Capture `hotkey_name[0]` BEFORE the 1s sleep: hotkey_name is
+        #     mutated by Settings → Save (on_saved); without the snapshot,
+        #     a user who reconfigured the hotkey during the 1s window
+        #     would see a stale label vs the running listener.
+        #   - Title is just "Display Off" (no version): consistent with
+        #     v1.7.8's UA-header policy of not broadcasting __version__
+        #     for fingerprinting reasons. The toast is local but visible
+        #     under screen-share.
+        #   - Persist via read-modify-write off the on-disk config rather
+        #     than overwriting the closure `cfg`: a concurrent
+        #     `_apply_settings` Save in the Settings dialog could
+        #     otherwise have its just-written changes clobbered by our
+        #     stale closure-cfg save.
+        ping_hotkey = hotkey_name[0]
+
         def _frozen_promote_ping():
             # 1s settle matches the first-run welcome notification — gives
             # pystray's NIM_ADD time to register before we fire NIF_INFO.
+            # If notify fires before NIM_ADD lands, pystray silently no-
+            # ops; we catch the exception below and DON'T set the flag,
+            # so next launch retries.
             time.sleep(1.0)
+            notify_ok = False
             try:
                 icon.notify(
                     f"Display Off is now running as a single-file .exe. "
-                    f"Press {hotkey_name[0]} to blank all displays.",
-                    "Display Off v" + __version__,
+                    f"Press {ping_hotkey} to blank all displays.",
+                    "Display Off",
                 )
                 log.info("Frozen-first-launch promotion ping fired — Explorer "
                          "should catalog the tray icon now, then tray_promoter "
                          "writes IsPromoted=1.")
+                notify_ok = True
             except Exception as e:
                 log.warning("Could not fire frozen-first-launch promotion "
                             "notification: %s. Tray icon may stay hidden; user "
                             "can manually toggle Settings ▸ Personalization "
-                            "▸ Taskbar ▸ Other system tray icons.", e)
-            # Persist the flag so subsequent launches don't re-fire this
-            # notification (Explorer remembers IsPromoted=1 once set; the
-            # ping is only needed for the initial catalog).
-            cfg["_frozen_promoted_pinged"] = True
+                            "▸ Taskbar ▸ Other system tray icons. The flag is "
+                            "NOT being set, so a retry will fire on next "
+                            "launch.", e)
+
+            if not notify_ok:
+                return
+
+            # Read-modify-write off the on-disk config to defeat the race
+            # against a concurrent Settings → Save: the user's just-edited
+            # hotkey/idle/lock values could otherwise be silently
+            # clobbered by a stale closure-cfg snapshot.
             try:
-                save_config(cfg)
+                disk_cfg = load_config()
+                disk_cfg["_frozen_promoted_pinged"] = True
+                save_config(disk_cfg)
+                # Mirror into the running closure cfg too so any
+                # in-process re-check (none today, but defensive) sees the
+                # post-ping state.
+                cfg["_frozen_promoted_pinged"] = True
             except OSError as e:
                 log.warning("Could not persist _frozen_promoted_pinged flag: "
-                            "%s — notification may fire again next launch.", e)
+                            "%s — notification may fire again next launch. "
+                            "Harmless beyond the extra toast.", e)
         threading.Thread(target=_frozen_promote_ping, daemon=True).start()
 
     icon.run()

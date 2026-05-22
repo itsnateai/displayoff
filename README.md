@@ -149,14 +149,14 @@ The manual **Check for Updates** button (Settings dialog) hits `api.github.com/r
 ## Caveats
 
 - **Production blank is ~5 seconds** on the native path, vs. ~0.5 seconds on the legacy path. Acceptable for the "click and walk away" use case; if you want faster blanking and your hardware doesn't trip the legacy bug, flip `use_legacy_sc_monitorpower: true` in config.
-- **First-run tray icon may land in Win11's overflow flyout** rather than the main taskbar tray. Win11 catalogs `pythonw.exe`-shared icons lazily; on first run, click the up-arrow (`^`) chevron once. The promoter ensures `IsPromoted=1` stays set across every restart afterward. Alternative: *Settings → Personalization → Taskbar → Other system tray icons → Display Off → On*.
+- **First-run tray icon may land in Win11's overflow flyout** rather than the main taskbar tray. Win11 catalogs new `ExecutablePath` entries in `NotifyIconSettings` lazily. The frozen `displayoff.exe` (v1.7.13+) self-cataloges via a one-shot `NIF_INFO` balloon on first launch, so the icon usually promotes itself within seconds. If that doesn't fire (Focus Assist, AV race, source-mode install), click the up-arrow (`^`) chevron once and the promoter writes `IsPromoted=1` for next time. Manual fallback: *Settings → Personalization → Taskbar → Other system tray icons → Display Off → On*.
 - **The right-click menu has no "Turn Off Displays" item.** Use double-click or the hotkey. Empirically, menu-item-triggered invocations ran the identical code chain but the kernel didn't act on the policy change (best hypothesis: `powercfg /setactive SCHEME_CURRENT` is a lazy refresh that gets optimized away when the active scheme is unchanged).
 - **Hotkey may be silently unavailable when an elevated window has focus.** Windows UIPI prevents low-privilege keyboard hooks (pynput's) from receiving input destined for elevated processes — Task Manager, an admin-elevated terminal, a UAC consent dialog. The tray icon still works.
 - **Single instance is per-user.** Each Windows user can run their own copy in their own session (Fast User Switching supported).
 
 ## Logs
 
-`pythonw.exe`-mode runs log to two files next to the script:
+Logs live in `%APPDATA%\displayoff\` (per-user, since v1.7.9) for both the `.exe` and source modes:
 
 - **`displayoff.log`** — tray-app events: hotkey registration, click triggers, lock-collision drops, errors.
 - **`native_blank.log`** — native idle-blank events: scheme read, sentinel writes, timeout writes, sleep with idle-counter samples, restore verification.

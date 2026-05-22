@@ -1,5 +1,23 @@
 # Changelog — Display Off
 
+## [1.7.14] — 2026-05-21
+
+Same-day hardening of v1.7.13's `_frozen_promoted_pinged` first-launch ping. A 6-agent verifier round on the v1.7.13 hotfix (T1 Diff-clean / T2 Gap-audit / T3 Code-review × Sonnet+Opus) returned 2× APPROVE / 4× CONCERNS with convergent findings on the new ping flow.
+
+### Fixed
+
+- **Gate uses strict identity (`is not True`) instead of truthiness** in `displayoff.py`. v1.7.13 used `not cfg.get("_frozen_promoted_pinged", False)` — a hand-edited config with `null`, `0`, or `""` evaluated falsy, re-firing the toast every launch even though the user might have intended to suppress it. Strict identity means ONLY a literal Python `True` suppresses the notification; everything else triggers a retry. Surfaced by T2 Sonnet+Opus + T3 Opus (convergent).
+- **Flag is set ONLY on successful `icon.notify()`**, not unconditionally after the try/except. v1.7.13 set `_frozen_promoted_pinged = True` even when `notify()` raised (icon not yet registered, Focus Assist blocking NIF_INFO, AV race) — burning the one-shot silently so the icon stayed hidden indefinitely. v1.7.14 gates the flag-write on a `notify_ok` flag that only flips inside the successful branch. Failed pings now retry on next launch instead of becoming a permanent stuck-hidden state. Surfaced by T2 Opus + T2 Sonnet (convergent).
+- **`hotkey_name[0]` captured BEFORE the 1 s settle** so a user who reconfigures the hotkey via Settings ▸ Save during the settle window doesn't see a stale label in the toast vs the active listener. Same capture pattern applied to the first-run welcome notification for symmetry. Surfaced by T3 Opus (single-finding HIGH).
+- **Config persistence uses read-modify-write off the on-disk config** in `_frozen_promote_ping` instead of `save_config(closure_cfg)`. v1.7.13's closure-cfg save would clobber a concurrent Settings ▸ Save's just-written user edits (new hotkey / idle minutes / lock-on-blank) with the stale snapshot from `run_tray`'s entry. v1.7.14 calls `load_config()` fresh, mutates only the one key, then `save_config(disk_cfg)` — the user's other edits survive. Surfaced by T3 Opus (single-finding HIGH).
+- **`first_run + frozen` users no longer get a duplicate toast on launch 2.** v1.7.13's `if first_run: ... elif _is_frozen() and not pinged: ...` chain meant a fresh-install frozen user got the welcome notification on launch 1, then the SEPARATE promotion ping on launch 2 (welcome → set defaults; ping branch fires because flag still False). v1.7.14 pre-sets `cfg["_frozen_promoted_pinged"] = True` inside the `first_run` branch under freeze, so the welcome notification doubles as the catalog-forcing ping. Surfaced by T3 Opus MEDIUM.
+- **Toast title is just "Display Off"** instead of `"Display Off v" + __version__`. The v1.7.8 User-Agent hardening explicitly removed `__version__` from network traffic for fingerprinting reasons; emitting the same string in a Win11 toast was inconsistent (visible under screen-share / OBS recording). Surfaced by T3 Opus MEDIUM.
+
+### Notes — gaps acknowledged but not patched
+
+- **Persistent `save_config` failure → recurring toast on every launch** (T2 Sonnet+Opus C2 convergent). If `%APPDATA%` is read-only or AV holds the config file consistently, the flag never persists and the toast fires every launch. Logged as `log.warning(... "Harmless beyond the extra toast.")`. Mitigation deferred to v1.7.15: an in-memory dedupe survives a single-session double-fire, but cross-launch behavior requires write access somewhere. Acceptable for the rare RO-APPDATA case.
+- **Daemon-thread + `os._exit` race vs rename-dance** (T3 Opus LOW). If the user clicks "Install now" while `_frozen_promote_ping` is mid-`save_config`, `os._exit(0)` skips the atomic rename and leaves `displayoff_config.json.tmp` orphaned. Cleaned up by the next `save_config`'s `os.replace`. Not patched — the window is sub-second and recovery is automatic.
+
 ## [1.7.13] — 2026-05-21
 
 First public single-file `displayoff.exe` (Nuitka onefile build) and the rename-dance self-updater that goes with it. Python source distribution continues alongside as a parallel channel — the same `displayoff.py` runs in both modes, dispatching on a `_is_frozen()` helper that detects the Nuitka `__compiled__` sentinel.
