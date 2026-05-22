@@ -26,6 +26,13 @@ $RECYCLE.BIN/
 *.orig
 *.rej
 
+# Rename-dance leftovers (v1.7.13+ self-updater intermediates that live
+# next to displayoff.exe in the install dir — usually cleaned by
+# _recover_from_failed_update on next launch, but defensive against any
+# .exe.old / .exe.tmp ever landing in the repo via build/ tinkering).
+*.old
+*.exe.tmp
+
 # Python
 __pycache__/
 *.pyc
