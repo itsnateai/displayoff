@@ -2474,7 +2474,17 @@ def _download_url_allowed(url):
     # fire (normpath collapses `..` segments away). They stay as a defensive
     # tripwire — a future refactor that removes Layer 1 without adding an
     # equivalent guard would still get caught by the dead Layer 2 check.
-    decoded_path = urllib.parse.unquote(parts.path)
+    # Loop until idempotent so double-encoded `%252e%252e` (decodes to
+    # `%2e%2e`, decodes again to `..`) doesn't bypass the segment check.
+    # T2-Opus R2 + T3-Opus R2 convergent finding. Bounded by max_passes so
+    # a pathological infinite-decode input (which urllib's unquote
+    # shouldn't produce, but defensive) terminates.
+    decoded_path = parts.path
+    for _ in range(5):
+        once = urllib.parse.unquote(decoded_path)
+        if once == decoded_path:
+            break
+        decoded_path = once
     raw_segments = decoded_path.replace("\\", "/").split("/")
     if ".." in raw_segments:
         return False

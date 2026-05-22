@@ -118,7 +118,7 @@ Items the v1.7.17 8-agent round surfaced that didn't make v1.7.18's cut:
 - `_download_url_allowed` URL parser hardening (`urlsplit` doesn't normalize `..` traversal; SHA256 is the integrity boundary so any exploit is bounded but the false-positive surface is wider than ideal).
 - `_migrate_legacy_data` `shutil.move` not atomic cross-device (only matters if `%APPDATA%` is on a different volume than the install dir).
 - `_DwmSetWindowAttribute` re-bound on every `_apply_dark_titlebar` call (convention violation; cosmetic).
-- `tray_promoter.py:121` docstring example still shows `current_exe_path=sys.executable` (real call site at `displayoff.py:3925` is correct; only the docstring will mislead template-copiers).
+- `tray_promoter.py:121` docstring example still shows `current_exe_path=sys.executable` (real call site in `displayoff.py`'s `run_tray()` is correct; only the docstring will mislead template-copiers).
 - `build-exe.bat` Nuitka pin guard (CI is already pinned via `pip install nuitka==4.1.1`; local builds aren't).
 
 ### Notes — the inaugural in-the-wild rename-dance exercise
