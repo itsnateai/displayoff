@@ -1,5 +1,71 @@
 # Changelog — Display Off
 
+## [1.7.20] — 2026-05-22
+
+**Final planned release. Maintenance-only mode after this.** Bundle of every deferred and out-of-scope item from the v1.7.17 / v1.7.18 / v1.7.19 train: 14 items grouped as resolver hardening (A1–A3), UX + observability (B4–B6), build + release hygiene (C7–C12), cosmetic (D13–D14).
+
+### Fixed — A. Resolver hardening
+
+- **`_path_under_protected()` helper rejects `%LOCALAPPDATA%\Microsoft\WindowsApps\`** (Strategy 0/1/2 in `_resolve_on_disk_exe_path()`). The Store-stub directory survived `_path_under_temp` because it isn't a TEMP dir, but a malicious argv[0] pointing inside it would steer the rename-dance at a reparse-point stub the Store ACL forbids writes to. Filtering up front gives a clean rejection rather than a partway-through-the-dance failure. The "known gap" comment block in v1.7.19's Strategy 0 docstring is replaced with a closure note. Symmetric resolution (realpath + normcase) with `_path_under_temp` so junctions / symlinks / 8.3 short names compare equal.
+- **`_download_url_allowed()` rejects path-traversal segments.** After `urlsplit`, the URL path is normalized via `os.path.normpath` (with backslash → forward-slash rewrite for portability on Windows builds) and rejected if it starts with `/..` or contains `/../`. The github.com branch's `startswith("/itsnateai/displayoff/")` check is no longer satisfiable via `/itsnateai/displayoff/../other-repo/...`. SHA256 verification is still the actual integrity boundary, but the allowlist's prefix-check should not be permissive against malformed inputs.
+- **`_migrate_legacy_data()` cross-device-atomic two-step.** Replaces `shutil.move(src, dst)` (which collapses to a non-atomic `shutil.copy2` + `os.remove` when src/dst are on different volumes) with an explicit `shutil.copy2 → _sha256_file equality check → os.remove(src)` chain. A crash between copy and unlink no longer leaves bytes in both locations or partial-bytes in dst (the SHA256 check detects the partial copy and removes the dst so the next launch re-attempts cleanly). Only matters when `%APPDATA%` and the install dir live on different volumes (portable USB install, NTFS-junctioned roaming profile).
+
+### Fixed — B. UX + observability
+
+- **`--diagnose-paths` exit code now signals resolver outcome.** Was always `0` regardless of whether the resolver succeeded. Now: `sys.exit(1 if _is_frozen() and not _EXE_PATH else 0)` — exit-0 = healthy (or .py source mode), exit-1 = frozen build with broken path resolution. A health script polling for updater readiness gets a useful signal. CONTRACT CHANGE for any caller currently parsing exit codes.
+- **Rename-dance child-ready handshake replaces 300 ms parent-sleep.** New named event `Local\DisplayOff_UpdateChildReady`: parent CreateEventWs (manual-reset, initial-state=False) BEFORE spawning the `--after-update` child, then waits via `WaitForSingleObject(handle, 5000)` instead of the v1.7.13 fixed `time.sleep(0.3)`. Child OpenEventWs + SetEvents as the very first act of `--after-update` (before reading state, before mutex acquire — signaling before mutex avoids the parent-must-exit-first deadlock; child's signal attests "Python interpreter is alive" which is what the parent's wait is actually for). 5 s timeout is a generous ceiling; if the child genuinely never starts the parent falls through to `os._exit(0)` anyway. Fallback to legacy 0.3 s sleep when `CreateEventW` returns NULL.
+- **`_themed_dialog` sticky `minsize()` floor.** v1.7.16's button-row width fix used one-shot `geometry()` which doesn't survive Tk re-solves (font cache refresh, DPI change, grab-set side effects). v1.7.20 adds `dlg.minsize(w, h)` after the `geometry()` call so the constraint persists for the dialog's lifetime.
+
+### Fixed — C. Build + release hygiene
+
+- **`release.yml` permissions tightened to least-privilege.** Workflow root: `contents: read`. Step level on the `softprops/action-gh-release` uploader: `contents: write`. Every other step (checkout, install, build, smoke) runs read-only.
+- **Post-upload CDN redirect-host smoke test in `release.yml`.** New CI step downloads the uploaded asset URL via `curl -sIL`, captures the final `url_effective` after redirects, and asserts the final host matches one of `release-assets.githubusercontent.com` / `objects.githubusercontent.com` / `objects-origin.githubusercontent.com`. If GitHub silently swaps CDN hosts again (the way they did mid-2025 when `release-assets.*` landed and broke v1.7.13–v1.7.15), the next release CI run fails BEFORE the broken build ships into users' update flow.
+- **`objects-origin.githubusercontent.com` added to in-app allowlist** — forward-compat defense for the same CDN-migration risk #8 catches at the CI layer. Microsoft's storage layer occasionally serves the origin host directly in long redirect chains; covering the host name now means the in-app updater stays working if GitHub points us at it later.
+- **`_UPDATE_MIN_EXE_SIZE = 1 MB` → `40 MB`.** Real `.exe` is ~55 MB (Nuitka 4.1.1 onefile + `--onefile-no-compression` workaround). 1 MB floor only caught 200-OK HTML error pages; 40 MB catches mis-shipped stub builds too. Comment includes the loosen-if note for a future Nuitka zstd-compression unlock that would shrink the .exe to ~20 MB.
+- **`build-exe.bat` Nuitka 4.1.1 preflight guard.** New `python -m nuitka --version | findstr /B "4.1.1"` check at the top of the .bat that fails fast if the active venv has a different Nuitka pinned. CI is already pinned via `pip install nuitka==4.1.1` in release.yml; local builds previously relied on whatever was installed. Mismatch silently introduced behavior drift (the py3.14 zstd compression bug we work around might be fixed in a newer Nuitka — at which point `--onefile-no-compression` should be DROPPED, not kept, but only after an explicit human decision).
+- **`build-exe.bat` Nuitka-version timeline entries refreshed for v1.7.16 / v1.7.17 / v1.7.18 / v1.7.19 / v1.7.20.** Confirms Nuitka 4.1.1 is still the workspace pin across the entire v1.7.16–v1.7.20 release window.
+
+### Fixed — D. Cosmetic
+
+- **`DwmSetWindowAttribute` bound at module load instead of every `_apply_dark_titlebar` call.** Per the workspace convention "all bindings live in the `if sys.platform == "win32":` block at the top of the file with explicit `argtypes`/`restype`". `_apply_dark_titlebar` had been an exception since v1.7.0 because `dwmapi.dll` is missing on pre-Win10 1607 builds; v1.7.20 wraps the `ctypes.WinDLL("dwmapi")` load in `try/OSError` so those builds gracefully no-op (the function checks `DwmSetWindowAttribute is None` and early-returns).
+- **`tray_promoter.py:121` docstring fix.** The template-portable example previously read `current_exe_path=sys.executable` — under Nuitka onefile freeze, `sys.executable` is the per-launch TEMP-extracted python.exe (NOT the on-disk .exe), so a freeze-mode template-copier would tag the wrong path. Corrected to `current_exe_path=_EXE_PATH or sys.executable`. The actual call site at `displayoff.py:4296` was already correct (it's inside an `if _is_frozen() and _EXE_PATH:` guard so `_EXE_PATH` cannot be None at the call); only the docstring example needed the fix.
+
+### Fixed — Verifier-round convergent (mid-round)
+
+A 6-agent verifier round (3 topics × Sonnet + Opus pair-by-topic) caught four issues that were rolled into v1.7.20 before tag:
+
+- **CRITICAL — `release.yml` step-level `permissions:` is silently ignored.** GitHub Actions only supports `permissions:` at workflow root and job level; the v1.7.20 first-pass put it on the softprops upload step where it would be a no-op, leaving the upload with a read-only `GITHUB_TOKEN` and failing every release push with a 403. T1-Sonnet + T1-Opus convergent. **Fix**: moved `permissions: contents: write` to the `build-windows-exe` job level. Workflow root stays `contents: read`.
+- **CRITICAL — `_download_url_allowed` URL-traversal check was a logical no-op against the documented attack.** `os.path.normpath` COLLAPSES `..` segments by design, so the `"/../" in normalized_path` check is dead code that can never match a real traversal URL. Meanwhile the github.com branch's prefix check used `parts.path` (raw, un-normalized), which still contains the literal `/../` prefix. A URL like `https://github.com/itsnateai/displayoff/../other-repo/release.exe` would pass: raw-path startswith fires True, normalized-path's `/../` check fires False. The exact bypass v1.7.20's first-pass CHANGELOG claimed to close was still satisfiable. T1-Sonnet + T1-Opus + T3-Opus convergent (3-of-6 critical). **Fix**: two-layer defense — (1) reject any `..` segment in the raw path BEFORE normalization, (2) do the github.com prefix check against the NORMALIZED path (with trailing-slash padding to keep the bare repo root acceptable). Regression-tested with 12 cases including the F2 attack URL.
+- **HIGH — `_update_child_ready_handle` ABA leak on repeat update attempt.** If the user cancels an update, dismisses the error, and clicks "Install now" again in the same session, the previous `_update_child_ready_handle` (if non-None from a prior successful flow) would be silently overwritten by the new `CreateEventW` call, leaking the kernel handle. T3-Sonnet HIGH. **Fix**: pre-create `CloseHandle` + zero guard in `_execute_rename_dance` before assigning a fresh handle.
+- **HIGH — `_migrate_legacy_data` TOCTOU on src hash.** The first-pass A3 fix hashed `src` AFTER `shutil.copy2`. The files being migrated include `displayoff.log` (an active RotatingFileHandler target in the same process). A post-copy hash could read bytes appended between the copy and the hash, producing a spurious mismatch that triggered a partial-copy cleanup loop indefinitely. T3-Sonnet HIGH. **Fix**: hash `src` BEFORE `shutil.copy2`, compare against the post-copy `dst` hash. Pre-copy hash is immune to post-copy modification.
+
+Plus two LOW observability nits from T1-Sonnet:
+- Strategy 2 now logs its rejection reason (symmetric with Strategies 0 and 1).
+- `_update_child_ready_handle` is zeroed after `CloseHandle` in `_run_rename_dance_flow._worker` (cosmetic — `os._exit(0)` follows, but consistency with the H1 pre-create guard matters if a future refactor replaces `os._exit`).
+
+The T2 pair (Gap-audit) reported ALL-14-COMPLETE; they did surface-check rather than semantic-trace, which is why the URL-traversal bypass slipped past T2 but caught by the T1 + T3 pairs. T2-Opus called out two improvements over spec (C8 host-list is 3-host strict; B5 Popen-failure handle cleanup) — both intentional improvements, kept.
+
+### Notes — maintenance mode
+
+After v1.7.20 ships, displayoff enters maintenance-only mode. The path-resolution bug class that drove v1.7.13–v1.7.19 is closed; the rename-dance has been proven to work end-to-end; the resolver has four layered strategies + the WindowsApps filter + the TEMP filter; the updater allowlist covers the three known GitHub CDN hosts + has CI-level CDN-change detection; and `--diagnose-paths` makes any future failure observable.
+
+Future failures, if they emerge:
+
+1. **Observable** via `path-resolver:` log lines or `--diagnose-paths` output. Both fire on every startup post-v1.7.19.
+2. **Recoverable** via manual install from the releases page. The SHA256SUMS.txt manifest is canonical.
+3. **Reproducible** via the resolver candidates dict (sys.executable / sys.argv[0] / NUITKA_ONEFILE_PARENT / `__compiled__.original_argv0` / `__compiled__.containing_dir`).
+
+A future session should NOT re-open displayoff unless one of those three observability properties breaks. The maintenance bar is "if a user reports a bug AND it's not in the v1.7.20 known-gap set, hotfix it. Otherwise, don't touch."
+
+### Notes — known gaps remaining (intentional)
+
+These are intentionally unfixed in v1.7.20 — either by-design or because the risk/reward doesn't justify a code change in maintenance mode:
+
+- **Pre-v3 config migration**: this version's tray-app pattern doesn't have a pre-v3 cohort to migrate; the closest equivalent is the v1.7.8 → v1.7.9 `_HERE` → `%APPDATA%\displayoff` move, which is already handled.
+- **`shell32.SHGetKnownFolderPath` instead of `%APPDATA%` env var lookup**: env-var lookup works for every Windows install discoverable; the KNOWNFOLDER API is more robust on locked-down policy edges but the failure mode is already handled (fallback to `_HERE`).
+- **`ctypes.windll.dwmapi` still vs `_dwmapi` lookup hot-path**: D13 moves the binding to module load; the `DwmSetWindowAttribute` call itself stays unchanged. No further optimization needed.
+- **No `--quit-then-update` CLI flag**: the rename-dance already handles in-process updates correctly; an out-of-process update CLI flag would be a new feature, not a maintenance fix.
+
 ## [1.7.19] — 2026-05-22
 
 Path-resolver hotfix + diagnostic-observability fix triggered by the v1.7.17 → v1.7.18 inaugural in-the-wild rename-dance attempt. The dance failed: pid 18996 had `_EXE_PATH` resolved to `<%TEMP%>\onefile_18996_.../python.exe` (Strategy 3 — the broken last-resort), and the rename target was the temp `python.exe` rather than the on-disk `displayoff.exe`. Worse, pid 18996's resolver candidates **were never written to the log file** — v1.7.17/v1.7.18 buffered them through `_MIGRATION_LOG` which only flushes the prefix `data-dir migration:` when the resolver also did data-dir migration. Pid 18996 was already migrated, so its resolver candidates stayed in-memory only. v1.7.19 fixes both the silent failure AND the diagnostic gap.

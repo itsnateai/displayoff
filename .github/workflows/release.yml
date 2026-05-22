@@ -37,13 +37,23 @@ on:
         type: string
 
 permissions:
-  contents: write  # required for softprops/action-gh-release to upload assets
+  contents: read   # v1.7.20: workflow-root least-privilege. Only the
+                   # softprops upload step needs write — every other step
+                   # (checkout, install, build, smoke) runs read-only.
 
 jobs:
   build-windows-exe:
     name: Build displayoff.exe (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 30
+    # v1.7.20 verifier convergence (T1-Sonnet + T1-Opus): GitHub Actions only
+    # supports `permissions:` at workflow root and job level, NOT at step
+    # level. A step-level permissions key is silently ignored. Putting the
+    # write permission here at the job scope (with workflow root staying
+    # `contents: read`) gives the softprops upload step the write token it
+    # needs without leaking write across other jobs we might add later.
+    permissions:
+      contents: write
     steps:
       - name: Checkout (push trigger)
         if: github.event_name == 'push'
@@ -78,7 +88,9 @@ jobs:
         # Pinned to v2.6.2 — softprops/action-gh-release@v2 is the tag the
         # user-facing docs reference, the SHA is the actual security
         # boundary. Re-resolve via `gh api repos/softprops/action-gh-release/git/refs/tags/<tag>`
-        # before bumping.
+        # before bumping. v1.7.20 verifier-converged fix: write permission
+        # is set at the JOB level (above) — step-level `permissions:` is
+        # not a supported GitHub Actions key and would be silently ignored.
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           # On push: the ref is the tag GitHub already resolved.
@@ -91,3 +103,49 @@ jobs:
           files: |
             build/displayoff.exe
             build/SHA256SUMS.txt
+
+      - name: Post-upload CDN redirect-host smoke test
+        # v1.7.20 forward-compat defense: GitHub silently swapped the
+        # asset CDN from objects.githubusercontent.com →
+        # release-assets.githubusercontent.com mid-2025, which broke
+        # displayoff's update allowlist in v1.7.13–v1.7.15 (caught only
+        # when v1.7.15 → v1.7.16 in-the-wild dance failed). This step
+        # downloads the freshly-uploaded asset URL via HEAD-follow and
+        # asserts the final redirect target matches one of the hosts
+        # the in-app `_download_url_allowed` accepts. If GitHub flips
+        # the CDN again, this CI step fails on the next release we cut,
+        # giving us a chance to refresh the allowlist BEFORE the broken
+        # build ships into production users' update flow.
+        shell: bash
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/itsnateai/displayoff/releases/download/${TAG}/displayoff.exe"
+          echo "Probing redirect chain from: $URL"
+          # -L follows redirects; -I emits only headers; -s suppresses
+          # progress noise. The final "location:" line is the resolved
+          # CDN host after all redirects have been followed (curl's
+          # --write-out %{url_effective} would give the same answer).
+          FINAL_URL="$(curl -sIL "$URL" -o /dev/null -w '%{url_effective}\n')"
+          echo "Final URL after redirects: $FINAL_URL"
+          ALLOWED_HOSTS=(
+            "release-assets.githubusercontent.com"
+            "objects.githubusercontent.com"
+            "objects-origin.githubusercontent.com"
+          )
+          MATCHED=0
+          for HOST in "${ALLOWED_HOSTS[@]}"; do
+            if [[ "$FINAL_URL" == https://${HOST}/* ]]; then
+              echo "OK: final host matches allowlist entry '${HOST}'"
+              MATCHED=1
+              break
+            fi
+          done
+          if [[ "$MATCHED" -ne 1 ]]; then
+            echo "::error::Final CDN host is NOT in displayoff's update allowlist!"
+            echo "::error::Final URL: $FINAL_URL"
+            echo "::error::Allowed hosts: ${ALLOWED_HOSTS[*]}"
+            echo "::error::Add the new host to _download_url_allowed() before users update."
+            exit 1
+          fi

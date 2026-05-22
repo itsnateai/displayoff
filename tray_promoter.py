@@ -118,8 +118,17 @@ def sweep_stale_entries(our_exe_name, current_exe_path):
     The function also ships as a **template-portable helper** for future
     Python tray projects that bundle to a stable named .exe (e.g., via
     PyInstaller onefile with `--name`); those projects should invoke
-    `sweep_stale_entries(our_exe_name="myapp.exe", current_exe_path=sys.executable)`
-    once at startup before `capture_baseline()`.
+    `sweep_stale_entries(our_exe_name="myapp.exe", current_exe_path=_EXE_PATH or sys.executable)`
+    once at startup before `capture_baseline()`. v1.7.20 docstring fix:
+    under Nuitka onefile freeze, `sys.executable` is the per-launch
+    TEMP-extracted python.exe (NOT the on-disk .exe), so a freeze-mode
+    template-copier passing it would tag the wrong path. `_EXE_PATH`
+    is the resolved on-disk path (None under .py source — fall through
+    to sys.executable in that case). The actual displayoff call site
+    at `displayoff.py:4296` already does this correctly via an outer
+    `if _is_frozen() and _EXE_PATH:` guard around the call; this is
+    purely a docstring example correction so template-copiers without
+    the surrounding guard get the right pattern.
 
     Conservative — only touches entries that:
       (a) have ExecutablePath populated (skips orphans / sparse subkeys),

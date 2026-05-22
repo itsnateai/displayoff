@@ -36,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.19"
+__version__ = "1.7.20"
 
 log = logging.getLogger("displayoff")
 
@@ -152,6 +152,40 @@ def _path_under_temp(path):
     return False
 
 
+def _path_under_protected(path):
+    """True if `path` lives under a Windows-protected location the resolver
+    must never target. v1.7.20: closes the WindowsApps Store-stub attack
+    vector documented in CHANGELOG v1.7.19 — `%LOCALAPPDATA%\\Microsoft\\
+    WindowsApps\\` survived `_path_under_temp` because it isn't a temp
+    dir, but writing a `.exe` there is forbidden (the reparse-point
+    stubs are owned by the Store) AND the resolver hitting that dir
+    would mean an attacker steered argv[0] at a Store stub.
+    Symmetric resolution (realpath + normcase) with `_path_under_temp`
+    so junctions/symlinks/8.3 names compare equal."""
+    if not path:
+        return False
+    try:
+        canonical = os.path.normcase(os.path.realpath(path))
+    except OSError:
+        canonical = os.path.normcase(os.path.abspath(path))
+    protected_candidates = []
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        protected_candidates.append(
+            os.path.join(local_appdata, "Microsoft", "WindowsApps")
+        )
+    for raw in protected_candidates:
+        try:
+            p = os.path.normcase(os.path.realpath(raw))
+        except OSError:
+            p = os.path.normcase(os.path.abspath(raw))
+        if not p.endswith(os.sep):
+            p = p + os.sep
+        if canonical.startswith(p):
+            return True
+    return False
+
+
 def _resolve_on_disk_exe_path():
     """Resolve the on-disk displayoff.exe path under freeze. None under .py.
 
@@ -227,11 +261,15 @@ def _resolve_on_disk_exe_path():
     # release manifest, so they can't inject arbitrary bytes — but the
     # bytes they DO inject (a real `displayoff.exe` build) will be
     # written to the spoofed path. Mitigations: the hardening triple
-    # (`.exe`, isfile, not-temp) excludes the most obvious paths an
-    # attacker would point at (TEMP scratch files, missing paths), but
-    # does NOT exclude every protected directory (e.g.
-    # `LOCALAPPDATA\Microsoft\WindowsApps\` Store stubs would survive
-    # the filter — known gap, see CHANGELOG v1.7.20+ backlog).
+    # (`.exe`, isfile, not-temp, not-protected) excludes the obvious
+    # paths an attacker would point at (TEMP scratch files, missing
+    # paths) AND the WindowsApps Store-stub directory closed in v1.7.20
+    # via `_path_under_protected`. The Store stubs are reparse points
+    # under `%LOCALAPPDATA%\Microsoft\WindowsApps\` — writing a `.exe`
+    # there is forbidden by the Store ACL, but a malicious argv[0] could
+    # still steer the resolver at one (and rename-dance would then fail
+    # noisily mid-step rather than silently). Rejecting up front is
+    # cleaner.
     compiled = globals().get("__compiled__")
     if compiled is not None:
         orig_argv0 = getattr(compiled, "original_argv0", None)
@@ -239,7 +277,8 @@ def _resolve_on_disk_exe_path():
             cand = os.path.abspath(orig_argv0)
             if (cand.lower().endswith(".exe")
                     and os.path.isfile(cand)
-                    and not _path_under_temp(cand)):
+                    and not _path_under_temp(cand)
+                    and not _path_under_protected(cand)):
                 _RESOLVER_LOG.append(
                     f"Strategy 0 (__compiled__.original_argv0) -> {cand!r}"
                 )
@@ -247,7 +286,7 @@ def _resolve_on_disk_exe_path():
             else:
                 _RESOLVER_LOG.append(
                     f"Strategy 0 rejected: original_argv0={cand!r} "
-                    f"(temp/missing/non-.exe) — falling back"
+                    f"(temp/protected/missing/non-.exe) — falling back"
                 )
 
     # Strategy 1: NUITKA_ONEFILE_PARENT → QueryFullProcessImageNameW.
@@ -330,7 +369,8 @@ def _resolve_on_disk_exe_path():
                             if (resolved
                                     and resolved.lower().endswith(".exe")
                                     and os.path.isfile(resolved)
-                                    and not _path_under_temp(resolved)):
+                                    and not _path_under_temp(resolved)
+                                    and not _path_under_protected(resolved)):
                                 _RESOLVER_LOG.append(
                                     f"Strategy 1 (NUITKA_ONEFILE_PARENT "
                                     f"pid={parent_pid}) -> {resolved!r}"
@@ -340,7 +380,7 @@ def _resolve_on_disk_exe_path():
                                 _RESOLVER_LOG.append(
                                     f"Strategy 1 rejected: parent "
                                     f"pid={parent_pid} -> {resolved!r} "
-                                    f"(temp/missing/non-.exe) — falling back"
+                                    f"(temp/protected/missing/non-.exe) — falling back"
                                 )
                     finally:
                         _Close(handle)
@@ -355,19 +395,34 @@ def _resolve_on_disk_exe_path():
                     f"Strategy 1 errored ({e!r}) — falling back"
                 )
 
-    # Strategy 2: sys.argv[0] if it's outside TEMP, ends with .exe, AND
-    # exists on disk. v1.7.17 T2-Sonnet hardening: existence check prevents
-    # a synthetic argv[0] (relative path, network path, deleted .exe) from
-    # silently propagating to the rename-dance / .lnk / tray_promoter.
+    # Strategy 2: sys.argv[0] if it's outside TEMP + WindowsApps, ends
+    # with .exe, AND exists on disk. v1.7.17 T2-Sonnet hardening:
+    # existence check prevents a synthetic argv[0] (relative path,
+    # network path, deleted .exe) from silently propagating to the
+    # rename-dance / .lnk / tray_promoter. v1.7.20: also filters via
+    # `_path_under_protected` so a Store-stub-spoofed argv[0] doesn't
+    # land here.
     argv0 = candidates.get("sys.argv[0]")
     if (argv0
             and argv0.lower().endswith(".exe")
             and os.path.isfile(argv0)
-            and not _path_under_temp(argv0)):
+            and not _path_under_temp(argv0)
+            and not _path_under_protected(argv0)):
         _RESOLVER_LOG.append(
             f"Strategy 2 (sys.argv[0]) -> {argv0!r}"
         )
         return argv0
+    elif argv0:
+        # v1.7.20 verifier T1-Sonnet N2: log Strategy 2 rejection for
+        # observability symmetry with Strategy 0 and Strategy 1, which
+        # both already log their rejection reasons. Without this line,
+        # a Strategy 2 rejection silently falls through to Strategy 3
+        # (which logs "all strategies failed") and the user can't tell
+        # WHY Strategy 2 didn't win from the log alone.
+        _RESOLVER_LOG.append(
+            f"Strategy 2 rejected: sys.argv[0]={argv0!r} "
+            f"(temp/protected/missing/non-.exe) — falling back"
+        )
 
     # Strategy 3: all three primary strategies failed — Nuitka likely
     # changed its environment contract, or the .exe file got moved/deleted
@@ -511,7 +566,52 @@ def _migrate_legacy_data():
             )
             continue
         try:
-            shutil.move(src, dst)
+            # v1.7.20: cross-device-atomic two-step (hash src → copy2 →
+            # SHA256 verify dst against pre-copy src hash → unlink src)
+            # instead of `shutil.move`. `shutil.move` collapses to
+            # `os.rename` when src/dst are on the same volume (atomic on
+            # NTFS) but falls back to a non-atomic copy+unlink on a
+            # cross-device move — `%APPDATA%` and the install dir CAN live
+            # on different volumes (portable install on USB, NTFS-junctioned
+            # roaming-profile mount). Under that fallback, a crash between
+            # copy and unlink would leave the bytes in BOTH locations and
+            # we'd re-do the move on next launch, copying the destination
+            # over itself. Worse, a partial copy would land on disk and the
+            # `os.path.exists(dst)` check on the next attempt would skip
+            # the file forever. The hash-verify gate makes the second pass
+            # detect partial copies and re-do them cleanly.
+            #
+            # v1.7.20 verifier T3-Sonnet H2: hash src BEFORE copy2, not
+            # after. The files being migrated include `displayoff.log`,
+            # which is written by an active RotatingFileHandler in the
+            # same process. A post-copy hash of src would read bytes that
+            # may have been appended between the copy and the read,
+            # producing a spurious mismatch that triggers a retry loop.
+            # Pre-copy hashing locks the comparison to "the bytes that
+            # were on disk at the moment we started the copy".
+            src_hash = _sha256_file(src)
+            shutil.copy2(src, dst)
+            if src_hash != _sha256_file(dst):
+                # Partial copy or mid-transfer disk error. Pull dst back
+                # off disk so the next attempt re-tries cleanly. Don't
+                # touch src — it's still the canonical copy.
+                try:
+                    os.remove(dst)
+                except OSError as cleanup_err:
+                    _MIGRATION_LOG.append(
+                        f"PARTIAL COPY DETECTED for {src!r} -> {dst!r} "
+                        f"AND cleanup of dst failed: {cleanup_err}. "
+                        f"Manual recovery: delete {dst!r} and relaunch."
+                    )
+                    had_recoverable_failure = True
+                    continue
+                _MIGRATION_LOG.append(
+                    f"partial copy detected {src!r} -> {dst!r}; "
+                    f"removed corrupted dst, will retry on next launch"
+                )
+                had_recoverable_failure = True
+                continue
+            os.remove(src)
             _MIGRATION_LOG.append(f"migrated {src!r} -> {dst!r}")
         except OSError as e:
             # Common failure: shared install in Program Files where _HERE is
@@ -547,6 +647,20 @@ def _migrate_legacy_data():
 # Fast User Switching works correctly. Global\ would block other users.
 _MUTEX_NAME = "Local\\DisplayOff_SingleInstance"
 _mutex_handle = None
+
+# v1.7.20: rename-dance child-ready handshake. The parent
+# `_execute_rename_dance()` CreateEventWs this name BEFORE spawning the
+# `--after-update` child, then `_run_rename_dance_flow._worker` waits on
+# it (5s timeout) before calling `os._exit(0)`. The child's `main()`
+# `--after-update` branch OpenEventWs the name as one of its first acts
+# and SetEvents to signal "Python interpreter is alive, I can take over
+# the tray slot now". Replaces v1.7.13's fixed `time.sleep(0.3)` which
+# was a guess at how long the child needed — too short on slow systems
+# (icon disappears, child loses mutex race), too long on fast ones
+# (laggy "Install now" UX). Manual-reset event, initial-state=False.
+# Falls back to the 0.3s sleep if CreateEventW returns NULL.
+_UPDATE_CHILD_READY_EVENT_NAME = "Local\\DisplayOff_UpdateChildReady"
+_update_child_ready_handle = None
 
 # ── Win32 constants ────────────────────────────────────────────────────────
 SC_MONITORPOWER = 0xF170
@@ -687,6 +801,32 @@ if sys.platform == "win32":
     IsUserAnAdmin.argtypes = []
     IsUserAnAdmin.restype = ctypes.wintypes.BOOL
 
+    # ── dwmapi (immersive dark titlebar) ──
+    # v1.7.20: hoisted from inside `_apply_dark_titlebar()` so the WinDLL
+    # load + argtypes/restype mutation happens ONCE at module load instead
+    # of every dialog open. Workspace convention: "All bindings live in
+    # the `if sys.platform == "win32":` block at the top of the file with
+    # explicit argtypes/restype" — `_apply_dark_titlebar` was an exception
+    # carried since v1.7.0 because dwmapi.dll is missing on pre-Win10 1607
+    # builds; wrap the load in try/OSError so the function gracefully
+    # no-ops on those (rather than crashing module import).
+    try:
+        _dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+    except OSError:
+        _dwmapi = None
+    if _dwmapi is not None:
+        try:
+            DwmSetWindowAttribute = _dwmapi.DwmSetWindowAttribute
+            DwmSetWindowAttribute.argtypes = [
+                ctypes.wintypes.HWND, ctypes.wintypes.DWORD,
+                ctypes.c_void_p, ctypes.wintypes.DWORD,
+            ]
+            DwmSetWindowAttribute.restype = ctypes.HRESULT
+        except AttributeError:
+            DwmSetWindowAttribute = None
+    else:
+        DwmSetWindowAttribute = None
+
     # ── Foreground-window elevation probing (UIPI miss-detection) ──
     # Used by the foreground-elevation watcher (v1.7.8+) to log when an
     # elevated window has focus and our global hotkey is being silently
@@ -790,6 +930,8 @@ else:
     _SetProcessDpiAwarenessContext = None
     _SetProcessDpiAwareness = None
     _SetProcessDPIAware = None
+    _dwmapi = None
+    DwmSetWindowAttribute = None
 
 # Win32 wait-result sentinels
 _WAIT_OBJECT_0 = 0x00000000
@@ -2022,8 +2164,14 @@ _UPDATE_RELAUNCH_PATH = os.path.join(_DATA_DIR, _UPDATE_RELAUNCH_FILENAME)
 # truncated transfer or, more dangerously, a 200-OK HTML error page (some
 # CDNs serve a "404" body with HTTP 200 — without a size floor, that HTML
 # would land on disk renamed as the .exe). The real Nuitka onefile build is
-# ~15-25 MB; 1 MB is a generous floor while still catching the failure mode.
-_UPDATE_MIN_EXE_SIZE = 1_000_000
+# ~55 MB (with `--onefile-no-compression` workaround for the Nuitka 4.1.1
+# + py3.14 zstd packing bug). v1.7.20: raised from 1 MB to 40 MB to also
+# catch mis-shipped stub builds (e.g., `--onefile` with a stripped data-
+# files set producing a 5-10 MB bootstrap-only binary that wouldn't actually
+# run). 40 MB is below the ~55 MB real size with margin for a future smaller
+# build (e.g., zstd-fix unlocking compression — would shrink the .exe to
+# ~20 MB; loosen this floor at that point).
+_UPDATE_MIN_EXE_SIZE = 40_000_000
 
 # Cache the last successful /releases/latest response to avoid burning
 # GitHub's 60-req/hr unauthenticated rate limit on repeated manual clicks.
@@ -2242,9 +2390,20 @@ def _download_url_allowed(url):
         asset CDN — kept for any older release whose asset URLs were
         baked before the migration. Defensive — both may coexist for
         some time.)
+      - host `objects-origin.githubusercontent.com` for any path
+        (v1.7.20 forward-compat defense — Microsoft's storage layer
+        occasionally serves the origin host directly in long redirect
+        chains. If GitHub flips us at it again the way they did when
+        the release-assets.* CDN landed, the dance keeps working.)
 
     Case-insensitive on scheme + netloc (RFC 3986 §3.1/3.2.2 — both are
-    case-insensitive); path is exact-prefix per HTTP semantics.
+    case-insensitive); path is exact-prefix per HTTP semantics. v1.7.20
+    also normalizes the path via `os.path.normpath` and rejects any
+    URL whose normalized path starts with `/..` or contains `/../` —
+    SHA256 is still the integrity boundary, but rejecting malformed
+    traversal up front keeps the allowlist's prefix check honest (a
+    `https://github.com/itsnateai/displayoff/../other-repo/...` URL
+    would otherwise pass the github.com branch's startswith check).
 
     v1.7.16 hotfix: added `release-assets.githubusercontent.com` after
     the v1.7.14 → v1.7.15 in-the-wild rename-dance attempt failed with
@@ -2266,12 +2425,48 @@ def _download_url_allowed(url):
         return False
     if parts.scheme.lower() != "https":
         return False
+    # v1.7.20 traversal rejection (two-layer, per verifier-round convergent
+    # finding from T1-Sonnet + T1-Opus + T3-Opus):
+    #
+    #   Layer 1: reject any RAW path containing a literal `..` segment.
+    #            `os.path.normpath` COLLAPSES `..` segments, so a `/../` check
+    #            on the normalized path is dead code — by the time normpath
+    #            runs, the traversal has already been canonicalized away.
+    #            The raw-path check on the un-normalized `parts.path` catches
+    #            the attack pattern before it gets collapsed.
+    #   Layer 2: do the `github.com` prefix check against the NORMALIZED
+    #            path, not the raw path. The raw check `parts.path.startswith
+    #            ("/itsnateai/displayoff/")` is satisfiable via
+    #            `/itsnateai/displayoff/../other-repo/...` (literal prefix
+    #            present), but the normalized form is `/itsnateai/other-repo/`
+    #            and correctly fails the prefix check.
+    #
+    # SHA256 verification is still the integrity boundary; this defense is
+    # belt-and-suspenders so the host-allowlist's documented promise actually
+    # holds. Layer 1 also rejects encoded variants like `.\.\` and `\.\.`
+    # since they normalize to the same canonical form.
+    raw_segments = parts.path.replace("\\", "/").split("/")
+    if ".." in raw_segments:
+        return False
+    normalized_path = os.path.normpath(parts.path).replace("\\", "/")
+    if normalized_path.startswith("/..") or "/../" in normalized_path:
+        return False
     netloc_low = parts.netloc.lower()
     if netloc_low == "github.com":
-        return parts.path.startswith("/itsnateai/displayoff/")
+        # Trailing-slash tolerance: `os.path.normpath` strips the trailing
+        # `/`, so a legitimate URL ending exactly at the repo root would
+        # over-reject. Padding `normalized_path` with `/` before the check
+        # keeps `/itsnateai/displayoff` (root, no slash) matching, while
+        # rejecting `/itsnateai/displayoffother/...` (no separator between
+        # `displayoff` and `other` after the pad — `(orig + "/")` is
+        # `/itsnateai/displayoffother/.../` which doesn't startswith the
+        # prefix-with-slash).
+        return (normalized_path + "/").startswith("/itsnateai/displayoff/")
     if netloc_low == "release-assets.githubusercontent.com":
         return True
     if netloc_low == "objects.githubusercontent.com":
+        return True
+    if netloc_low == "objects-origin.githubusercontent.com":
         return True
     return False
 
@@ -2681,6 +2876,54 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
         # log entry. Keep going.
         log.warning("Could not write update-relaunch state: %s", e)
 
+    # v1.7.20: create the child-ready handshake event BEFORE spawning the
+    # child. Parent will WaitForSingleObject on this handle (in the caller,
+    # `_run_rename_dance_flow._worker`) so the parent's `os._exit(0)` waits
+    # for the child's signal — replaces the fixed 0.3s sleep that lost the
+    # mutex race on slow systems. Failure to create the event is logged
+    # but non-fatal: the caller falls back to the 0.3s sleep.
+    global _update_child_ready_handle
+    if sys.platform == "win32" and CreateEventW is not None:
+        # v1.7.20 verifier T3-Sonnet H1: ABA defense. If a previous update
+        # attempt in this session left `_update_child_ready_handle` non-None
+        # (e.g., the caller's wait branch ran and CloseHandle'd it but the
+        # global slot wasn't cleared — see the `os._exit(0)` chain in
+        # `_run_rename_dance_flow._worker`), we'd silently leak that prior
+        # handle when CreateEventW assigns a new one. Closing first is
+        # idempotent and safe: kernel handles can be CloseHandle'd more
+        # than once across the same process only if the handle hasn't been
+        # already-closed; we guard with try/except for the already-closed
+        # case (CloseHandle returns FALSE + GetLastError ERROR_INVALID_HANDLE
+        # — harmless and won't raise here since CloseHandle's restype is
+        # BOOL not HRESULT). The "handle still valid" case is the leak we
+        # actually want to prevent.
+        if _update_child_ready_handle:
+            try:
+                CloseHandle(_update_child_ready_handle)
+            except Exception:
+                pass
+            _update_child_ready_handle = None
+        try:
+            # Manual-reset (so the caller's wait + cleanup can read the
+            # signaled state without auto-resetting it mid-read), initial
+            # state = False (we haven't been signaled yet).
+            _update_child_ready_handle = CreateEventW(
+                None, True, False, _UPDATE_CHILD_READY_EVENT_NAME
+            )
+            if not _update_child_ready_handle:
+                log.warning(
+                    "Could not create update-child-ready event (err=%d); "
+                    "falling back to fixed 0.3s sleep before parent exit.",
+                    ctypes.get_last_error(),
+                )
+                _update_child_ready_handle = None
+        except OSError as e:
+            log.warning(
+                "CreateEventW for update-child-ready raised (%s); "
+                "falling back to fixed 0.3s sleep before parent exit.", e
+            )
+            _update_child_ready_handle = None
+
     # Step 8: spawn child --after-update detached, then return so the
     # caller exits (step 9 — child cleanup — runs in the new process).
     log.info("Update dance: spawning %s --after-update", current)
@@ -2696,6 +2939,16 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
             cwd=_INSTALL_DIR,
         )
     except OSError as e:
+        # Release the handshake event if Popen failed — the caller won't
+        # wait on it (we return "spawn_failed" so the relaunch branch
+        # isn't taken), and leaving a kernel handle dangling for the
+        # lifetime of the process is sloppy.
+        if _update_child_ready_handle:
+            try:
+                CloseHandle(_update_child_ready_handle)
+            except Exception:
+                pass
+            _update_child_ready_handle = None
         return "spawn_failed", (
             f"new .exe written successfully but spawn failed: {e}. "
             "Restart Display Off manually."
@@ -2728,8 +2981,10 @@ def _apply_dark_titlebar(root):
 
     `root.winfo_id()` returns the HWND of Tk's internal frame, not the
     top-level window — we need the parent. No-op on non-Windows or older
-    Win10/11 builds where the attribute isn't supported."""
-    if sys.platform != "win32":
+    Win10/11 builds where dwmapi.dll or `DwmSetWindowAttribute` is missing
+    (v1.7.20: the binding lives at module-level — `DwmSetWindowAttribute`
+    is `None` on those builds and the early return catches it cleanly)."""
+    if sys.platform != "win32" or DwmSetWindowAttribute is None:
         return
     try:
         # update() forces window creation if it hasn't fully realized yet —
@@ -2742,20 +2997,6 @@ def _apply_dark_titlebar(root):
         # HWNDs above 2GB on 64-bit. Bound name per workspace constraint:
         # "Never call ctypes.windll.* directly outside the bindings block".
         hwnd = GetParent(hwnd_inner) or hwnd_inner
-        # Bind DwmSetWindowAttribute with explicit argtypes/restype rather
-        # than calling `ctypes.windll.dwmapi.DwmSetWindowAttribute(...)`
-        # directly — HWND is pointer-sized on x64 and default-c_int argtype
-        # silently truncates handles above 2 GB. HRESULT default-c_int
-        # restype is actually correct (HRESULT is 32-bit signed), but
-        # binding it explicitly matches the workspace constraint: never
-        # call `ctypes.windll.*` directly outside a bound-name pattern.
-        _dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-        DwmSetWindowAttribute = _dwmapi.DwmSetWindowAttribute
-        DwmSetWindowAttribute.argtypes = [
-            ctypes.wintypes.HWND, ctypes.wintypes.DWORD,
-            ctypes.c_void_p, ctypes.wintypes.DWORD,
-        ]
-        DwmSetWindowAttribute.restype = ctypes.HRESULT
         # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 on Win10 2004+ / Win11.
         # Earlier Win10 builds (1903–1909) used 19 — try 20 first, fall back
         # to 19 only if 20 returns nonzero (failure).
@@ -2894,6 +3135,13 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
         px = (dlg.winfo_screenwidth() - w) // 2
         py = (dlg.winfo_screenheight() - h) // 2
     dlg.geometry(f"{w}x{h}+{px}+{py}")
+    # v1.7.20: sticky minimum size. Tk may re-solve geometry on font-cache
+    # refresh, DPI change, or grab-set side effects — without minsize, the
+    # body Label's wraplength becomes the floor and the button row clips
+    # again (same failure mode v1.7.16 fixed once at create-time, but the
+    # one-shot fix doesn't survive a re-solve). minsize is the durable
+    # form of the same constraint.
+    dlg.minsize(w, h)
 
     dlg.attributes("-alpha", 0)
     dlg.deiconify()
@@ -3800,6 +4048,11 @@ def _run_rename_dance_flow(parent_root, assets, latest):
             log.exception("Failed to marshal update error: %s", e)
 
     def _worker():
+        # v1.7.20: `_update_child_ready_handle` is mutated below (zeroed
+        # after CloseHandle on the wait path — see N1 verifier finding).
+        # Without `global` the assignment would create a local var that
+        # shadows the module-level reads above, defeating the cleanup.
+        global _update_child_ready_handle
         manifest_url = assets.get(_UPDATE_MANIFEST_NAME)
         exe_url = assets.get(_UPDATE_EXE_NAME)
         log.info("Update dance starting: latest=%s exe_url=%s manifest_url=%s",
@@ -3836,11 +4089,54 @@ def _run_rename_dance_flow(parent_root, assets, latest):
                 # Python docs, but be defensive about a corrupted logging
                 # state mid-dance never blocking the relaunch.
                 pass
-            # Brief settle so the OS has a chance to start the child process
-            # before the current one releases its tray icon. Without this,
-            # the tray briefly shows no icon between exit and child-startup.
-            # 300ms is short enough to feel instant.
-            time.sleep(0.3)
+            # v1.7.20: wait for the child to signal "I'm alive" via the
+            # named event the parent created in `_execute_rename_dance`.
+            # Previously we slept a fixed 0.3s — too short on slow systems
+            # (the child's Python interpreter is still bootstrapping, parent
+            # exits, child loses the mutex race and exits silently → "no
+            # tray after update" with no log entry). 5s is a generous
+            # ceiling for the Nuitka bootstrap + interpreter init; if the
+            # child genuinely never starts we fall through anyway.
+            # Fallback to the legacy 0.3s sleep when CreateEventW failed
+            # (no handle was stashed) — at least we don't regress.
+            if _update_child_ready_handle is not None:
+                wait_result = WaitForSingleObject(
+                    _update_child_ready_handle, 5000
+                )
+                if wait_result == _WAIT_OBJECT_0:
+                    log.info("Update dance: child signaled ready in <5s; "
+                             "parent exiting now.")
+                elif wait_result == _WAIT_TIMEOUT:
+                    log.warning(
+                        "Update dance: child did not signal ready within "
+                        "5s — exiting anyway. The tray may briefly show no "
+                        "icon while the child completes startup; this "
+                        "should self-heal once the child registers."
+                    )
+                else:
+                    log.warning(
+                        "Update dance: WaitForSingleObject returned "
+                        "unexpected code 0x%X; exiting anyway.", wait_result
+                    )
+                try:
+                    CloseHandle(_update_child_ready_handle)
+                except Exception:
+                    pass
+                # v1.7.20 verifier T1-Sonnet N1: zero the global so a
+                # hypothetical second update attempt in this session (if
+                # os._exit didn't follow — defensive, current code does
+                # exit) starts with a clean slot. Symmetric with the
+                # spawn-failure cleanup path in `_execute_rename_dance`.
+                # In practice the `os._exit(0)` below makes this cosmetic,
+                # but consistency with the H1 pre-create guard means a
+                # future refactor (e.g., replacing os._exit with a clean
+                # tray shutdown) won't inherit a stale handle.
+                _update_child_ready_handle = None
+            else:
+                # Brief settle so the OS has a chance to start the child
+                # process before the current one releases its tray icon.
+                # 300ms is short enough to feel instant.
+                time.sleep(0.3)
             # os._exit skips Python's interpreter shutdown — necessary
             # because pystray's icon.run() owns the main thread and a clean
             # exit from a daemon thread isn't straightforward. The spawned
@@ -4481,7 +4777,15 @@ def main():
                 print(f"  {_line}")
         else:
             print("resolver log: (empty — likely running from .py source)")
-        return
+        # v1.7.20: exit non-zero when the resolver failed under freeze
+        # (the actual failure case the flag exists to diagnose). A health
+        # script polling for "is the install still able to update itself"
+        # now has a useful signal: exit-0 = healthy or .py source mode;
+        # exit-1 = frozen build with broken path resolution (manual
+        # install required). The flag itself ran cleanly either way —
+        # the non-zero exit is about the resolver outcome, not the
+        # diagnose flag's own success.
+        sys.exit(1 if _is_frozen() and not _EXE_PATH else 0)
 
     # File logging so pythonw.exe runs are debuggable. Without this, every
     # log.* call below goes to a NullHandler and we have zero visibility.
@@ -4603,6 +4907,42 @@ def main():
     # treat the post-update launch any differently than a normal tray
     # startup — tray-mode is the default, so falling through is correct.
     if "--after-update" in sys.argv:
+        # v1.7.20: signal the parent's child-ready handshake event as the
+        # very first act of --after-update — before reading state, before
+        # `_acquire_single_instance`. Signaling before mutex acquire is the
+        # design choice that avoids a parent-must-exit-first deadlock: the
+        # parent still holds the single-instance mutex when we get here,
+        # so we cannot acquire it until the parent's `os._exit(0)` releases
+        # it; the parent in turn won't os._exit until it sees our signal.
+        # Signaling early breaks the deadlock — parent observes the signal,
+        # exits (releasing mutex), then this process's later
+        # `_acquire_single_instance()` call succeeds. The 5-second wait the
+        # parent does is for "child's Python interpreter is alive and
+        # running" — that's what we're attesting to with the SetEvent here.
+        if sys.platform == "win32" and OpenEventW is not None:
+            try:
+                _child_event = OpenEventW(
+                    _EVENT_MODIFY_STATE, False,
+                    _UPDATE_CHILD_READY_EVENT_NAME
+                )
+                if _child_event:
+                    try:
+                        SetEvent(_child_event)
+                        log.info("After-update: signaled parent via "
+                                 "child-ready event.")
+                    finally:
+                        CloseHandle(_child_event)
+                else:
+                    # Parent never created the event (CreateEventW failed,
+                    # or this child was launched outside the dance flow).
+                    # Not fatal — parent will fall through its own 0.3s
+                    # fallback and exit.
+                    log.info("After-update: child-ready event not present "
+                             "(parent may be running an older build or "
+                             "the event creation failed). No-op.")
+            except OSError as e:
+                log.warning("After-update: child-ready signal raised %s; "
+                            "continuing anyway.", e)
         state = _read_and_clear_update_relaunch_state()
         if state is not None:
             persisted_version = state.get("version") or "?"
