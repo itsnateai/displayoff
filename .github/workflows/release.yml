@@ -1,0 +1,93 @@
+name: Release
+
+# Auto-build displayoff.exe + SHA256SUMS.txt on every annotated semver tag
+# push (v*.*.*) and attach them to the matching GitHub release. The release
+# itself must already exist (created via `gh release create` or the web UI)
+# at the time the tag pushes — softprops/action-gh-release tolerates this:
+# if the release exists, it uploads to it; if it doesn't, it creates one.
+#
+# Why the build runs in CI instead of locally:
+#   - Reproducibility — a clean windows-latest runner with no Nuitka cache
+#     bytes from prior local builds matches what an external auditor would
+#     reproduce.
+#   - SHA256 transparency — the manifest is computed from bytes the runner
+#     just built, never bytes that touched the maintainer's machine.
+#
+# Build cost: ~5-10 min on github-hosted windows-latest. timeout-minutes is
+# 30 to absorb Nuitka's first-time MinGW64 download path (worst-case ~7 min
+# extra on a cold cache).
+#
+# Action pins: all third-party actions pinned to a full commit SHA per the
+# workspace supply-chain baseline (`memory/reference_supply_chain_baseline_2026_05_15.md`).
+# Tag comments document the human-readable version the SHA resolved at the
+# time of pinning — bump the SHA, bump the comment.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Manual dispatch lets you build + smoke-test a tag without re-creating
+  # it. Useful when an artifact upload failed and the release exists but
+  # the assets are missing.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.7.15). Must already exist."
+        required: true
+        type: string
+
+permissions:
+  contents: write  # required for softprops/action-gh-release to upload assets
+
+jobs:
+  build-windows-exe:
+    name: Build displayoff.exe (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (push trigger)
+        if: github.event_name == 'push'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Checkout (manual-dispatch trigger)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          # Nuitka is a build-only dep; pinning to match what build-release.sh
+          # was validated against. Bump in lockstep with the .bat / .sh
+          # comments referencing the Nuitka + py3.14 zstd workaround.
+          python -m pip install nuitka==4.1.1
+
+      - name: Build displayoff.exe + SHA256SUMS.txt
+        shell: bash
+        run: ./build-release.sh
+
+      - name: Upload artifacts to the release
+        # Pinned to v2.6.2 — softprops/action-gh-release@v2 is the tag the
+        # user-facing docs reference, the SHA is the actual security
+        # boundary. Re-resolve via `gh api repos/softprops/action-gh-release/git/refs/tags/<tag>`
+        # before bumping.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          # On push: the ref is the tag GitHub already resolved.
+          # On workflow_dispatch: the inputs.tag value drives both checkout
+          # ref above AND the release we upload to.
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          # fail_on_unmatched_files=true so a silent build failure (Nuitka
+          # produced no .exe but exited 0) doesn't ship an asset-less release.
+          fail_on_unmatched_files: true
+          files: |
+            build/displayoff.exe
+            build/SHA256SUMS.txt

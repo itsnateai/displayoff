@@ -32,7 +32,7 @@ REM files alongside (no extraction step). We use --onefile so the install is
 REM a single file the rename-dance updater can swap atomically.
 
 setlocal
-set VERSION=1.7.14
+set VERSION=1.7.15
 set VERSION_FOUR=%VERSION%.0
 
 REM Embed the icon as a Windows resource (--windows-icon-from-ico) AND bundle
@@ -50,9 +50,17 @@ REM incompatibility ("Allocation error : not enough memory" in
 REM compression.zstd.ZstdError during onefile bootstrap packing — the
 REM compiled .dist directory is fine, but zstd's compress() can't accept
 REM the dist-file enumeration write under py3.14). Bypass costs ~30 MB of
-REM .exe size (55 MB vs ~20 MB compressed). Revisit once Nuitka 4.2+ ships
-REM with py3.14 fixes — drop the flag for smaller distribution-side .exe.
-REM Tracked: 2026-05-21 — see build-exe.sh for the matching bash recipe.
+REM .exe size (55 MB vs ~20 MB compressed).
+REM
+REM Version-check timeline (re-check before each release; drop the flag
+REM if a newer Nuitka has shipped the py3.14 zstd fix):
+REM   2026-05-21 (v1.7.13 / v1.7.14): Nuitka PyPI latest = 4.1.1 — bug still present, flag required.
+REM   2026-05-21 (v1.7.15):           re-checked `pip index versions nuitka` → 4.1.1 still latest. Flag required.
+REM
+REM Recipe to re-verify: `pip index versions nuitka | head -1` — if the
+REM top line shows >4.1.1, install it in a scratch venv, build with the
+REM flag dropped, and confirm onefile-pack completes. See build-release.sh
+REM for the matching bash recipe (kept in sync).
 
 python -m nuitka ^
     --onefile ^

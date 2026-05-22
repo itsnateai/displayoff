@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.14"
+__version__ = "1.7.15"
 
 log = logging.getLogger("displayoff")
 
@@ -258,6 +258,12 @@ _NATIVE_PROD_SLEEP_SECS = 5.0   # How long the native idle-blank path holds the 
                                 # when rapid double-trigger drops a second click.
 _NATIVE_PROD_SETTLE_SECS = 0.5  # Pause before writing the 1s timeout. Same idea as the legacy SC_MONITORPOWER
                                 # path: gives the user's mouse time to come to rest before we arm the trap.
+_TRAY_SETTLE_SECS = 1.0         # Pause before icon.notify() in tray-startup workers (first-run welcome
+                                # notification and frozen-first-launch promotion ping). Lets pystray's
+                                # NIM_ADD register the icon before we ask Explorer to render NIF_INFO; a
+                                # toast before NIM_ADD lands gets silently dropped. Extracted from the
+                                # two inline time.sleep(1.0) call sites so a future timing change stays
+                                # coupled (v1.7.15 — T3-Sonnet LOW from v1.7.14 verifier round).
 
 # ── Win32 bindings (Windows-only) ──────────────────────────────────────────
 # Every call site must use the bound names from this block — never raw
@@ -1653,7 +1659,7 @@ _UPDATE_MANIFEST_NAME = "SHA256SUMS.txt"
 _UPDATE_TMP_SUFFIX = ".tmp"
 _UPDATE_OLD_SUFFIX = ".old"
 
-# Relaunch-mode persistence: step 5 of the dance writes this file with the
+# Relaunch-mode persistence: step 7 of the dance writes this file with the
 # new-version string + the launch mode (currently always "tray", but the
 # scaffolding lets future one-shot CLI invocations skip the tray-restart
 # branch of --after-update). Lives in _DATA_DIR so it survives the .exe
@@ -1678,6 +1684,21 @@ _UPDATE_MIN_EXE_SIZE = 1_000_000
 _UPDATE_CHECK_CACHE_TTL = 6 * 3600  # 6 hours
 _update_check_cache = {"timestamp": 0.0, "result": None}
 _update_check_cache_lock = threading.Lock()
+
+# v1.7.15 (T2 C2 follow-up from v1.7.14 verifier round): in-memory dedupe for
+# the frozen-first-launch promotion ping. If %APPDATA% is read-only or AV
+# holds the config file consistently, save_config raises OSError and the
+# `_frozen_promoted_pinged` flag never persists to disk — so the next launch
+# re-fires the toast. v1.7.14 deferred this with a `log.warning(... "Harmless
+# beyond the extra toast.")` line and accepted cross-launch spam in the rare
+# RO-APPDATA case. This module-level boolean catches the SAME-session case:
+# nothing in the current process re-enters `_frozen_promote_ping` (it's a
+# one-shot startup worker), but defensive — if a future code path ever
+# re-invokes the worker (Explorer-restart handler, mid-session promote retry,
+# etc.) the bool prevents a second toast within one process invocation. The
+# acceptable degradation under RO-APPDATA is still "one toast per launch",
+# never "two toasts per launch".
+_PING_FIRED_THIS_PROCESS = False
 
 
 def _version_tuple(v):
@@ -1785,23 +1806,37 @@ def check_for_updates(timeout=5, force=False):
 # Replaces the v1.7.12 "open release page in browser" flow when running as
 # the frozen displayoff.exe. Mechanics from
 # `_.claude/_templates/checklists/code-change/add-self-update.md` (the C#
-# canonical) adapted for a Python freeze:
+# canonical) adapted for a Python freeze. Step numbering matches the v1.7.13
+# CHANGELOG entry verbatim so a maintainer cross-referencing the public
+# release notes lands on the right inline label here. v1.7.15 reconciliation
+# (T1 from v1.7.13 verifier round) — previously the outer comment used 1-7+8
+# while _execute_rename_dance's body labelled steps 1+2 through 6, neither
+# matching the CHANGELOG.
 #
-#   1. Download new <exe>.tmp into _INSTALL_DIR
-#   2. SHA256-verify against SHA256SUMS.txt manifest from the same release
-#   3. os.rename current displayoff.exe → displayoff.exe.old
-#   4. os.rename displayoff.exe.tmp → displayoff.exe
-#   5. Write _UPDATE_RELAUNCH_PATH with the new-version string
-#   6. Spawn displayoff.exe --after-update detached
-#   7. Exit current process (Windows releases its file lock on .exe.old)
+# Caller responsibility (the Settings "Install now" worker):
+#   1. Hit GitHub releases API for latest tag + assets list
+#      (check_for_updates) — already exists pre-dance
+#   2. Fetch SHA256SUMS.txt from same release + parse the displayoff.exe
+#      entry (_fetch_release_manifest_sha256)
 #
-# Step 8 (in the new process):
-#   - --after-update reads + deletes _UPDATE_RELAUNCH_PATH
-#   - Deletes <exe>.old (now that Windows has released the lock)
-#   - Logs the new version
+# _execute_rename_dance handles:
+#   3. Download new <exe>.tmp into _INSTALL_DIR (_download_to_path)
+#   4. SHA256-verify the .tmp against the manifest digest; on mismatch,
+#      delete .tmp and return "sha256_mismatch"
+#   5. os.rename current displayoff.exe → displayoff.exe.old (atomic NTFS)
+#   6. os.rename displayoff.exe.tmp → displayoff.exe (atomic; restore
+#      from .old on failure)
+#   7. Write _UPDATE_RELAUNCH_PATH with the new-version string
+#   8. Spawn displayoff.exe --after-update detached + caller os._exit(0)
+#      after a 300 ms settle so the child can claim the tray
+#
+# Step 9 (in the new --after-update process):
+#   - Reads + deletes _UPDATE_RELAUNCH_PATH
+#   - Deletes <exe>.old (Windows has released the lock by now)
+#   - Logs the version transition + parent PID
 #   - Continues to the normal tray-start path
 #
-# Recovery (called at the top of main()):
+# Recovery (called at the top of main(), independent of the dance):
 #   - Stale <exe>.tmp from an interrupted download → delete (untrusted bytes)
 #   - Stale <exe>.old from a crashed dance → delete (we're already on new)
 #   - Stale _UPDATE_RELAUNCH_PATH without --after-update → log + delete
@@ -2004,7 +2039,7 @@ def _download_to_path(url, dest_path, timeout=60):
 
 
 def _write_update_relaunch_state(new_version):
-    """Persist the relaunch state file. Called at step 5 of the dance, just
+    """Persist the relaunch state file. Called at step 7 of the dance, just
     before spawning the --after-update child. Writes JSON: `{version,
     timestamp, exe_path}`. The child reads + deletes it as the first thing
     --after-update does."""
@@ -2082,7 +2117,13 @@ def _recover_from_failed_update():
 
 
 def _execute_rename_dance(exe_url, exe_sha256, new_version):
-    """Execute the 5-step rename-dance. Returns (status, detail):
+    """Execute steps 3-8 of the rename-dance (steps 1-2 are the caller's
+    API + manifest fetch; step 9 is the --after-update child). Step
+    numbering matches the v1.7.13 CHANGELOG entry — see the outer
+    `── Rename-dance updater ──` comment block above for the full
+    9-step framing.
+
+    Returns (status, detail):
       - ("relaunched", None)           — caller MUST exit immediately
       - ("not_frozen", detail)         — running from .py source; N/A
       - ("download_failed", detail)    — network/404/redirect outside allowlist
@@ -2117,7 +2158,10 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
             except OSError as e:
                 return "rename_failed", f"cannot remove stale {path!r}: {e}"
 
-    # Step 1+2: download with SHA256 verify
+    # Steps 3+4: download new .exe to .tmp, then SHA256-verify against
+    # the manifest digest the caller already extracted. The two steps
+    # share a try-block because a failed verify also wants the .tmp
+    # cleaned up.
     log.info("Update dance: downloading %s -> %s", exe_url, tmp)
     ok, err = _download_to_path(exe_url, tmp)
     if not ok:
@@ -2146,7 +2190,7 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
             f"corrupted download or tampered release. .tmp deleted."
         )
 
-    # Step 3: rename current → .old. The os.rename across the same NTFS
+    # Step 5: rename current → .old. The os.rename across the same NTFS
     # directory is atomic and (unlike os.replace) refuses to overwrite the
     # destination if it exists — we pre-cleaned .old above, so a name
     # collision here means a parallel update attempt is in flight (extremely
@@ -2165,7 +2209,7 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
             "Try closing other Display Off instances and retry."
         )
 
-    # Step 4: move .tmp → current. If this fails, restore .old → current
+    # Step 6: move .tmp → current. If this fails, restore .old → current
     # so the user isn't left with a missing .exe.
     log.info("Update dance: renaming %s -> %s", tmp, current)
     try:
@@ -2185,7 +2229,7 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
             pass
         return "rename_failed", f"cannot move .tmp into place: {e}. Restored from .old."
 
-    # Step 5: write relaunch state so the child knows what to do
+    # Step 7: write relaunch state so the child knows what to do
     try:
         _write_update_relaunch_state(new_version)
     except OSError as e:
@@ -2193,8 +2237,8 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
         # log entry. Keep going.
         log.warning("Could not write update-relaunch state: %s", e)
 
-    # Step 6: spawn child --after-update detached, then return so the caller
-    # exits.
+    # Step 8: spawn child --after-update detached, then return so the
+    # caller exits (step 9 — child cleanup — runs in the new process).
     log.info("Update dance: spawning %s --after-update", current)
     try:
         DETACHED_PROCESS = 0x00000008
@@ -3538,7 +3582,34 @@ def run_tray():
     # missing or fails to import, log it and proceed with no promotion (the
     # icon will land in Win11's overflow flyout instead of the main tray).
     try:
-        from tray_promoter import capture_baseline, promote_in_background
+        from tray_promoter import capture_baseline, promote_in_background, sweep_stale_entries
+        # v1.7.15: clean NotifyIconSettings cruft from prior displayoff.exe
+        # builds at different install paths (the rename-dance keeps the same
+        # path across upgrades, but a user who moved the .exe between
+        # releases — e.g. relocated from a personal folder to Program Files
+        # — leaves a stale subkey behind for every prior location). Only
+        # invoked under freeze: under .py source the basename is
+        # pythonw.exe / python.exe and sweep_stale_entries explicitly
+        # no-ops on those names (too broad to scope safely — would match
+        # every other Python tray app the user has). Must run BEFORE
+        # capture_baseline so removed subkeys aren't in the baseline
+        # snapshot.
+        if _is_frozen() and _EXE_PATH:
+            # Defense-in-depth: sweep_stale_entries wraps all registry I/O
+            # in try/except OSError internally and returns 0 on failure,
+            # so this catch should never trigger in practice. The narrow
+            # outer guard here exists so that a future tray_promoter
+            # refactor (e.g. introducing a non-OSError exception type, a
+            # Nuitka-frozen import quirk, or a registry-schema change)
+            # can never crash the tray-startup path — tray_promoter is UX
+            # polish, never a crash surface (line ~3580 comment above).
+            try:
+                sweep_stale_entries(our_exe_name="displayoff.exe",
+                                    current_exe_path=_EXE_PATH)
+            except Exception as e:
+                log.warning("tray_promoter.sweep_stale_entries raised "
+                            "unexpectedly (%s) — skipping sweep, continuing "
+                            "with capture_baseline.", e)
         tray_baseline = capture_baseline()
         _promote_tray = True
     except ImportError as e:
@@ -3784,7 +3855,7 @@ def run_tray():
         welcome_hotkey = hotkey_name[0]
 
         def _welcome():
-            time.sleep(1.0)  # let the tray icon attach before notifying
+            time.sleep(_TRAY_SETTLE_SECS)  # let the tray icon attach before notifying
             try:
                 icon.notify(
                     f"Press {welcome_hotkey} to blank all displays.",
@@ -3838,12 +3909,23 @@ def run_tray():
         ping_hotkey = hotkey_name[0]
 
         def _frozen_promote_ping():
-            # 1s settle matches the first-run welcome notification — gives
-            # pystray's NIM_ADD time to register before we fire NIF_INFO.
-            # If notify fires before NIM_ADD lands, pystray silently no-
-            # ops; we catch the exception below and DON'T set the flag,
-            # so next launch retries.
-            time.sleep(1.0)
+            # v1.7.15: in-memory dedupe across any future re-invocation
+            # within this same process. The persisted `_frozen_promoted_pinged`
+            # config flag is the cross-launch gate; this module-level bool
+            # is the within-process gate that holds even when the disk
+            # write fails (RO-APPDATA, AV lock, locked-down policy).
+            global _PING_FIRED_THIS_PROCESS
+            if _PING_FIRED_THIS_PROCESS:
+                log.info("Frozen-first-launch promotion ping already fired this "
+                         "process — skipping (in-memory dedupe).")
+                return
+
+            # _TRAY_SETTLE_SECS settle matches the first-run welcome
+            # notification — gives pystray's NIM_ADD time to register
+            # before we fire NIF_INFO. If notify fires before NIM_ADD
+            # lands, pystray silently no-ops; we catch the exception
+            # below and DON'T set the flag, so next launch retries.
+            time.sleep(_TRAY_SETTLE_SECS)
             notify_ok = False
             try:
                 icon.notify(
@@ -3866,6 +3948,13 @@ def run_tray():
             if not notify_ok:
                 return
 
+            # Flag the in-memory dedupe BEFORE the disk write attempt: even
+            # if save_config raises (RO-APPDATA), within-process re-entry
+            # must still be blocked. The toast already fired; firing a
+            # second one in the same process is the failure mode the bool
+            # is preventing.
+            _PING_FIRED_THIS_PROCESS = True
+
             # Read-modify-write off the on-disk config to defeat the race
             # against a concurrent Settings → Save: the user's just-edited
             # hotkey/idle/lock values could otherwise be silently
@@ -3881,7 +3970,9 @@ def run_tray():
             except OSError as e:
                 log.warning("Could not persist _frozen_promoted_pinged flag: "
                             "%s — notification may fire again next launch. "
-                            "Harmless beyond the extra toast.", e)
+                            "In-process dedupe still prevents same-session "
+                            "re-fire; cross-launch behavior under RO-APPDATA "
+                            "is acceptable (rare edge case).", e)
         threading.Thread(target=_frozen_promote_ping, daemon=True).start()
 
     icon.run()

@@ -105,14 +105,20 @@ def sweep_stale_entries(our_exe_name, current_exe_path):
     Settings" cruft that .NET single-file publish + WinGet versioned
     install dirs leave behind across releases.
 
-    **NOT INVOKED FROM DISPLAYOFF.** Displayoff is pystray-backed (exe
-    basename = pythonw.exe / python.exe), and this function explicitly
-    no-ops for those basenames because "pythonw.exe" is too broad to
-    scope safely — would match every other Python tray app the user has.
-    The function ships in this module as a **template-portable helper**
-    for future Python tray projects that bundle to a stable named .exe
-    (e.g., via PyInstaller onefile with --name); those projects should
-    invoke `sweep_stale_entries(our_exe_name="myapp.exe", current_exe_path=sys.executable)`
+    **Invocation:** displayoff v1.7.15+ invokes this from `displayoff.py`
+    under freeze mode only — the call is guarded `if _is_frozen() and
+    _EXE_PATH:` so the .py source path skips. Under freeze the exe
+    basename is the stable `displayoff.exe` (set via Nuitka's
+    `--output-filename`), which scopes safely. Under .py source the
+    basename is `pythonw.exe` / `python.exe`, both of which this function
+    explicitly no-ops on (lines below) because they are too broad to
+    scope safely — `pythonw.exe` would match every other Python tray app
+    the user has.
+
+    The function also ships as a **template-portable helper** for future
+    Python tray projects that bundle to a stable named .exe (e.g., via
+    PyInstaller onefile with `--name`); those projects should invoke
+    `sweep_stale_entries(our_exe_name="myapp.exe", current_exe_path=sys.executable)`
     once at startup before `capture_baseline()`.
 
     Conservative — only touches entries that:

@@ -24,7 +24,9 @@ echo "Building v${VERSION}..."
 rm -f build/displayoff.exe build/SHA256SUMS.txt
 
 # Same recipe as build-exe.bat. See that file for the --onefile-no-compression
-# rationale (Nuitka 4.1.1 + py3.14 zstd OOM workaround).
+# rationale (Nuitka 4.1.1 + py3.14 zstd OOM workaround) and the version-check
+# timeline. Re-verify before each release: `pip index versions nuitka | head -1`.
+# Last checked: 2026-05-21 (v1.7.15) — Nuitka latest still 4.1.1, flag required.
 python -m nuitka \
     --onefile \
     --onefile-no-compression \
@@ -69,8 +71,22 @@ echo
 echo "=== Smoke test ==="
 build/displayoff.exe --version
 echo
-echo "=== Next steps (run these manually when ready to ship) ==="
-echo "  1. git tag v${VERSION}"
-echo "  2. git push origin v${VERSION}"
-echo "  3. gh release create v${VERSION} --title 'v${VERSION}' --notes-file release-notes.md build/displayoff.exe build/SHA256SUMS.txt"
-echo "  (Extract the CHANGELOG entry for v${VERSION} into release-notes.md first.)"
+echo "=== Next steps (CI-driven release workflow, v1.7.15+) ==="
+echo "  This script ran a LOCAL build for verification. As of v1.7.15 the"
+echo "  canonical release artifacts are built by .github/workflows/release.yml"
+echo "  on the GitHub runner — do NOT 'gh release upload' the locally-built"
+echo "  .exe (it would replace the CI-built one and break SHA256 transparency)."
+echo
+echo "  Correct release flow:"
+echo "    1. Edit CHANGELOG.md → release-notes.md (extract this version's entry)"
+echo "    2. gh release create v${VERSION} --title 'v${VERSION}' --notes-file release-notes.md --draft"
+echo "       (NO asset files — CI uploads them when the tag pushes)"
+echo "    3. git tag v${VERSION} && git push origin v${VERSION}"
+echo "       (release.yml fires on the tag push, builds the .exe + SHA256SUMS"
+echo "       in CI, uploads them to the draft release, ~5-10 min)"
+echo "    4. gh release edit v${VERSION} --draft=false"
+echo "       (promote to public once CI uploaded the assets — verify the"
+echo "       SHA256 in the release matches what this local build produced)"
+echo
+echo "  This local build's SHA256 (for cross-checking the CI build):"
+echo "    ${SHA}"
