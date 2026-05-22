@@ -1,33 +1,29 @@
-Post-tag hardening of the v1.7.17 path resolver fallback paths, plus the inaugural in-the-wild rename-dance exercise. v1.7.17's binary works empirically in the real Nuitka onefile case (Strategy 1 — `NUITKA_ONEFILE_PARENT` + `QueryFullProcessImageNameW` — always wins, verified in `displayoff.log`). The v1.7.17 8-agent verifier round surfaced edge cases in the Strategy 2/3 fallback paths that don't fire under normal use but were soft against synthetic argv[0], unset `%TEMP%`, junctions, and `python -O`. v1.7.18 closes those gaps.
+Path-resolver hotfix + diagnostic-observability fix. v1.7.18's inaugural in-the-wild rename-dance failed empirically: a v1.7.17 → v1.7.18 update attempt resolved the running .exe path to the temp-extracted Nuitka bootstrap python.exe (Strategy 3 — the broken last-resort) and tried to rename that instead of the actual on-disk `displayoff.exe`. Worse, the resolver's diagnostic candidates were silently swallowed because v1.7.18 only logged them when data-dir migration ran, and the affected process had already migrated.
 
-If you're on v1.7.17, **this is the first release that the in-app "Install now" updater can pull**. Click Settings → Check for updates → Install now and v1.7.17 should download, SHA-verify, atomically rename your existing `displayoff.exe` to `displayoff.exe.old`, write v1.7.18 in its place, and relaunch — all in about 5 seconds. This is the inaugural end-to-end exercise of the rename-dance.
+v1.7.19 fixes both: a new Strategy 0 (Nuitka's `__compiled__.original_argv0`, which was correct in every resolver-candidates line we have on file) layered before Strategy 1, AND `path-resolver:` log lines that fire on EVERY startup, AND a `--diagnose-paths` CLI flag for ad-hoc triage.
 
 ## What's fixed
 
-- **`_path_under_temp(path)` helper** — multi-env-var TEMP detection (`TEMP`, `TMP`, `LOCALAPPDATA\Temp`) with `realpath` + `normcase` resolution, robust against 8.3 short-names and junctions.
-- **Strategy 1** now rejects results that point inside any TEMP-like dir, fail `os.path.isfile`, or don't end in `.exe` — defense if a future Nuitka spawns the bootstrap via a chain where the parent is itself a temp-extracted `python.exe`.
-- **Strategy 2** adds `os.path.isfile(argv0)` + the multi-TEMP-env check so a synthetic `sys.argv[0]` (relative path, deleted .exe, etc.) no longer silently propagates to the rename-dance and autostart `.lnk`.
-- **Strategy 3** returns `None` (was `sys.executable`) — downstream consumers guard `if _EXE_PATH and ...` already, so `None` makes them skip cleanly instead of mis-targeting. "WARNING log + wrong path" was worse than "no path" because users don't read logs but DO notice features silently failing.
-- **`_autostart_target_pythonw`**: `assert` → `raise`. v1.7.17 added the assert as a defense against source-only invariants leaking under freeze, but `assert` compiles to a no-op under `python -O`, which would silently revive the v1.7.13 `.lnk`-points-at-temp-path bug. v1.7.18 promotes to an unconditional `RuntimeError`.
-- **`release-notes.md` private-path scrub** — v1.7.17's notes referenced a personal install path; v1.7.18 (and the live v1.7.17 release page, retroactively edited) no longer mention it.
+- **New Strategy 0**: `__compiled__.original_argv0` — Nuitka-authoritative invocation path, available even after the bootstrap parent exits (one plausible Strategy 1 failure mode). Same hardening triple as Strategies 1 & 2: `.exe` extension, `os.path.isfile`, not under any TEMP-like dir.
+- **Path-resolver diagnostics now log on every startup**, with prefix `path-resolver:`. v1.7.18 buffered them through `_MIGRATION_LOG` which only emitted with prefix `data-dir migration:` and only when migration ran. Result: the v1.7.18 dance failure was un-diagnosable from the log alone.
+- **`displayoff.exe --diagnose-paths`** — new CLI flag. Prints version, frozen state, the winning `_EXE_PATH`, and every resolver candidate / strategy decision to stdout. Runs before `%APPDATA%` setup so the flag works even when the data dir is broken. Anyone reporting a future dance failure can paste the output into a GitHub issue without needing to attach the log.
+- **Strategy 3 WARNING** now points users at `--diagnose-paths` instead of `displayoff.log`.
 
 ## Upgrade path
 
-- **v1.7.17 users** — click Settings → Check for updates → Install now. The dance should run end-to-end. If it doesn't, capture `displayoff.log` and report the issue.
-- **v1.7.13 / v1.7.14 / v1.7.15 / v1.7.16 users** — manual install is still required (those clients have the path-resolution bug v1.7.17 fixed, so they can't reach this release via the in-app updater). Same steps as the v1.7.17 release notes documented:
-  1. Right-click the Display Off tray icon → **Quit**.
-  2. Download `displayoff.exe` from this release.
-  3. Replace your existing `displayoff.exe` with the new file (same filename, same location).
-  4. Launch v1.7.18. Your config + autostart `.lnk` + idle settings carry over unchanged.
-- **`.py` source-mode users** — no action needed; the resolver returns `None` under source and the rename-dance is skipped entirely (you get updates by `git pull`).
+- **v1.7.18 users** — click Settings → Check for updates → Install now. On a clean v1.7.18 install (Strategy 1 working at startup), the dance should run end-to-end. If it fails, the post-recovery v1.7.19 will print the full resolver state via `displayoff.exe --diagnose-paths`.
+- **v1.7.17 users** — manual install is still required. v1.7.17's resolver does not have the v1.7.18 hardening AND does not have the v1.7.19 Strategy 0, so the in-app updater can still fall to broken Strategy 3 against this release. Quit the tray, download `displayoff.exe` below, replace the binary in place, and relaunch.
+- **v1.7.13 / v1.7.14 / v1.7.15 / v1.7.16 users** — manual install same as above. These releases have the structural v1.7.13 path-resolution bug.
+- **.py source-mode users** — no action; resolver returns `None` under source, rename-dance is skipped.
 
-## What v1.7.18 doesn't yet fix (deferred to v1.7.19+)
+## What v1.7.19 doesn't yet fix (deferred to v1.7.20+)
 
-- `_UPDATE_MIN_EXE_SIZE` floor (currently 1 MB; real .exe is ~52 MB).
+- 300 ms parent-`os._exit` vs child-mutex race in the dance child relaunch.
+- `_UPDATE_MIN_EXE_SIZE` tighter floor.
 - `release.yml` permissions tightening + post-upload redirect-host smoke test.
-- 300 ms parent-`os._exit` vs child-mutex race in the dance child relaunch (sub-second window; if hit, symptom is "no tray after update" with no log entry).
-- `_themed_dialog` sticky `minsize()` floor (currently one-shot `geometry()`).
+- `_themed_dialog` sticky `minsize()` floor.
+- `_download_url_allowed` URL parser hardening, `_migrate_legacy_data` cross-device atomicity, `_DwmSetWindowAttribute` rebinding, tray_promoter docstring.
 
-None of these block normal operation; they're hardening items the verifier round flagged that didn't make this release's cut.
+These are deliberately held back so v1.7.19's changelog is narrowly about "the dance failed; here's how to make it observable and safer". Polish bundles into v1.7.20.
 
 Full changelog: see `CHANGELOG.md`.

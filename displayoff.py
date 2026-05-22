@@ -18,6 +18,7 @@ Usage:
     python displayoff.py --quit-other # Signal a running tray instance to quit (no-op if none)
     python displayoff.py --reset-config   # Delete the config file
     python displayoff.py --version    # Print version
+    python displayoff.py --diagnose-paths # Print path-resolver candidates + winning strategy (v1.7.19+)
     pythonw displayoff.py             # Start in tray, no console window
 """
 import ctypes
@@ -35,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.18"
+__version__ = "1.7.19"
 
 log = logging.getLogger("displayoff")
 
@@ -95,11 +96,24 @@ def _is_frozen():
     return getattr(sys, "frozen", False) or "__compiled__" in globals()
 
 
-# Buffer for migration + diagnostic messages emitted before basicConfig
-# wires up the file handler. main() flushes this list once the logger is
-# live. Module-level so the path resolver, ensure_data_dir, and
-# _migrate_legacy_data can all append.
+# Buffer for data-dir migration messages emitted before basicConfig wires
+# up the file handler. main() flushes this list once the logger is live,
+# with prefix `data-dir migration:`. Module-level so `_ensure_data_dir`
+# and `_migrate_legacy_data` can both append. v1.7.19 split: the path
+# resolver no longer writes here — see `_RESOLVER_LOG` below, which has
+# its own flush prefix and fires on EVERY startup (not gated on whether
+# migration actually ran).
 _MIGRATION_LOG: list[str] = []
+
+# Buffer for path-resolver candidates + winning-strategy lines, kept
+# separate from _MIGRATION_LOG so the log prefix reflects what was actually
+# logged (`path-resolver:` not `data-dir migration:`). Flushed on EVERY
+# startup, not gated on whether migration ran — v1.7.18 leaked diagnostic
+# data on pid 18996 because its data-dir was already migrated, so the
+# resolver outcome stayed in-memory only. v1.7.19 separates the concerns:
+# migration log = one-shot upgrade events; resolver log = every-launch
+# observability into which strategy won and why.
+_RESOLVER_LOG: list[str] = []
 
 
 def _path_under_temp(path):
@@ -141,19 +155,36 @@ def _path_under_temp(path):
 def _resolve_on_disk_exe_path():
     """Resolve the on-disk displayoff.exe path under freeze. None under .py.
 
-    v1.7.17 fix: see freeze-mode comment block above for why sys.executable
-    is wrong here. Layered fallback chain:
+    See freeze-mode comment block above for why sys.executable is wrong here.
+    Layered fallback chain (v1.7.19):
 
+      0. `__compiled__.original_argv0` — Nuitka-authoritative origin path
+         recorded by the compiled module. Available even after the bootstrap
+         parent exits, which was v1.7.17/v1.7.18 Strategy 1's failure mode
+         under certain launch chains (pid 18996 incident, 2026-05-22). No
+         cross-process query required.
       1. `NUITKA_ONEFILE_PARENT` + `QueryFullProcessImageNameW(parent_pid)`
          — bootstrap IS the on-disk .exe, kernel-tracked image path = truth.
+         Requires the bootstrap parent to still be alive.
       2. `os.path.abspath(sys.argv[0])` if it ends in .exe and isn't under
          %TEMP%. Per Nuitka docs sys.argv[0] is the original onefile binary.
-      3. Final fallback: `sys.executable` with a WARNING log. We get here
-         only if both primary strategies failed — Nuitka likely changed its
-         environment contract; v1.7.18 patch territory.
+      3. Return None (v1.7.18+ behavior — fail loud instead of returning the
+         broken sys.executable). Downstream consumers (rename-dance,
+         autostart .lnk, tray_promoter) all guard `_EXE_PATH and ...` and
+         skip when None — user can manually install instead of the dance
+         corrupting their TEMP dir.
 
-    Diagnostic logging captures every candidate so future verifier rounds
-    can read the log rather than re-derive."""
+    Strategies 0, 1, and 2 all gate on the same hardening triple: `.exe`
+    extension, `os.path.isfile`, not under any TEMP-like dir (see
+    `_path_under_temp`).
+
+    Diagnostic logging buffers every candidate and the winning-strategy
+    line into `_RESOLVER_LOG`. `main()` emits it with `path-resolver:`
+    prefix on EVERY startup, regardless of whether data-dir migration ran
+    — v1.7.18 left this gated on `_MIGRATION_LOG` which silently dropped
+    diagnostics on already-migrated processes (pid 18996 had zero resolver
+    output despite hitting Strategy 3). The `--diagnose-paths` CLI flag
+    prints the same data to stdout for ad-hoc triage."""
     if not _is_frozen():
         return None
 
@@ -168,11 +199,56 @@ def _resolve_on_disk_exe_path():
             globals().get("__compiled__"), "containing_dir", None
         ),
     }
-    _MIGRATION_LOG.append(
-        "_resolve_on_disk_exe_path candidates: " + ", ".join(
+    _RESOLVER_LOG.append(
+        "candidates: " + ", ".join(
             f"{k}={v!r}" for k, v in candidates.items()
         )
     )
+
+    # Strategy 0: __compiled__.original_argv0 — Nuitka-authoritative origin
+    # path. Tried before Strategy 1 because it doesn't depend on a live
+    # parent process (Strategy 1's failure mode when the bootstrap exits or
+    # an exotic launch chain reroutes the parent). All every-pid logs to
+    # date show original_argv0 pointing at the correct on-disk .exe path,
+    # even when sys.executable was the TEMP bootstrap python.exe. Filtered
+    # through the same hardening triple as Strategies 1 and 2 so a
+    # malformed value (relative path, deleted .exe, TEMP path) can't
+    # silently mis-target the rename-dance.
+    #
+    # Trust-boundary note: `__compiled__.original_argv0` is the cmdline
+    # argv[0] Nuitka recorded at process launch. An attacker who can
+    # `CreateProcessW` displayoff.exe with `lpCommandLine` whose first
+    # token is `C:\Users\victim\some-other.exe` could redirect this
+    # resolver at that path. Same trust posture as Strategy 1's
+    # parent-PID query (see below): the attacker already has local
+    # code-exec as the current user when they spawn us with a controlled
+    # cmdline, so it's not a privilege escalation. The downstream
+    # rename-dance writes only after SHA256 verification against the
+    # release manifest, so they can't inject arbitrary bytes — but the
+    # bytes they DO inject (a real `displayoff.exe` build) will be
+    # written to the spoofed path. Mitigations: the hardening triple
+    # (`.exe`, isfile, not-temp) excludes the most obvious paths an
+    # attacker would point at (TEMP scratch files, missing paths), but
+    # does NOT exclude every protected directory (e.g.
+    # `LOCALAPPDATA\Microsoft\WindowsApps\` Store stubs would survive
+    # the filter — known gap, see CHANGELOG v1.7.20+ backlog).
+    compiled = globals().get("__compiled__")
+    if compiled is not None:
+        orig_argv0 = getattr(compiled, "original_argv0", None)
+        if isinstance(orig_argv0, str) and orig_argv0:
+            cand = os.path.abspath(orig_argv0)
+            if (cand.lower().endswith(".exe")
+                    and os.path.isfile(cand)
+                    and not _path_under_temp(cand)):
+                _RESOLVER_LOG.append(
+                    f"Strategy 0 (__compiled__.original_argv0) -> {cand!r}"
+                )
+                return cand
+            else:
+                _RESOLVER_LOG.append(
+                    f"Strategy 0 rejected: original_argv0={cand!r} "
+                    f"(temp/missing/non-.exe) — falling back"
+                )
 
     # Strategy 1: NUITKA_ONEFILE_PARENT → QueryFullProcessImageNameW.
     # Self-contained ctypes inside the helper because the file's main win32
@@ -193,11 +269,21 @@ def _resolve_on_disk_exe_path():
     # spawning user already controls.
     #
     # PID-reuse race: Nuitka's bootstrap parent stays alive until the
-    # child exits (the onefile model), so the parent_pid is still bound
-    # to the actual bootstrap process at module-import time. PID-reuse
-    # race window is effectively zero. If a future Nuitka version
-    # detaches the bootstrap, the `.endswith(".exe")` check and strategy
-    # 2's TEMP-prefix filter still bound the damage.
+    # child exits in the standard onefile model, so the parent_pid is
+    # still bound to the actual bootstrap process at module-import time.
+    # In that standard case the race window is effectively zero.
+    # HOWEVER, v1.7.18's pid 18996 incident empirically falsified the
+    # "standard case" assumption for at least one launch chain — Strategy
+    # 1 evidently failed (no resolver candidates wrote, _EXE_PATH landed
+    # on Strategy 3's TEMP\python.exe). The exact mechanism stays
+    # uncertain pending the next `--diagnose-paths` capture, but possible
+    # explanations include: detached bootstrap, OpenProcess denied by AV,
+    # or `QueryFullProcessImageNameW` returning a stale value. v1.7.19's
+    # Strategy 0 (preferred above) sidesteps all three by reading
+    # `__compiled__.original_argv0` from the compiled module's own
+    # metadata — no cross-process query needed. Strategy 1 stays as a
+    # fallback in case `__compiled__` ever evolves in a way that drops
+    # `original_argv0`.
     parent_pid_str = os.environ.get("NUITKA_ONEFILE_PARENT")
     if sys.platform == "win32" and parent_pid_str:
         try:
@@ -235,11 +321,6 @@ def _resolve_on_disk_exe_path():
                         size = _wt.DWORD(len(buf))
                         if _QueryImg(handle, 0, buf, ctypes.byref(size)):
                             resolved = buf.value
-                            _MIGRATION_LOG.append(
-                                f"_resolve_on_disk_exe_path: "
-                                f"NUITKA_ONEFILE_PARENT pid={parent_pid} -> "
-                                f"{resolved!r}"
-                            )
                             # v1.7.17 T2-Opus hardening: reject Strategy 1
                             # results that point inside any TEMP-like dir.
                             # If a future Nuitka version spawns the bootstrap
@@ -250,25 +331,28 @@ def _resolve_on_disk_exe_path():
                                     and resolved.lower().endswith(".exe")
                                     and os.path.isfile(resolved)
                                     and not _path_under_temp(resolved)):
+                                _RESOLVER_LOG.append(
+                                    f"Strategy 1 (NUITKA_ONEFILE_PARENT "
+                                    f"pid={parent_pid}) -> {resolved!r}"
+                                )
                                 return os.path.abspath(resolved)
                             elif resolved:
-                                _MIGRATION_LOG.append(
-                                    f"_resolve_on_disk_exe_path: rejecting "
-                                    f"Strategy 1 result {resolved!r} "
+                                _RESOLVER_LOG.append(
+                                    f"Strategy 1 rejected: parent "
+                                    f"pid={parent_pid} -> {resolved!r} "
                                     f"(temp/missing/non-.exe) — falling back"
                                 )
                     finally:
                         _Close(handle)
                 else:
-                    _MIGRATION_LOG.append(
-                        f"_resolve_on_disk_exe_path: OpenProcess failed for "
+                    _RESOLVER_LOG.append(
+                        f"Strategy 1 OpenProcess failed for "
                         f"parent_pid={parent_pid} (err="
                         f"{ctypes.get_last_error()}) — falling back"
                     )
             except Exception as e:
-                _MIGRATION_LOG.append(
-                    f"_resolve_on_disk_exe_path: parent-PID strategy "
-                    f"errored ({e!r}) — falling back"
+                _RESOLVER_LOG.append(
+                    f"Strategy 1 errored ({e!r}) — falling back"
                 )
 
     # Strategy 2: sys.argv[0] if it's outside TEMP, ends with .exe, AND
@@ -280,27 +364,31 @@ def _resolve_on_disk_exe_path():
             and argv0.lower().endswith(".exe")
             and os.path.isfile(argv0)
             and not _path_under_temp(argv0)):
-        _MIGRATION_LOG.append(
-            f"_resolve_on_disk_exe_path: sys.argv[0] strategy -> {argv0!r}"
+        _RESOLVER_LOG.append(
+            f"Strategy 2 (sys.argv[0]) -> {argv0!r}"
         )
         return argv0
 
-    # Strategy 3: BOTH primary strategies failed — Nuitka likely changed
-    # its environment contract. Return None rather than the broken
-    # sys.executable value: downstream consumers (`_execute_rename_dance`,
-    # `_autostart_target`, `_recover_from_failed_update`) already guard on
-    # `_EXE_PATH and ...`, so returning None makes those code paths skip
-    # cleanly instead of mis-targeting. v1.7.17 T3-Opus hardening — the
-    # whole v1.7.13–v1.7.16 incident proves "WARNING + wrong path" is
-    # worse than "no path"; the user can manually re-install instead of
-    # silently corrupting their install.
+    # Strategy 3: all three primary strategies failed — Nuitka likely
+    # changed its environment contract, or the .exe file got moved/deleted
+    # between launch and resolver invocation. Return None rather than the
+    # broken sys.executable value: downstream consumers
+    # (`_execute_rename_dance`, `_autostart_target`,
+    # `_recover_from_failed_update`) already guard on `_EXE_PATH and ...`,
+    # so returning None makes those code paths skip cleanly instead of
+    # mis-targeting. v1.7.17 T3-Opus hardening — the whole v1.7.13–v1.7.16
+    # incident proves "WARNING + wrong path" is worse than "no path"; the
+    # user can manually re-install instead of silently corrupting their
+    # install. v1.7.19: same behavior, additional Strategy 0 (Nuitka
+    # original_argv0) layered on top to catch v1.7.18's specific failure
+    # mode where Strategy 1's parent-PID query returned a stale path.
     exe = candidates.get("sys.executable")
-    _MIGRATION_LOG.append(
-        f"_resolve_on_disk_exe_path: WARNING — both primary strategies "
-        f"failed; sys.executable={exe!r} is likely the wrong path. "
-        f"Returning None so rename-dance / autostart .lnk / tray_promoter "
-        f"skip cleanly (downstream guards check `_EXE_PATH and ...`). "
-        f"Please report displayoff.log to "
+    _RESOLVER_LOG.append(
+        f"WARNING — all strategies failed; sys.executable={exe!r} is "
+        f"likely the wrong path. Returning None so rename-dance / "
+        f"autostart .lnk / tray_promoter skip cleanly (downstream guards "
+        f"check `_EXE_PATH and ...`). Please run `displayoff.exe "
+        f"--diagnose-paths` and report the output to "
         f"github.com/itsnateai/displayoff/issues."
     )
     return None
@@ -4376,6 +4464,25 @@ def run_tray():
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main():
+    # v1.7.19: --diagnose-paths prints the path-resolver candidates +
+    # winning-strategy line to stdout, then exits. Runs BEFORE any
+    # data-dir / logging setup so the flag works even when %APPDATA% is
+    # unwritable or the log file is locked. The resolver already ran at
+    # module-import time (see `_EXE_PATH = _resolve_on_disk_exe_path()`
+    # above), so `_EXE_PATH` and `_RESOLVER_LOG` are populated whenever
+    # this code runs under freeze.
+    if "--diagnose-paths" in sys.argv:
+        print(f"displayoff {__version__} --diagnose-paths")
+        print(f"frozen: {_is_frozen()}")
+        print(f"_EXE_PATH: {_EXE_PATH!r}")
+        if _RESOLVER_LOG:
+            print("resolver log:")
+            for _line in _RESOLVER_LOG:
+                print(f"  {_line}")
+        else:
+            print("resolver log: (empty — likely running from .py source)")
+        return
+
     # File logging so pythonw.exe runs are debuggable. Without this, every
     # log.* call below goes to a NullHandler and we have zero visibility.
     # RotatingFileHandler (v1.7.0+) prevents unbounded growth — a tray app
@@ -4419,6 +4526,9 @@ def main():
             for _m in _MIGRATION_LOG:
                 sys.stderr.write(f"displayoff: data-dir migration: {_m}\n")
             _MIGRATION_LOG.clear()
+            for _r in _RESOLVER_LOG:
+                sys.stderr.write(f"displayoff: path-resolver: {_r}\n")
+            _RESOLVER_LOG.clear()
     if sys.stderr is not None:
         _handlers.append(logging.StreamHandler())
     if not _handlers:
@@ -4453,6 +4563,13 @@ def main():
     # Skipped if the stderr-fallback above already drained _MIGRATION_LOG.
     for _msg in _MIGRATION_LOG:
         log.info("data-dir migration: %s", _msg)
+    # v1.7.19: parallel flush for path-resolver buffer. Separate prefix so a
+    # human reading the log isn't misled into thinking migration ran when
+    # only the resolver did. Fires on EVERY startup (resolver runs at
+    # module import unconditionally under freeze), unlike _MIGRATION_LOG
+    # which is typically empty after the one-time v1.7.9 migration.
+    for _msg in _RESOLVER_LOG:
+        log.info("path-resolver: %s", _msg)
     # v1.7.11 refinement: only clear the buffer when at least one real handler
     # consumed the messages. In the NullHandler-only degenerate path
     # (pythonw + unwritable _DATA_DIR) the log.info calls above went to
@@ -4466,6 +4583,7 @@ def main():
     )
     if _root_has_real_handler:
         _MIGRATION_LOG.clear()
+        _RESOLVER_LOG.clear()
 
     # v1.7.13: clean up artifacts from a previous launch's rename-dance that
     # may have crashed or been interrupted before --after-update could fire.
