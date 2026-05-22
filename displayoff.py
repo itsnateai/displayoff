@@ -538,6 +538,24 @@ _DEFAULT_CONFIG = {
     # hybrid GPU laptops). Set true to force the legacy SC_MONITORPOWER path
     # used in v1.0-1.5.
     "use_legacy_sc_monitorpower": False,
+    # v1.7.13: one-shot flag set after the first successful tray-promotion
+    # notification fires under the frozen .exe build. Win11 22H2+ defaults
+    # new tray icons (new ExecutablePath in NotifyIconSettings) to hidden-
+    # in-overflow until either (a) the user manually flips them via
+    # Settings ▸ Personalization ▸ Taskbar ▸ Other system tray icons, or
+    # (b) Explorer catalogs the icon and our tray_promoter writes
+    # IsPromoted=1. Explorer's catalog is lazy — it doesn't write the
+    # registry entry until the user opens the overflow flyout. Firing
+    # `icon.notify(...)` immediately after launch is the one well-known
+    # trick that FORCES Explorer to catalog the icon synchronously
+    # (because the balloon needs the icon's screen position). Once
+    # catalogued, the promoter's background poll finds the new entry and
+    # flips IsPromoted to 1. We only need to fire this notification ONCE
+    # per .exe install — subsequent launches inherit the IsPromoted=1
+    # state. The flag persists in config so a user who installs the .exe,
+    # closes it, and relaunches doesn't get repeated post-install
+    # notifications.
+    "_frozen_promoted_pinged": False,
 }
 
 
@@ -3768,6 +3786,45 @@ def run_tray():
                 except OSError as e:
                     log.warning("Could not write initial config: %s", e)
         threading.Thread(target=_welcome, daemon=True).start()
+    elif _is_frozen() and not cfg.get("_frozen_promoted_pinged", False):
+        # v1.7.13: first launch under the frozen .exe build for a user who
+        # already has a config from a previous source-mode install. Win11
+        # 22H2+ treats the .exe as a brand-new ExecutablePath in
+        # NotifyIconSettings (separate from the previous pythonw.exe entry)
+        # and defaults it to hidden-in-overflow. Fire a one-shot
+        # notification to force Explorer to catalog the icon synchronously
+        # — without that catalog, tray_promoter has nothing to set
+        # IsPromoted=1 on and the icon stays hidden indefinitely. See
+        # _DEFAULT_CONFIG `_frozen_promoted_pinged` comment for the full
+        # backstory.
+        def _frozen_promote_ping():
+            # 1s settle matches the first-run welcome notification — gives
+            # pystray's NIM_ADD time to register before we fire NIF_INFO.
+            time.sleep(1.0)
+            try:
+                icon.notify(
+                    f"Display Off is now running as a single-file .exe. "
+                    f"Press {hotkey_name[0]} to blank all displays.",
+                    "Display Off v" + __version__,
+                )
+                log.info("Frozen-first-launch promotion ping fired — Explorer "
+                         "should catalog the tray icon now, then tray_promoter "
+                         "writes IsPromoted=1.")
+            except Exception as e:
+                log.warning("Could not fire frozen-first-launch promotion "
+                            "notification: %s. Tray icon may stay hidden; user "
+                            "can manually toggle Settings ▸ Personalization "
+                            "▸ Taskbar ▸ Other system tray icons.", e)
+            # Persist the flag so subsequent launches don't re-fire this
+            # notification (Explorer remembers IsPromoted=1 once set; the
+            # ping is only needed for the initial catalog).
+            cfg["_frozen_promoted_pinged"] = True
+            try:
+                save_config(cfg)
+            except OSError as e:
+                log.warning("Could not persist _frozen_promoted_pinged flag: "
+                            "%s — notification may fire again next launch.", e)
+        threading.Thread(target=_frozen_promote_ping, daemon=True).start()
 
     icon.run()
 

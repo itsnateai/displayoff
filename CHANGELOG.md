@@ -50,6 +50,14 @@ After the initial v1.7.13 implementation, a high-stakes 8-agent verifier dispatc
 - **Parallel distribution.** v1.7.13 ships the `displayoff.exe` alongside the existing Python source — not replacing it. Users who already run from `python displayoff.py` or `pythonw displayoff.py` keep working; users who download the .exe get the same logic plus the rename-dance updater. Whether to deprecate the source channel in v1.8.0 is deferred until the .exe has a few weeks of real-world telemetry.
 - **`build-exe.bat` not in the GitHub release.** The build script + `build/` directory are committed to source control so future maintainers can rebuild, but they don't ship as release assets. The release publishes only `displayoff.exe` + `SHA256SUMS.txt`.
 
+### Fixed — tray icon was hidden by default on first .exe launch
+
+**Reported during the v1.7.13 rollout** by the first .exe tester (the developer): on a workstation that already had a v1.7.12 source-mode tray with `IsPromoted=1` for its `pythonw.exe` entry, the v1.7.13 .exe registered a brand-new `ExecutablePath` in `NotifyIconSettings`, and Win11 22H2+ defaulted that new entry to hidden-in-overflow. The existing `tray_promoter` couldn't flip `IsPromoted=1` because Explorer hadn't yet catalogued the new icon — Explorer's catalog write is lazy and only fires when the user opens the overflow flyout or Settings ▸ Other system tray icons. Result: invisible icon until the user manually interacted with overflow.
+
+**Fix:** new `_frozen_promoted_pinged` config flag (default `false`) gates a one-shot `icon.notify(...)` call that fires on the first .exe launch for any user who already has a config from a previous source-mode install. The `NIF_INFO` balloon notification forces Explorer to catalog the icon synchronously (the balloon needs the icon's screen position), and once catalogued, `tray_promoter`'s background poll finds the new subkey and writes `IsPromoted=1`. The flag persists in `displayoff_config.json` so subsequent launches don't re-fire the notification (Explorer remembers `IsPromoted=1` once set).
+
+The fallback is unchanged: users can still manually toggle Display Off → On in Settings ▸ Personalization ▸ Taskbar ▸ Other system tray icons. The notification just makes the automatic path work for the typical-Win11 case where the user wouldn't otherwise know to do that.
+
 ## [1.7.12] — 2026-05-21
 
 Pre-existing-cleanup pass. Two real fixes from carried-forward backlog plus a Notes section correcting documentation drift in v1.7.11's CHANGELOG entry.
