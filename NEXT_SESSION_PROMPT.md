@@ -1,84 +1,89 @@
-# DisplayOff v1.7.17 — Next-Session Prompt
+# DisplayOff v1.7.18 — Next-Session Prompt
 
-Continue displayoff hardening. v1.7.15 + v1.7.16 shipped 2026-05-21 (tags `v1.7.15` `8e4b53c` / `v1.7.16` `a991f47`, both public). The session ended with a CRITICAL latent bug discovered that was missed by both the 8-agent verifier round AND the v1.7.13 freeze-pass author.
+v1.7.17 shipped 2026-05-22 (tag `v1.7.17`, commit `ff7d160`, public). It fixes the latent v1.7.13–v1.7.16 path-resolution bug under Nuitka onefile via `_resolve_on_disk_exe_path()` (layered `NUITKA_ONEFILE_PARENT` + `QueryFullProcessImageNameW` chain). Source for v1.7.18 already carries the verifier-round hardening (commit `416fb45`).
 
 ## Read first
 
-- `C:/Users/nate/.claude/projects/X---Projects/memory/project_displayoff_v1716_shipped.md` — full session telemetry: what shipped, what's still broken, every claim I made that turned out wrong, complete v1.7.17 backlog.
-- `X:/_Projects/displayoff/CHANGELOG.md` v1.7.15 + v1.7.16 entries.
-- `X:/_Projects/displayoff/displayoff.py` lines 84-90 (`_EXE_PATH` / `_INSTALL_DIR` constants), 670-700 (`_autostart_target`), 3625-3680 (sweep + promote_in_background call site).
-- `X:/_Projects/displayoff/displayoff.log` — look for "current launcher is 'C:\Users\nate\AppData\Local\Temp\onefile_..._python.exe'" entries; that's the empirical proof of the bug.
+- `C:/Users/nate/.claude/projects/X---Projects/memory/project_displayoff_v1717_shipped.md` — full session telemetry from v1.7.17.
+- `X:/_Projects/displayoff/CHANGELOG.md` v1.7.17 entry — describes what shipped and what's still in the backlog.
+- `X:/_Projects/displayoff/displayoff.py` lines 105–306 (`_path_under_temp` + `_resolve_on_disk_exe_path` — hardened post-tag for v1.7.18 baseline), 844–854 (`_autostart_target_pythonw` raise-defense).
+- `X:/_Projects/displayoff/displayoff.log` (and `%APPDATA%\displayoff\displayoff.log`) — look for `_resolve_on_disk_exe_path candidates:` lines to see which strategy wins on this hardware.
 
-## v1.7.17 scope — IN PRIORITY ORDER
+## v1.7.18 scope — in priority order
 
-### 1. CRITICAL — Nuitka onefile path-resolution bug (THE main reason for v1.7.17)
+### 1. HIGH — tag + push v1.7.18 to exercise the inaugural in-the-wild rename-dance
 
-**Symptom proven this session:** `_EXE_PATH = os.path.abspath(sys.executable)` returns the temp-extracted `python.exe` (e.g., `%TEMP%\onefile_PID_RAND_HASH\python.exe`), NOT the on-disk `displayoff.exe`. v1.7.13's freeze-mode comment block claims `sys.executable` is the on-disk .exe under Nuitka — empirically false for Nuitka 4.1.1.
+The post-tag hardening from the v1.7.17 8-agent verifier round is already in source on master (`416fb45`). v1.7.17 binary on GitHub is unchanged and works empirically (Strategy 1 always wins under real Nuitka onefile usage). The right next step is to tag v1.7.18, push, let CI build + upload, and **this** is the inaugural in-the-wild rename-dance exercise: v1.7.17 → v1.7.18 update flow.
 
-**Cascading impact:**
-- `tray_promoter.promote_in_background(exe_path=sys.executable)` never matches the registry's `ExecutablePath` (which Win11 correctly populates with the on-disk .exe). Never writes `IsPromoted=1`. Tray icon stays hidden.
-- `_autostart_target()` returns `_EXE_PATH` for the .lnk target — would point at a temp path that changes every launch. Log shows "Stale startup shortcut" every relaunch.
-- `_INSTALL_DIR = os.path.dirname(_EXE_PATH)` resolves to the temp dir. The rename-dance downloads to + renames in the temp dir, NEVER touches the on-disk install. **The dance has been structurally incapable of updating users since v1.7.13.** The v1.7.16 URL-allowlist hotfix made the network step pass but the dance still wouldn't have worked.
+What's already committed for v1.7.18 baseline (commit `416fb45`):
 
-**Fix approach:**
-1. Add a `_resolve_on_disk_exe_path()` helper. Investigate which of these returns the on-disk .exe path under Nuitka onefile 4.1.1:
-   - `sys.argv[0]`
-   - `os.environ.get("NUITKA_ONEFILE_PARENT")` (PID; query parent's image)
-   - Win32 `GetModuleFileNameW(NULL)` from inside the child
-   - `__compiled__.original_argv0` (Nuitka attribute)
-   - First-class: build a tiny test binary that logs all four values, run from `proggy\Tools` location, see what each returns
-2. Rewire `_EXE_PATH` to consume the helper.
-3. Verify all downstream call sites: `_autostart_target()`, `_execute_rename_dance` (uses `_EXE_PATH` for `current`, `_INSTALL_DIR` for download dest), `tray_promoter.promote_in_background(exe_path=...)`, `_recover_from_failed_update`.
-4. Update the misleading comment block at `displayoff.py:43-68` with the empirical reality.
-5. **SANDBOX-TEST THE FULL DANCE BEFORE SHIP THIS TIME.** Skipping the sandbox test in v1.7.15 was the root cause of needing v1.7.16. Skipping it again would be the third strike. Sandbox VM with v1.7.16 .exe → fake-v1.7.17 release on a private repo → click Install now → verify the on-disk .exe actually changes + `.old` cleanup fires + child relaunches at v1.7.17.
+- New `_path_under_temp(path)` helper — realpath + normcase + check across TEMP/TMP/LOCALAPPDATA\Temp env vars.
+- Strategy 1 now rejects results that point inside any TEMP-like dir, fail `os.path.isfile`, or don't end in `.exe`. (T2-Opus convergent.)
+- Strategy 2 adds `os.path.isfile(argv0)` + multi-TEMP-env check. (T2-Sonnet CRITICAL ×2.)
+- Strategy 3 returns `None` rather than the broken `sys.executable` — downstream consumers already guard `if _EXE_PATH and ...`, so None forces the safer "skip cleanly" path. (T3-Opus HIGH.)
+- `_autostart_target_pythonw`: `assert` → `if/raise RuntimeError` — survives `python -O`, satisfies workspace rule 12 "fail loud". (T3-Opus HIGH.)
+- `release-notes.md` scrubbed of `proggy\Tools\` private path. Live GitHub release notes also updated via `gh release edit v1.7.17 --notes-file release-notes.md`. (T3-Sonnet.)
 
-### 2. HIGH — convergent verifier findings (8-agent round produced; full list in memory file)
+### 2. MEDIUM — drain the v1.7.17 deferred backlog into v1.7.18
 
-- **`chrome_margin = 40` hardcoded** in `_themed_dialog` — fragile at 125%+ DPI scaling. Use `winfo_pixels("0.3i")` or similar.
-- **`_PING_FIRED_THIS_PROCESS` global without lock** — violates workspace's documented free-threaded discipline. Use `threading.Lock`.
-- **`_recover_from_failed_update` unconditionally deletes `.old`** — hostile to manual rollback. Skip cleanup if `.old` mtime > `current` mtime.
-- **`.gitignore *.old` too broad** — narrow to `*.exe.old` or `/*.old`.
-- **`build-exe.bat:17` says "should print 'displayoff 1.7.13'"** — stale.
-- **`_themed_dialog` should use `dlg.minsize()` (sticky) not one-shot `geometry()` floor** — current floor doesn't survive a Tk geometry re-solve.
+Pulled from the v1.7.17 CHANGELOG and verifier-round findings. None of these are blocking; bundling them together gives v1.7.18 a meaningful changelog rather than "post-tag hardening only":
 
-### 3. MEDIUM — workspace blast-radius (EQSwitch CDN bug)
+- **`_UPDATE_MIN_EXE_SIZE = 1_000_000` → tighter floor.** Real Nuitka onefile build is ~52 MB. A floor of ~40 MB catches mis-shipped stub binaries; current 1 MB only catches HTML error pages. Trivial constant change. (T3-Sonnet MEDIUM, T3-Opus MEDIUM-3 convergent.)
+- **`release.yml` permissions tightening.** Move `contents: write` from the workflow level down to just the `softprops/action-gh-release` step (`contents: read` at workflow root). One-line change. (v1.7.17 deferred backlog.)
+- **`release.yml` post-upload redirect-host smoke test.** Add a `curl -sI -L` check on `https://github.com/itsnateai/displayoff/releases/download/<tag>/displayoff.exe` and assert the final redirect lands on `release-assets.githubusercontent.com`. Proactive future-CDN-change detection. (v1.7.17 deferred backlog.)
+- **`objects-origin.githubusercontent.com` defensive allowlist add.** Forward-compat for future GitHub CDN host migrations. (v1.7.17 deferred backlog.)
+- **`_themed_dialog` `dlg.minsize(w, h)` sticky-floor.** Currently the floor is one-shot via `geometry()`. `minsize()` survives Tk geometry re-solves. (v1.7.17 deferred backlog.)
+- **`build-exe.bat` Nuitka pin guard.** Add `python -m nuitka --version | findstr "^4\.1\.1"` preflight; fail-fast if a different Nuitka is installed locally. CI is already pinned via `pip install nuitka==4.1.1` in `release.yml`. (T3-Opus INFO.)
+- **`tray_promoter.py` docstring example fix.** Line 121 docstring still shows `current_exe_path=sys.executable` as the example. The real call site is correct, but the docstring will mislead future template-copiers. Change to `current_exe_path=_EXE_PATH or sys.executable`. (T4-Sonnet LOW.)
 
-User said they'd handle this in the EQSwitch terminal directly. If they didn't get to it: `eqswitch/UI/UpdateDialog.cs:467` — same `release-assets.githubusercontent.com` missing-from-allowlist bug as displayoff v1.7.13/14/15 had. Pattern fix is in `_.claude/_templates/snippets/csharp/github-self-update-allowlist.md` (canonical dual-host).
+### 3. LOW — non-blocking, can defer to v1.7.19+ if v1.7.18 gets crowded
 
-Also: three workspace templates still teach the single-host pattern. Update them:
-- `_.claude/_templates/checklists/code-change/add-self-update.md`
-- `_.claude/_templates/references/csharp/self-update-pattern.md`
-- `_.claude/_templates/templates/github/package-manager-submission.md`
-
-### 4. LOW — backlog from 8-agent round
-
-See memory file for full list. Worth doing eventually but not blocking:
-- `objects-origin.githubusercontent.com` defensive allowlist add
-- `release.yml` permissions tightening (`contents: read` at workflow level)
-- `release.yml` post-upload redirect-host smoke test (proactive future-CDN-change detection)
-- `_UPDATE_MIN_EXE_SIZE = 1 MB` → tighter floor (real .exe is 52 MB)
-- 300 ms parent-`os._exit` vs child-`_acquire_single_instance` race window in the rename-dance
+- **300 ms parent-`os._exit` vs child `_acquire_single_instance` race in the rename-dance child relaunch.** Window is sub-second; if child loses, symptom is "no tray after update" with no log entry. Mitigation idea: switch to a named event (`SetEvent` from parent after child handshake) rather than fixed `time.sleep(0.3)`. Worth doing but non-trivial. (T3-Sonnet MEDIUM, T3-Opus, v1.7.17 deferred backlog convergent.)
+- **`_download_url_allowed` URL parser hardening.** `urlsplit` doesn't normalize `..`; `startswith` on path can be tricked by path traversal in the URL string. SHA256 is the integrity boundary so any actual exploit is bounded, but tighter parsing closes the false-positive surface. (T2-Opus CRITICAL but bounded by SHA.)
+- **`_migrate_legacy_data` `shutil.move` not atomic cross-device.** Pre-existing code, hits if `%APPDATA%` is on a different volume than the install dir (rare). Add a hash-verify-then-delete pattern. (T2-Opus.)
+- **`_DwmSetWindowAttribute` re-bound on every `_apply_dark_titlebar` call.** Convention violation (file rule: bindings live in the main block). Cosmetic. (T3-Sonnet LOW.)
 
 ## Workflow
 
-1. Read the memory file + the displayoff.log empirical evidence.
-2. Add diagnostic logging to confirm which API returns the on-disk .exe path under Nuitka onefile (`sys.argv[0]` is the most likely answer per Nuitka docs).
-3. Build a v1.7.17-pre with the path-resolution fix.
-4. **Sandbox-test the rename-dance end-to-end against a fake-v1.7.17 release** — this is the gate.
-5. If sandbox test passes, fix the other convergent findings in the same commit.
-6. 6-agent normal-stakes verifier round (workflow shaped + path resolution is a security boundary so could justify 8-agent but the surface is smaller than v1.7.13 → 6 is probably right).
-7. Bump `__version__` to 1.7.16 → 1.7.17 in `displayoff.py` and `build-exe.bat`.
-8. CHANGELOG entry — be honest about what was broken since v1.7.13.
-9. Create draft release with notes (no asset files — CI uploads them on tag push).
-10. Tag + push commit + tag together. CI builds, uploads, auto-promotes draft.
-11. Verify SHA cross-check, verify the running .exe at `C:\Users\nate\proggy\Tools\displayoff.exe` is replaceable by clicking Install now in the v1.7.16-running instance against v1.7.17. This is the inaugural successful real-world dance.
+1. Read the v1.7.17 memory file + the empirical `_resolve_on_disk_exe_path candidates:` log line.
+2. Decide v1.7.18 scope: minimum is "ship the hardening that's in source"; ideal is "hardening + 3–5 deferred backlog items".
+3. For each backlog item picked, edit + verify per the file's discipline (`assert` → `raise`, explicit `argtypes`/`restype`, etc.).
+4. Bump `__version__` to `1.7.18` in `displayoff.py` (currently `1.7.17`) and `set VERSION=1.7.18` in `build-exe.bat`.
+5. Honest CHANGELOG entry covering both the post-tag hardening shipped between v1.7.17 and v1.7.18 (already in source — describe what's in `416fb45`) AND any new backlog items closed.
+6. Write a `release-notes.md` for v1.7.18 — short. The headline is "first dance exercise post-v1.7.17"; emphasize that v1.7.17 users SHOULD be able to use Settings → Check for updates → Install now successfully this time.
+7. Build locally (`build-exe.bat`), confirm `displayoff.exe --version` prints `1.7.18`, confirm `displayoff.log` shows the resolver picking Strategy 1.
+8. 6-agent normal-stakes verifier round (3 topics × Sonnet+Opus) before tagging — the high-stakes 8-agent round can be reserved for if Strategy 1 fails empirically. **Apply convergent CRITICAL/HIGH fixes mid-round; re-verify if anything REJECTs.**
+9. `gh release create v1.7.18 --draft --title "..." --notes-file release-notes.md` (no files; CI uploads).
+10. `git tag v1.7.18 -m "v1.7.18" && git push origin master && git push origin v1.7.18` → CI fires.
+11. Watch CI run; confirm both `displayoff.exe` + `SHA256SUMS.txt` upload + draft auto-promotes to public.
+12. **Now the real test:** click "Settings → Check for updates → Install now" from the v1.7.17 install. The dance should download, SHA-verify, rename `displayoff.exe` → `displayoff.exe.old`, write the new bytes, spawn `displayoff.exe --after-update`, and the v1.7.18 tray icon should appear within ~2 seconds. **If anything goes wrong here, the path-resolution fix has a latent flaw and v1.7.19 is necessary.** Capture `displayoff.log` for proof.
 
 ## Context preservation
 
 - Active workspace: `X:/_Projects/displayoff/`
-- Canonical install: `C:\Users\nate\proggy\Tools\displayoff.exe` (v1.7.16, SHA `30a8e971...`)
-- Backup install (build artifact, now deleted): `X:/_Projects/displayoff/build/displayoff.exe` was where the user ran from previously; current build dir holds Nuitka cache subdirs only
-- `_frozen_promoted_pinged` config flag: currently absent (cleared this session). On next launch the promotion ping will fire, but `tray_promoter` STILL won't write `IsPromoted=1` until v1.7.17 ships the path-resolution fix
-- All AKS hooks active (pre-edit vault context, post-commit /bug-found, completion-checkpoint v4.1 with stakes-aware verifier dispatch)
-- Workspace push policy: blanket push permission granted for displayoff (non-`_.claude/` repo); commits OK to be unattributed (no Co-Authored-By per `no_claude_attribution_git`)
-- Three things I claimed at end-of-v1.7.16-session that were wrong: "The dance should work end-to-end this time" + "Install now should actually work end-to-end from v1.7.16 onward" + "v1.7.16 → v1.7.17 should be the first successful in-the-wild dance exercise". v1.7.17 is the actual fix — be skeptical of my own optimism here.
+- Current `__version__` in source: `1.7.17` (already-shipped binary)
+- Master HEAD: commit `416fb45` (post-tag hardening, NOT in any released binary yet)
+- Canonical install: `C:\Users\nate\proggy\Tools\displayoff.exe` — v1.7.17 once manually installed; this is where the "Install now" test fires against.
+- Public release: https://github.com/itsnateai/displayoff/releases/tag/v1.7.17 — SHA `eab51ae3f77d7c36c3a7c2000da4347a4df9d2e634e6e4edc29a37087339faaa`.
+- All AKS hooks active (pre-edit vault context, post-commit /bug-found, completion-checkpoint v4.1 with stakes-aware verifier dispatch).
+- Workspace push policy: blanket push permission granted for displayoff (non-`_.claude/` repo); commits OK to be unattributed.
+- **Sandbox rule deleted 2026-05-22.** Don't ask Nate about sandbox-testing; it's no longer a ship gate. The harness reference (`memory/reference_windows_sandbox_testing.md`) stays for optional use only.
+- Three things v1.7.17 source carries that the v1.7.17 binary does NOT:
+  - `_path_under_temp` helper (multi-TEMP-env coverage)
+  - Strategy 1 TEMP-rejection + isfile + .exe filters
+  - Strategy 2 isfile + multi-TEMP-env filters
+  - Strategy 3 returns None (was `sys.executable`)
+  - `_autostart_target_pythonw` `assert` → `raise`
+  - `release-notes.md` `proggy\Tools\` scrub (also live on GitHub already)
+
+## Workspace template work (do NOT re-do)
+
+Commit `ec3c0c9` (local-only per `_.claude/**` push-blocking rule) already updated:
+- `_.claude/_templates/checklists/release/pre-release.md` — sandbox-mandate lifted
+- `_.claude/_templates/snippets/python/tray-icon-promoter.md` — Nuitka onefile trap documented, `_EXE_PATH or sys.executable` pattern shown
+- `_.claude/_templates/snippets/csharp/tray-icon-promoter.md` — sandbox mandate lifted
+- `_.claude/_templates/snippets/csharp/tray-app.md` — "non-negotiable" → "optional escalation"
+- `_.claude/_templates/snippets/powershell/screenshot-capture.md` — sandbox-default-flow lifted
+- `_.claude/_templates/troubleshooting/windows/sandbox-silent-logoncommand.md` — workflow rule reference updated
+
+No further template work needed for v1.7.18 unless the dance test surfaces new gaps.

@@ -1,5 +1,40 @@
 # Changelog — Display Off
 
+## [1.7.18] — 2026-05-22
+
+Post-tag hardening of the v1.7.17 path resolver fallback paths, surfaced by the v1.7.17 8-agent verifier round. The v1.7.17 binary works empirically (Strategy 1 — `NUITKA_ONEFILE_PARENT` + `QueryFullProcessImageNameW` — always wins under real Nuitka onefile usage, verified in `displayoff.log`), but the fallback Strategy 2/3 paths were soft against several edge cases. v1.7.18 closes those gaps and is also the **inaugural in-the-wild rename-dance exercise**: a v1.7.17 user clicking Settings → Check for updates → Install now against this release is the actual first end-to-end test of the dance.
+
+### Fixed
+
+- **`_path_under_temp(path)` helper — robust multi-env-var TEMP detection.** v1.7.17's Strategy 2 used a single `%TEMP%` string-prefix check, which was fragile against (a) `%TEMP%` unset in restricted accounts or sandboxed services, (b) 8.3 short-name vs long-name resolution drift, and (c) junctions/symlinks resolving differently. New helper resolves both sides via `os.path.realpath` + `os.path.normcase` and checks across `TEMP`, `TMP`, and `LOCALAPPDATA\Temp`. Used by Strategies 1 and 2 in the resolver. Flagged convergent by v1.7.17 T2-Sonnet (CRITICAL) + T2-Opus.
+- **Strategy 1 now rejects results under TEMP-like dirs, missing-on-disk paths, and non-`.exe` extensions.** Previously the strategy returned whatever `QueryFullProcessImageNameW` reported, gated only by `.endswith(".exe")`. If a future Nuitka version spawned the bootstrap via a chain where the parent process itself was an extracted-temp `python.exe`, Strategy 1 would silently re-introduce the v1.7.13 bug class. Defense layered via the new `_path_under_temp` helper + `os.path.isfile`. Flagged by v1.7.17 T2-Opus.
+- **Strategy 2 adds `os.path.isfile(argv0)` + multi-TEMP-env check.** A synthetic `sys.argv[0]` (relative path, network path, or path to a deleted .exe — possible if a caller invokes `displayoff.exe` with a custom argv from a wrapper script) no longer silently propagates to the rename-dance, autostart `.lnk`, and tray promoter. Flagged convergent by v1.7.17 T2-Sonnet (CRITICAL).
+- **Strategy 3 returns `None` (was `sys.executable`).** When both primary strategies fail, the resolver now signals "no valid path" rather than handing downstream consumers the same broken value the v1.7.13 bug used. The rename-dance, autostart `.lnk` creator, and `tray_promoter` all check `if _EXE_PATH and ...` before acting, so `None` makes those paths skip cleanly instead of mis-targeting. The v1.7.13–v1.7.16 incident proved "WARNING log + wrong path" is worse than "no path" — users don't read warnings, but they DO notice a feature silently doing nothing. Flagged HIGH by v1.7.17 T3-Opus.
+- **`_autostart_target_pythonw`: `assert` → `if/raise RuntimeError`.** v1.7.17 added an `assert not _is_frozen()` defense against a future refactor accidentally invoking this source-mode-only function under freeze. But `assert` compiles to a no-op under `python -O`, which would silently revive the v1.7.13 `.lnk`-points-at-temp-path bug. v1.7.18 promotes the guard to an unconditional `raise RuntimeError`, satisfying workspace rule 12 ("fail loud"). Flagged HIGH by v1.7.17 T3-Opus.
+- **`release-notes.md` private-path scrub.** v1.7.17's public release notes referenced `proggy\Tools\displayoff.exe` (a personal install path) in the empirical-proof section. v1.7.18 scrubs to `<%TEMP%>` for the temp-path example and removes the specific install path entirely. The live v1.7.17 release notes were also updated via `gh release edit v1.7.17 --notes-file release-notes.md`. Flagged by v1.7.17 T3-Sonnet per workspace `feedback_no_personal_names_in_public_repos` policy.
+
+### Notes — what's still on the v1.7.19+ backlog
+
+Items the v1.7.17 8-agent round surfaced that didn't make v1.7.18's cut:
+
+- `_UPDATE_MIN_EXE_SIZE = 1 MB` → tighter floor (real .exe is ~52 MB).
+- `release.yml` permissions tightening (`contents: read` at workflow root, `write` only on the upload step).
+- `release.yml` post-upload redirect-host smoke test (proactive future-CDN-change detection).
+- `objects-origin.githubusercontent.com` defensive allowlist add (forward-compat for future CDN host migrations).
+- `_themed_dialog` `dlg.minsize()` sticky-floor (currently one-shot `geometry()`).
+- 300 ms parent-`os._exit` vs child-`_acquire_single_instance` race in the rename-dance child relaunch.
+- `_download_url_allowed` URL parser hardening (`urlsplit` doesn't normalize `..` traversal; SHA256 is the integrity boundary so any exploit is bounded but the false-positive surface is wider than ideal).
+- `_migrate_legacy_data` `shutil.move` not atomic cross-device (only matters if `%APPDATA%` is on a different volume than the install dir).
+- `_DwmSetWindowAttribute` re-bound on every `_apply_dark_titlebar` call (convention violation; cosmetic).
+- `tray_promoter.py:121` docstring example still shows `current_exe_path=sys.executable` (real call site at `displayoff.py:3925` is correct; only the docstring will mislead template-copiers).
+- `build-exe.bat` Nuitka pin guard (CI is already pinned via `pip install nuitka==4.1.1`; local builds aren't).
+
+### Notes — the inaugural in-the-wild rename-dance exercise
+
+v1.7.17 was the first release the dance *could* work against, but no user had exercised it end-to-end yet (the manual-install upgrade path was the only documented one). v1.7.18 is the first release where the v1.7.17 cohort can use Settings → Check for updates → Install now against a real new release and complete the full dance — download `.exe` to `.tmp` → SHA verify → atomic rename `displayoff.exe` → `displayoff.exe.old` → atomic rename `displayoff.exe.tmp` → `displayoff.exe` → spawn `displayoff.exe --after-update` → child cleans up `.old` and the v1.7.18 tray icon appears.
+
+If anything in this chain breaks for a v1.7.17 user, the failure mode is graceful (the dance leaves either the original `.exe` or the `.old` intact — both are recoverable via manual rename) but the symptom will be "Install now appeared to succeed but the version didn't change". Capture `displayoff.log` from any such report and a v1.7.19 hotfix lands the same day.
+
 ## [1.7.17] — 2026-05-22
 
 The actual fix for the rename-dance, tray promoter, and autostart `.lnk` — each of which has been **structurally broken under freeze since v1.7.13**. v1.7.13's freeze pass added a comment block claiming `sys.executable` returns the on-disk `displayoff.exe` under Nuitka onefile (the PyInstaller-onefile behavior). That assumption is empirically false on Nuitka 4.1.1: `sys.executable` returns the per-launch temp-extracted python.exe (e.g., `C:\Users\<user>\AppData\Local\Temp\onefile_<pid>_<rand>_<hash>\python.exe`), not the on-disk .exe. v1.7.16's release notes claimed the dance "should work end-to-end this time" — also false; the v1.7.16 URL-allowlist fix made the network step pass but the rename targeted the wrong directory. v1.7.17 ships the path-resolution fix that finally makes the dance work.
