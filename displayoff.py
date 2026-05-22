@@ -102,6 +102,42 @@ def _is_frozen():
 _MIGRATION_LOG: list[str] = []
 
 
+def _path_under_temp(path):
+    """True if `path` lives under any of Windows' canonical temp-dir env
+    vars: TEMP, TMP, LOCALAPPDATA\\Temp. v1.7.17 T2-Sonnet+T2-Opus
+    hardening: a single `%TEMP%` check is fragile because the env can be
+    cleared in restricted accounts or sandboxed services, and short-name
+    (8.3) vs long-name resolution can also defeat a string prefix match.
+    This helper resolves both sides via `os.path.realpath` + `normcase`
+    so junctions, symlinks, and 8.3 names all compare equal."""
+    if not path:
+        return False
+    try:
+        canonical = os.path.normcase(os.path.realpath(path))
+    except OSError:
+        canonical = os.path.normcase(os.path.abspath(path))
+    temp_candidates = []
+    for env_var in ("TEMP", "TMP"):
+        v = os.environ.get(env_var)
+        if v:
+            temp_candidates.append(v)
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        temp_candidates.append(os.path.join(local_appdata, "Temp"))
+    for raw in temp_candidates:
+        try:
+            t = os.path.normcase(os.path.realpath(raw))
+        except OSError:
+            t = os.path.normcase(os.path.abspath(raw))
+        # Append a separator so a path like `C:\Temp_Backup\foo.exe` doesn't
+        # match `C:\Temp\` as a substring.
+        if not t.endswith(os.sep):
+            t = t + os.sep
+        if canonical.startswith(t):
+            return True
+    return False
+
+
 def _resolve_on_disk_exe_path():
     """Resolve the on-disk displayoff.exe path under freeze. None under .py.
 
@@ -204,8 +240,23 @@ def _resolve_on_disk_exe_path():
                                 f"NUITKA_ONEFILE_PARENT pid={parent_pid} -> "
                                 f"{resolved!r}"
                             )
-                            if resolved and resolved.lower().endswith(".exe"):
+                            # v1.7.17 T2-Opus hardening: reject Strategy 1
+                            # results that point inside any TEMP-like dir.
+                            # If a future Nuitka version spawns the bootstrap
+                            # via a chain where the parent process is itself
+                            # the extracted temp python.exe, Strategy 1 would
+                            # otherwise re-introduce the v1.7.13 bug.
+                            if (resolved
+                                    and resolved.lower().endswith(".exe")
+                                    and os.path.isfile(resolved)
+                                    and not _path_under_temp(resolved)):
                                 return os.path.abspath(resolved)
+                            elif resolved:
+                                _MIGRATION_LOG.append(
+                                    f"_resolve_on_disk_exe_path: rejecting "
+                                    f"Strategy 1 result {resolved!r} "
+                                    f"(temp/missing/non-.exe) — falling back"
+                                )
                     finally:
                         _Close(handle)
                 else:
@@ -220,30 +271,39 @@ def _resolve_on_disk_exe_path():
                     f"errored ({e!r}) — falling back"
                 )
 
-    # Strategy 2: sys.argv[0] if it's outside TEMP and ends with .exe.
+    # Strategy 2: sys.argv[0] if it's outside TEMP, ends with .exe, AND
+    # exists on disk. v1.7.17 T2-Sonnet hardening: existence check prevents
+    # a synthetic argv[0] (relative path, network path, deleted .exe) from
+    # silently propagating to the rename-dance / .lnk / tray_promoter.
     argv0 = candidates.get("sys.argv[0]")
-    if argv0 and argv0.lower().endswith(".exe"):
-        temp_dir = os.environ.get("TEMP", "")
-        in_temp = bool(temp_dir) and argv0.lower().startswith(
-            os.path.abspath(temp_dir).lower()
+    if (argv0
+            and argv0.lower().endswith(".exe")
+            and os.path.isfile(argv0)
+            and not _path_under_temp(argv0)):
+        _MIGRATION_LOG.append(
+            f"_resolve_on_disk_exe_path: sys.argv[0] strategy -> {argv0!r}"
         )
-        if not in_temp:
-            _MIGRATION_LOG.append(
-                f"_resolve_on_disk_exe_path: sys.argv[0] strategy -> {argv0!r}"
-            )
-            return argv0
+        return argv0
 
-    # Strategy 3: last-resort fallback to sys.executable. BOTH primary
-    # strategies failed — Nuitka likely changed its environment contract.
+    # Strategy 3: BOTH primary strategies failed — Nuitka likely changed
+    # its environment contract. Return None rather than the broken
+    # sys.executable value: downstream consumers (`_execute_rename_dance`,
+    # `_autostart_target`, `_recover_from_failed_update`) already guard on
+    # `_EXE_PATH and ...`, so returning None makes those code paths skip
+    # cleanly instead of mis-targeting. v1.7.17 T3-Opus hardening — the
+    # whole v1.7.13–v1.7.16 incident proves "WARNING + wrong path" is
+    # worse than "no path"; the user can manually re-install instead of
+    # silently corrupting their install.
     exe = candidates.get("sys.executable")
     _MIGRATION_LOG.append(
         f"_resolve_on_disk_exe_path: WARNING — both primary strategies "
-        f"failed; falling back to sys.executable={exe!r}. The on-disk "
-        f"path may be wrong; rename-dance + autostart .lnk + tray_promoter "
-        f"will mis-target. Please report displayoff.log to "
+        f"failed; sys.executable={exe!r} is likely the wrong path. "
+        f"Returning None so rename-dance / autostart .lnk / tray_promoter "
+        f"skip cleanly (downstream guards check `_EXE_PATH and ...`). "
+        f"Please report displayoff.log to "
         f"github.com/itsnateai/displayoff/issues."
     )
-    return exe
+    return None
 
 
 # ── Paths ──────────────────────────────────────────────────────────────────
@@ -841,11 +901,17 @@ def _autostart_target_pythonw():
     but a future refactor could plumb it under a frozen branch by mistake.
     The same docstring-trust failure that bit v1.7.13 → v1.7.16 is the
     exact thing we're defending against."""
-    assert not _is_frozen(), (
-        "_autostart_target_pythonw must never be called under freeze — "
-        "sys.executable is the temp-extracted python.exe, not the on-disk "
-        ".exe. Use _EXE_PATH for the .lnk target under freeze."
-    )
+    # Hard guard (raise, not assert): `assert` compiles to no-op under
+    # `python -O`, which would silently revive the v1.7.13 bug class. Raise
+    # is unconditional and matches workspace rule 12 ("fail loud"). v1.7.17
+    # T3-Opus verifier-round catch.
+    if _is_frozen():
+        raise RuntimeError(
+            "_autostart_target_pythonw must never be called under freeze — "
+            "sys.executable is the temp-extracted python.exe, not the on-disk "
+            ".exe. Use the resolved on-disk path (_EXE_PATH from "
+            "_resolve_on_disk_exe_path) for the .lnk target under freeze."
+        )
     py = sys.executable
     if py.lower().endswith("python.exe"):
         pyw = py[:-len("python.exe")] + "pythonw.exe"

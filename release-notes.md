@@ -38,11 +38,11 @@ Be honest about regression scope: the rename-dance has **never** worked end-to-e
 - **v1.7.16** — hotfixed the GitHub release-asset CDN allowlist. Necessary, but not sufficient — the URL fix made the network step pass but the rename still targeted the temp dir.
 - **v1.7.17** — the actual fix. The 8-agent verifier rounds on each release couldn't catch this because the v1.7.13 comment block claimed `sys.executable` was correct, and the verifiers trusted the docstring over runtime behavior.
 
-The empirical proof showed up in `displayoff.log` after the v1.7.16 manual install at `proggy\Tools\displayoff.exe`:
+The empirical proof showed up in `displayoff.log` after the v1.7.16 manual install:
 
 ```
 Stale startup shortcut: target='...pythonw.exe' but current launcher is
-'C:\Users\nate\AppData\Local\Temp\onefile_42604_561348_DreZIYVFd8M\python.exe'
+'<%TEMP%>\onefile_<pid>_<rand>\python.exe'
 — treating as 'not enabled' so next Save re-creates it.
 ```
 
