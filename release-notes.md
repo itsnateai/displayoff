@@ -1,21 +1,23 @@
-Backlog drain — sub-threshold items from the v1.7.13 + v1.7.14 verifier rounds, plus a build-infrastructure pass that auto-builds the .exe on tag push instead of from the maintainer's machine. No new user-facing features.
+Hotfix. v1.7.15's first live exercise of the rename-dance updater (introduced in v1.7.13) failed because GitHub had migrated the release-asset CDN to a domain not in the hardcoded allowlist. The update-available dialog also had a clipped button row. Both fixed.
 
-## Highlights
+## What's fixed
 
-- **CI-built releases.** From v1.7.15 onward the `displayoff.exe` + `SHA256SUMS.txt` you download are produced by `.github/workflows/release.yml` on a `windows-latest` runner — not on the maintainer's machine. SHA-transparency: the manifest is computed from bytes the runner just built. Action pins are full commit SHAs per the workspace supply-chain baseline.
-- **`tray_promoter.sweep_stale_entries` is now wired up under freeze.** Cleans `NotifyIconSettings` cruft from prior `displayoff.exe` install locations (relevant if you've ever moved the `.exe` between folders). Guarded so `.py` source mode skips entirely.
-- **In-memory dedupe** for the frozen-first-launch promotion ping. Defends against any future code path re-invoking `_frozen_promote_ping` from the same process. Same-session double-fire previously possible (only theoretical — no current re-entry path) is now impossible.
-- **`_TRAY_SETTLE_SECS = 1.0` constant** extracted so the first-run welcome notification's settle window and the promote-ping's settle window stay coupled across future timing changes.
-- **Rename-dance step numbering reconciled** between code and the v1.7.13 CHANGELOG (9-step framing now used in both).
-- **Build script comments** carry a version-check timeline for the Nuitka `--onefile-no-compression` workaround. As of 2026-05-21 (v1.7.15), Nuitka latest is still 4.1.1, py3.14 zstd fix has not shipped, flag stays.
+- **Self-updater works again** — added `release-assets.githubusercontent.com` to the update-host allowlist. GitHub migrated the release-asset CDN from `objects.githubusercontent.com` to the new host over 2025; the hardcoded allowlist hadn't caught up. v1.7.13 / v1.7.14 / v1.7.15 all carried this latent bug — it only surfaced when v1.7.15 was the first release to have ANOTHER release (this one) to update to. The legacy `objects.githubusercontent.com` is still in the list for any older release whose URLs were baked before the migration.
+- **Update-available dialog button row no longer clips.** Middle button label shortened to "Releases page" (was "Open releases page") so the three-button row fits the dialog at default DPI. `_themed_dialog` now also floors the dialog's geometry width to the button row's required width as a defense against future widening.
 
-## Verifier round
+## Upgrade path
 
-6-agent normal-stakes round (3 topics × Sonnet+Opus): T1 Diff-clean, T2 Gap-audit, T3 Code-review. Convergent findings applied before tag: stale "step 5" references in `_write_update_relaunch_state` (now "step 7"), stale `tray_promoter.sweep_stale_entries` docstring assertion ("NOT INVOKED FROM DISPLAYOFF" → "invoked from displayoff under freeze v1.7.15+"), narrow `try/except Exception` around the sweep call (defense-in-depth — the function already wraps registry I/O internally), `build-release.sh` "Next steps" banner now points at the CI flow rather than `gh release upload`, CHANGELOG wording precision on `_PING_FIRED_THIS_PROCESS` semantics (set after successful `icon.notify()`, with explicit Focus-Assist-suppresses-toast-but-`notify`-still-returns-OK note).
+If you're running v1.7.14 or v1.7.15, click Settings → Check for updates → Install now. The dance should work end-to-end this time. If it doesn't, the "Releases page" fallback button opens this page in your browser for manual download.
 
-## Known disclaimers
+If you're on the .py source channel, no action needed — the dance only applies to the frozen `.exe`.
 
-- **The rename-dance still has no live end-to-end exercise.** v1.7.13 was the first .exe (nothing to update FROM). v1.7.14 was a same-day patch (also no real update flow). v1.7.15 is the first release that *could* exercise the dance — a user on v1.7.13 or v1.7.14 clicking "Install now" against this release is the test cohort. Worst-case failure is "user has to manually re-download from this page"; the next-launch recovery path (`_recover_from_failed_update`) cleans up partial-state artifacts automatically.
-- **Persistent `save_config` failure under read-only `%APPDATA%`** still re-fires the promotion toast every launch. In-memory dedupe added in v1.7.15 fixes the same-session case; the cross-launch case requires write access somewhere on disk and is acceptable as documented (rare, benign — one extra toast per launch, no functional impact).
+## What this exposes
+
+v1.7.16 is the third-time's-the-charm for the rename-dance:
+
+- **v1.7.13** — dance code shipped, no version to update FROM.
+- **v1.7.14** — same-day patch on the dance's first-launch promotion ping; still no real update flow exercised.
+- **v1.7.15** — dance live-but-broken-at-GitHub-end. First live attempt failed at the URL allowlist.
+- **v1.7.16** — dance live-and-fixed. The v1.7.15 release brief explicitly deferred the sandbox-style end-to-end test; that deferral was the actual root cause of this hotfix. A 5-minute sandbox run would have caught the CDN-domain change before users did.
 
 Full changelog: see `CHANGELOG.md`.

@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.15"
+__version__ = "1.7.16"
 
 log = logging.getLogger("displayoff")
 
@@ -1642,6 +1642,16 @@ _RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 #     have to allowlist it for the download fetch to succeed.
 _ALLOWED_UPDATE_HOSTS = (
     "https://github.com/itsnateai/",
+    # GitHub migrated the release-asset CDN from
+    # objects.githubusercontent.com → release-assets.githubusercontent.com
+    # over 2025. The current canonical redirect target (verified
+    # 2026-05-21 against a freshly-uploaded v1.7.15 asset) is
+    # release-assets.githubusercontent.com — the JWT inside the signed
+    # URL even names it explicitly via the `aud` claim. The legacy host
+    # stays in the list for any older release whose asset URLs were
+    # baked before the migration (defensive — both may coexist for some
+    # time and the SHA256 verification is the actual integrity boundary).
+    "https://release-assets.githubusercontent.com/",
     "https://objects.githubusercontent.com/",
 )
 
@@ -1852,12 +1862,27 @@ def _download_url_allowed(url):
       - host `github.com` ONLY for paths under `/itsnateai/displayoff/`
         (NOT all itsnateai repos — a future `itsnateai/other` release
         could otherwise impersonate displayoff)
-      - host `objects.githubusercontent.com` for any path (GitHub's
-        S3-backed asset CDN doesn't expose per-repo scoping in URLs;
-        the SHA256 verification is the actual integrity boundary here)
+      - host `release-assets.githubusercontent.com` for any path
+        (GitHub's current Azure-Blob-backed asset CDN — migrated from
+        objects.githubusercontent.com over 2025. The SHA256 verification
+        is the actual integrity boundary; the host check just keeps the
+        redirect chain inside known GitHub infra.)
+      - host `objects.githubusercontent.com` for any path (the legacy
+        asset CDN — kept for any older release whose asset URLs were
+        baked before the migration. Defensive — both may coexist for
+        some time.)
 
     Case-insensitive on scheme + netloc (RFC 3986 §3.1/3.2.2 — both are
     case-insensitive); path is exact-prefix per HTTP semantics.
+
+    v1.7.16 hotfix: added `release-assets.githubusercontent.com` after
+    the v1.7.14 → v1.7.15 in-the-wild rename-dance attempt failed with
+    `urlopen error redirect target not in allowlist:
+    'https://release-assets.githubusercontent.com/...'`. The dance was
+    silently broken since v1.7.13 because nobody had exercised it
+    end-to-end until v1.7.15 shipped. This is the load-bearing case for
+    why a real-world live test belongs in the release gate — the
+    8-agent code review couldn't catch a GitHub-end CDN-domain change.
 
     Returns False for empty/None/malformed URLs.
     """
@@ -1873,6 +1898,8 @@ def _download_url_allowed(url):
     netloc_low = parts.netloc.lower()
     if netloc_low == "github.com":
         return parts.path.startswith("/itsnateai/displayoff/")
+    if netloc_low == "release-assets.githubusercontent.com":
+        return True
     if netloc_low == "objects.githubusercontent.com":
         return True
     return False
@@ -2422,7 +2449,20 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
     # Center on parent (or screen if no parent geometry) before the alpha-mask
     # deiconify pattern (matches Settings + About).
     dlg.update_idletasks()
-    w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+    # v1.7.16 defense: ensure the dialog is at least wide enough for the
+    # button row. v1.7.13-v1.7.15 used wraplength=460 on the body Label,
+    # which caps the body's natural width — but a body whose actual text
+    # wraps narrower than the button row would let the dialog inherit
+    # that narrower width and clip long button labels. (Live update flow
+    # in v1.7.15 surfaced this: a 3-button "Install now / Open releases
+    # page / Cancel" row clipped the middle button.) Compute the button
+    # row's required width and floor the dialog's width to it + chrome
+    # margin. winfo_reqwidth includes Tk's padding from pack(padx=...).
+    btn_row_w = btn_frame.winfo_reqwidth()
+    body_w = body.winfo_reqwidth()
+    chrome_margin = 40  # rough Toplevel chrome + Tk's pack padding budget
+    min_dialog_w = max(body_w, btn_row_w + chrome_margin)
+    w, h = max(dlg.winfo_reqwidth(), min_dialog_w), dlg.winfo_reqheight()
     try:
         px = parent.winfo_rootx() + max((parent.winfo_width() - w) // 2, 0)
         py = parent.winfo_rooty() + max((parent.winfo_height() - h) // 2, 0)
@@ -3315,11 +3355,11 @@ def _run_rename_dance_flow(parent_root, assets, latest):
                 f"{title}\n\n{detail}\n\n"
                 "You can open the release page manually to download v"
                 f"{latest} yourself.",
-                buttons=("Open releases page", "Cancel"),
+                buttons=("Releases page", "Cancel"),
                 default_idx=0,
                 kind="error",
             )
-            if btn == "Open releases page":
+            if btn == "Releases page":
                 _open_url(_GITHUB_RELEASES_URL)
         except _tk_local.TclError:
             log.error("Update error: %s — %s (parent window closed before "
@@ -3455,6 +3495,14 @@ def _run_update_check(parent_root):
                 # when running from source, or when the release predates the
                 # .exe asset (e.g., v1.7.12 viewed from a v1.7.13 client).
                 if _can_use_rename_dance(assets):
+                    # v1.7.16: button labels shortened so the three-button
+                    # row fits the dialog width at default DPI scaling.
+                    # v1.7.13-v1.7.15 used "Open releases page" (18 chars)
+                    # which clipped on the live update-flow at 100% scaling
+                    # (and worse under 125%+). "Releases page" (13 chars)
+                    # renders cleanly. The body prose still refers to it
+                    # by the full functional name for accessibility/clarity
+                    # — only the button label changed.
                     btn = _themed_dialog(
                         parent_root,
                         "Display Off — Update available",
@@ -3464,8 +3512,8 @@ def _run_update_check(parent_root):
                         "Install now will download the new build, verify its\n"
                         "SHA256 against the published manifest, replace the\n"
                         "running .exe, and relaunch.\n\n"
-                        "Open releases page lets you download manually.",
-                        buttons=("Install now", "Open releases page", "Cancel"),
+                        "Releases page lets you download manually instead.",
+                        buttons=("Install now", "Releases page", "Cancel"),
                         default_idx=0,
                         kind="info",
                     )
@@ -3475,7 +3523,7 @@ def _run_update_check(parent_root):
                         # error dialog back via parent_root.after — nothing
                         # more to do here.
                         return
-                    if btn == "Open releases page":
+                    if btn == "Releases page":
                         if html_url and html_url.startswith("https://github.com/"):
                             _open_url(html_url)
                         else:

@@ -32,7 +32,7 @@ REM files alongside (no extraction step). We use --onefile so the install is
 REM a single file the rename-dance updater can swap atomically.
 
 setlocal
-set VERSION=1.7.15
+set VERSION=1.7.16
 set VERSION_FOUR=%VERSION%.0
 
 REM Embed the icon as a Windows resource (--windows-icon-from-ico) AND bundle
