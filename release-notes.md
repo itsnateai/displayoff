@@ -16,7 +16,7 @@ v1.7.20 is the **final planned release**. Maintenance-only mode after this — n
 
 ### C. Build + release hygiene
 
-- **`release.yml` permissions tightened.** Workflow root is `contents: read`; only the `softprops/action-gh-release` upload step has `contents: write`. Least-privilege model — every other step (checkout, install, build) runs read-only.
+- **`release.yml` permissions tightened.** Workflow root is `contents: read`; the `build-windows-exe` job (which contains the `softprops/action-gh-release` upload step) gets `contents: write` at the job level. Least-privilege model — no other job (current or future) inherits write access. (A first-pass tried step-level `permissions:` which GitHub Actions silently ignores; the multi-agent verifier round caught it before tag.)
 - **Post-upload CDN redirect-host smoke test in CI.** Curls the uploaded asset URL, follows redirects, asserts the final host matches one of the three values in `_download_url_allowed`'s allowlist. If GitHub silently swaps the CDN host again (the way they did when `release-assets.githubusercontent.com` landed mid-2025 and broke our updater), the next release CI run fails BEFORE the broken build ships to users.
 - **`objects-origin.githubusercontent.com` added to the in-app update allowlist.** Forward-compat defense for the same CDN-migration risk #8 catches at the CI layer.
 - **`_UPDATE_MIN_EXE_SIZE = 1 MB` → `40 MB`.** Real `.exe` is ~55 MB. 1 MB floor only caught 200-OK HTML error pages; 40 MB catches mis-shipped stub builds too. Loosen if a future Nuitka zstd-compression unlock lands and shrinks the real exe to ~20 MB.

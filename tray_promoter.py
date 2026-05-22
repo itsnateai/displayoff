@@ -125,10 +125,10 @@ def sweep_stale_entries(our_exe_name, current_exe_path):
     template-copier passing it would tag the wrong path. `_EXE_PATH`
     is the resolved on-disk path (None under .py source — fall through
     to sys.executable in that case). The actual displayoff call site
-    at `displayoff.py:4296` already does this correctly via an outer
-    `if _is_frozen() and _EXE_PATH:` guard around the call; this is
-    purely a docstring example correction so template-copiers without
-    the surrounding guard get the right pattern.
+    in `run_tray()` (search for `sweep_stale_entries(our_exe_name="displayoff.exe"`)
+    already does this correctly via an outer `if _is_frozen() and _EXE_PATH:`
+    guard around the call; this is purely a docstring example correction so
+    template-copiers without the surrounding guard get the right pattern.
 
     Conservative — only touches entries that:
       (a) have ExecutablePath populated (skips orphans / sparse subkeys),

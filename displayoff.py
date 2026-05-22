@@ -154,14 +154,21 @@ def _path_under_temp(path):
 
 def _path_under_protected(path):
     """True if `path` lives under a Windows-protected location the resolver
-    must never target. v1.7.20: closes the WindowsApps Store-stub attack
-    vector documented in CHANGELOG v1.7.19 — `%LOCALAPPDATA%\\Microsoft\\
-    WindowsApps\\` survived `_path_under_temp` because it isn't a temp
-    dir, but writing a `.exe` there is forbidden (the reparse-point
-    stubs are owned by the Store) AND the resolver hitting that dir
-    would mean an attacker steered argv[0] at a Store stub.
+    must never target. Covers:
+      - `%LOCALAPPDATA%\\Microsoft\\WindowsApps\\` (Store reparse-point
+        stubs; v1.7.20 original closure)
+      - `%SystemRoot%\\System32\\` and `%SystemRoot%\\SysWOW64\\` (kernel-
+        owned binaries; v1.7.20 verifier-convergent T2-Sonnet + T2-Opus)
+      - `%ProgramFiles%`, `%ProgramFiles(x86)%` (admin-installed apps;
+        ACLs would block writes anyway but rejecting up front prevents
+        partway-through-the-dance failures)
+      - `%ProgramData%` (machine-wide app data; same rationale)
+    A malicious argv[0] pointing at any of these would force the rename-
+    dance to attempt `os.rename(current, old)` on a path the current user
+    can't write — failing mid-step with a confusing ACL error. Rejecting
+    up front gives a clean "manual install required" log path instead.
     Symmetric resolution (realpath + normcase) with `_path_under_temp`
-    so junctions/symlinks/8.3 names compare equal."""
+    so junctions/symlinks/8.3 short-names compare equal."""
     if not path:
         return False
     try:
@@ -174,6 +181,15 @@ def _path_under_protected(path):
         protected_candidates.append(
             os.path.join(local_appdata, "Microsoft", "WindowsApps")
         )
+    # v1.7.20 verifier-convergent expansion: kernel + admin-installed dirs.
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if system_root:
+        protected_candidates.append(os.path.join(system_root, "System32"))
+        protected_candidates.append(os.path.join(system_root, "SysWOW64"))
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
+        v = os.environ.get(env_var)
+        if v:
+            protected_candidates.append(v)
     for raw in protected_candidates:
         try:
             p = os.path.normcase(os.path.realpath(raw))
@@ -581,14 +597,23 @@ def _migrate_legacy_data():
             # the file forever. The hash-verify gate makes the second pass
             # detect partial copies and re-do them cleanly.
             #
-            # v1.7.20 verifier T3-Sonnet H2: hash src BEFORE copy2, not
-            # after. The files being migrated include `displayoff.log`,
-            # which is written by an active RotatingFileHandler in the
-            # same process. A post-copy hash of src would read bytes that
-            # may have been appended between the copy and the read,
-            # producing a spurious mismatch that triggers a retry loop.
-            # Pre-copy hashing locks the comparison to "the bytes that
-            # were on disk at the moment we started the copy".
+            # v1.7.20 verifier-convergent H2 + T3-Sonnet I1 correction:
+            # hash src BEFORE copy2, not after. The post-fix-verifier T3-
+            # Sonnet noted the original "RotatingFileHandler active in
+            # this process" rationale is factually wrong at first launch
+            # — `_migrate_legacy_data` runs BEFORE `basicConfig`, so no
+            # handler is attached yet when the loop fires. The hash-
+            # before-copy ordering still matters for two real scenarios:
+            #   (a) concurrent reader/writer in ANOTHER process (e.g., a
+            #       native_blank.py invocation running parallel to the
+            #       tray's startup writes to displayoff.log via its own
+            #       handler) — pre-copy hash captures a stable snapshot.
+            #   (b) future refactor that moves the call site to AFTER
+            #       basicConfig — keeps the H2 defense intact under that
+            #       refactor without the retry-loop foot-gun.
+            # SHA256 verification on dst still catches truncated writes
+            # / disk errors / NTFS junction surprises that show up as
+            # bytes-on-disk-differ-from-bytes-just-written.
             src_hash = _sha256_file(src)
             shutil.copy2(src, dst)
             if src_hash != _sha256_file(dst):
@@ -2425,30 +2450,35 @@ def _download_url_allowed(url):
         return False
     if parts.scheme.lower() != "https":
         return False
-    # v1.7.20 traversal rejection (two-layer, per verifier-round convergent
-    # finding from T1-Sonnet + T1-Opus + T3-Opus):
+    # v1.7.20 traversal rejection (per verifier-round convergent finding from
+    # T1-Sonnet + T1-Opus + T3-Opus, plus post-fix T2-Sonnet + T2-Opus
+    # percent-encoding gap):
     #
-    #   Layer 1: reject any RAW path containing a literal `..` segment.
-    #            `os.path.normpath` COLLAPSES `..` segments, so a `/../` check
-    #            on the normalized path is dead code — by the time normpath
-    #            runs, the traversal has already been canonicalized away.
-    #            The raw-path check on the un-normalized `parts.path` catches
-    #            the attack pattern before it gets collapsed.
+    #   Layer 0: percent-decode the URL path. `urlsplit` does NOT decode
+    #            percent-encoded characters, so `%2e%2e` would pass the raw-
+    #            segment `..` check and the normpath check (normpath also
+    #            doesn't decode). `urllib.parse.unquote` decodes `%2e` → `.`
+    #            and other RFC 3986 percent-encoded sequences before our
+    #            traversal-detection runs.
+    #   Layer 1: reject any DECODED path containing a literal `..` segment
+    #            (split on forward slash AFTER backslash-rewrite). Catches
+    #            both literal `..` and decoded `%2e%2e`.
     #   Layer 2: do the `github.com` prefix check against the NORMALIZED
-    #            path, not the raw path. The raw check `parts.path.startswith
-    #            ("/itsnateai/displayoff/")` is satisfiable via
-    #            `/itsnateai/displayoff/../other-repo/...` (literal prefix
-    #            present), but the normalized form is `/itsnateai/other-repo/`
-    #            and correctly fails the prefix check.
+    #            decoded path. Layer 1 should already reject anything that
+    #            would change the prefix; Layer 2 is belt-and-suspenders.
     #
     # SHA256 verification is still the integrity boundary; this defense is
     # belt-and-suspenders so the host-allowlist's documented promise actually
-    # holds. Layer 1 also rejects encoded variants like `.\.\` and `\.\.`
-    # since they normalize to the same canonical form.
-    raw_segments = parts.path.replace("\\", "/").split("/")
+    # holds. After Layer 0 + Layer 1, the `startswith("/..")` /
+    # `"/../" in normalized_path` checks at Layer 2's threshold can never
+    # fire (normpath collapses `..` segments away). They stay as a defensive
+    # tripwire — a future refactor that removes Layer 1 without adding an
+    # equivalent guard would still get caught by the dead Layer 2 check.
+    decoded_path = urllib.parse.unquote(parts.path)
+    raw_segments = decoded_path.replace("\\", "/").split("/")
     if ".." in raw_segments:
         return False
-    normalized_path = os.path.normpath(parts.path).replace("\\", "/")
+    normalized_path = os.path.normpath(decoded_path).replace("\\", "/")
     if normalized_path.startswith("/..") or "/../" in normalized_path:
         return False
     netloc_low = parts.netloc.lower()
