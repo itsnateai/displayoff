@@ -35,13 +35,44 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.12"
+__version__ = "1.7.13"
 
 log = logging.getLogger("displayoff")
 
+
+# ── Freeze-mode detection ─────────────────────────────────────────────────
+# v1.7.13 ships a single-file `displayoff.exe` built by Nuitka onefile
+# (--onefile + --windows-icon-from-ico + --include-data-files). The .py
+# source still works as a parallel distribution channel — both modes share
+# the same logic, dispatched on freeze-mode detection.
+#
+#   - Nuitka onefile: sets the `__compiled__` module attr at compile time,
+#     bootloader extracts to a per-launch temp dir, `sys.executable` is the
+#     on-disk .exe, `__file__` points into the temp extraction dir.
+#   - PyInstaller onefile (defensive — we don't ship this, but the helper
+#     stays correct if someone builds with PyInstaller for testing): sets
+#     `sys.frozen = True` and exposes `sys._MEIPASS` (temp extract dir).
+#   - .py source: neither sentinel is set, `sys.executable` is the Python
+#     interpreter (python.exe / pythonw.exe), `__file__` is the script.
+#
+# Two distinct directories under freeze:
+#   _HERE        — bundle's temp extraction dir (where displayoff.ico and
+#                  imported modules land at launch; transient, per-run).
+#                  Pystray's Image.open(_ICON_PATH) reads from here.
+#   _INSTALL_DIR — on-disk dir containing the .exe itself (persistent
+#                  across launches). The autostart .lnk's WorkingDirectory
+#                  and the rename-dance update flow both target this.
+#
+# Both collapse to the script dir under .py source. The split only matters
+# when frozen, but the resolver works in both modes so call sites stay
+# single-code-path.
+def _is_frozen():
+    return getattr(sys, "frozen", False) or "__compiled__" in globals()
+
+
 # ── Paths ──────────────────────────────────────────────────────────────────
-# _HERE = script directory. Holds repo-tracked assets (the icon) which travel
-# with the install and are never written to at runtime.
+# See the freeze-mode block above for why _HERE and _INSTALL_DIR can
+# differ under one-file freezers.
 # _DATA_DIR = per-user state (%APPDATA%\displayoff\). Holds config, logs,
 # crash-recovery sentinel — anything the running process writes. Split since
 # v1.7.9 so a shared install (e.g. one clone under Program Files used by two
@@ -51,6 +82,9 @@ log = logging.getLogger("displayoff")
 # autostart section below — both use the same `APPDATA` env var, so when the
 # fallback to _HERE fires here it also fires for autostart).
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_EXE_PATH = os.path.abspath(sys.executable) if _is_frozen() else None
+_INSTALL_DIR = (os.path.dirname(_EXE_PATH) if _EXE_PATH
+                else os.path.dirname(os.path.abspath(__file__)))
 _DATA_DIR = (os.path.join(os.environ.get("APPDATA", ""), "displayoff")
              if os.environ.get("APPDATA") else _HERE)
 _ICON_PATH = os.path.join(_HERE, "displayoff.ico")
@@ -130,6 +164,19 @@ def _migrate_legacy_data():
         "native_blank.log.1", "native_blank.log.2", "native_blank.log.3",
         ".native_blank_in_progress.json",
     ]
+    # v1.7.13: track per-file recoverable failures so we DON'T set the
+    # short-circuit flag when a retry could succeed. v1.7.12 unconditionally
+    # set _MIGRATED = True after the loop — meaning a file locked by AV
+    # mid-launch (the AV scanner momentarily holding the source file open)
+    # would be permanently skipped for the lifetime of the process even
+    # though a retry 30 seconds later would have succeeded. Surfaced by T2
+    # Sonnet+Opus round 5 verifiers (convergent).
+    #
+    # "Benign races" (dst already exists post-failure — concurrent launcher
+    # won) DON'T count as recoverable: the work is done, just by someone
+    # else. Only true OSErrors with no destination materialization stop the
+    # flag from being set.
+    had_recoverable_failure = False
     for name in legacy_names:
         src = os.path.join(_HERE, name)
         dst = os.path.join(_DATA_DIR, name)
@@ -165,12 +212,16 @@ def _migrate_legacy_data():
                 _MIGRATION_LOG.append(
                     f"could not migrate {src!r} -> {dst!r}: {e}"
                 )
-    # Mark the migration complete regardless of per-file failures — any
-    # source file still in _HERE after this point either failed to move
-    # (logged above) or didn't exist to begin with. A retry on next call
-    # would replay the same loop with the same outcome; the flag spares
-    # the syscalls.
-    _MIGRATED = True
+                had_recoverable_failure = True
+    # Mark the migration complete only when no recoverable failures
+    # occurred — that way a transient lock (AV scan, OneDrive in-progress
+    # sync) doesn't permanently strand a file in _HERE. A future invocation
+    # of _migrate_legacy_data() re-runs the loop, which re-discovers the
+    # un-moved file and retries the shutil.move. Permanent failures (e.g.
+    # _HERE is read-only) still pay the existence-check cost per call, but
+    # those are rare and the per-call cost is small (~5 stat syscalls).
+    if not had_recoverable_failure:
+        _MIGRATED = True
 
 # ── Single-instance guard ──────────────────────────────────────────────────
 # Local\ scope = per-session. Each Windows user gets their own instance,
@@ -334,11 +385,48 @@ if sys.platform == "win32":
     except OSError:
         _shcore = None
 
-    # SetProcessDpiAwarenessContext is a Win10 1607+ symbol on user32.dll;
-    # SetProcessDPIAware exists on every Windows back to Vista. Both are
-    # resolved lazily inside _set_dpi_awareness via getattr — they're
-    # rarely-called and the AttributeError fallback chain is part of the
-    # API contract here (older Windows = quieter DPI awareness).
+    # uxtheme.dll provides ordinal-only exports for dark-mode native menus
+    # (SetPreferredAppMode = ordinal 135, FlushMenuThemes = ordinal 136).
+    # These are private/undocumented Win10 1903+ APIs but have been stable
+    # through Win11 25H2. v1.7.13: converted from `ctypes.windll.uxtheme`
+    # raw lookup to a bound WinDLL with use_last_error=True so any future
+    # GetLastError consultation reads the intended thread-local rather than
+    # an unrelated syscall's stale value. Ordinal lookup (`_uxtheme[135]`)
+    # works the same on bound and raw WinDLL objects.
+    try:
+        _uxtheme = ctypes.WinDLL("uxtheme", use_last_error=True)
+    except OSError:
+        _uxtheme = None
+
+    # DPI awareness function declarations. v1.7.13: moved here from inside
+    # _set_dpi_awareness so the argtypes/restype mutation happens once at
+    # module load rather than every call. v1.7.12 set these on the function
+    # object inside the function body — idempotent (function called once
+    # at startup) but technically a shared-state mutation; the bindings-
+    # block pattern exists precisely to keep these immutable. Each tier is
+    # guarded with try/AttributeError so missing symbols on older Windows
+    # leave the corresponding bound name as None.
+    try:
+        _SetProcessDpiAwarenessContext = _user32.SetProcessDpiAwarenessContext
+        _SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        _SetProcessDpiAwarenessContext.restype = ctypes.wintypes.BOOL
+    except AttributeError:
+        _SetProcessDpiAwarenessContext = None
+    if _shcore is not None:
+        try:
+            _SetProcessDpiAwareness = _shcore.SetProcessDpiAwareness
+            _SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+            _SetProcessDpiAwareness.restype = ctypes.c_long
+        except AttributeError:
+            _SetProcessDpiAwareness = None
+    else:
+        _SetProcessDpiAwareness = None
+    try:
+        _SetProcessDPIAware = _user32.SetProcessDPIAware
+        _SetProcessDPIAware.argtypes = []
+        _SetProcessDPIAware.restype = ctypes.wintypes.BOOL
+    except AttributeError:
+        _SetProcessDPIAware = None
 
     _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     OpenProcessToken = _advapi32.OpenProcessToken
@@ -373,6 +461,10 @@ else:
     OpenProcess = None
     OpenProcessToken = None
     GetTokenInformation = None
+    _uxtheme = None
+    _SetProcessDpiAwarenessContext = None
+    _SetProcessDpiAwareness = None
+    _SetProcessDPIAware = None
 
 # Win32 wait-result sentinels
 _WAIT_OBJECT_0 = 0x00000000
@@ -551,6 +643,38 @@ def _autostart_target_pythonw():
     return py
 
 
+def _autostart_target():
+    """Resolve (target, arguments, working_dir, icon_location) for the
+    Startup-folder .lnk.
+
+    Returns a 4-tuple suitable for direct interpolation into the PowerShell
+    `WScript.Shell` script that creates the shortcut. Two modes:
+
+      - Frozen (v1.7.13+ .exe): `displayoff.exe` is self-contained, takes no
+        startup args (run_tray is the default behavior), and carries its own
+        icon as embedded Windows resource — IconLocation references the .exe
+        with resource index 0. WorkingDirectory is the .exe's install dir.
+
+      - Source (.py): `pythonw.exe` launches the script. Arguments is the
+        quoted absolute path to displayoff.py. WorkingDirectory is the script
+        dir. IconLocation is the on-disk displayoff.ico bundled with the
+        repo.
+
+    Keeping the dispatch in one helper means `_create_startup_lnk` and
+    `autostart_enabled` always reconcile against the same expected target —
+    a v1.7.12 source-mode .lnk auto-refreshes to point at the new .exe the
+    next time the user toggles autostart from the frozen build.
+    """
+    if _is_frozen():
+        exe = _EXE_PATH
+        return exe, "", _INSTALL_DIR, f"{exe},0"
+    py = _autostart_target_pythonw()
+    script = os.path.abspath(__file__)
+    working_dir = os.path.dirname(script)
+    icon_path = os.path.join(working_dir, "displayoff.ico")
+    return py, f'"{script}"', working_dir, f"{icon_path},0"
+
+
 def _ps_sq_escape(s):
     """Escape a string for embedding inside a PowerShell single-quoted literal.
     PS single-quotes are literal-preserving for everything EXCEPT the single
@@ -619,42 +743,35 @@ def _create_startup_lnk():
     if sys.platform != "win32":
         raise OSError("startup-folder shortcut is Windows-only")
     _require_appdata()
-    script = os.path.abspath(__file__)
-    py = _autostart_target_pythonw()
-    working_dir = os.path.dirname(script)
-    icon_path = os.path.join(working_dir, "displayoff.ico")
+    target, arguments, working_dir, icon_location = _autostart_target()
 
     # Escape EVERY interpolated value for the PS single-quoted-literal context.
     # PS single-quotes preserve backslashes but treat `'` as terminator — paths
     # with apostrophes (legal NTFS: `C:\Users\O'Brien\...`) would otherwise
     # break the script or inject arbitrary PS. `_ps_sq_escape` doubles every
-    # `'` per PS literal rules. The Arguments field's content also gets
-    # escaped because the inner double-quotes wrap a value that goes into a
-    # *different* PS string parser (verified by code review 2026-05-14).
+    # `'` per PS literal rules. The Arguments field's content (under source
+    # mode it's `"<script_path>"`) gets a DQ escape FIRST so embedded `"` in
+    # the path survive the inner double-quote parser, THEN the SQ escape so
+    # embedded `'` survive the outer single-quote parser. Under frozen mode
+    # `arguments` is empty, so both escapes pass it through unchanged.
     lnk_q = _ps_sq_escape(_STARTUP_LNK_PATH)
-    py_q = _ps_sq_escape(py)
-    # script_q is embedded inside `'"{script_q}"'` — the OUTER context is PS
-    # single-quote (so `'` must be doubled), the INNER content is wrapped in
-    # double-quotes that the .lnk records literally (so any `"` in the path
-    # must also be doubled to survive PS DQ-parser semantics). Apply BOTH
-    # escapes; order matters only in that we treat them as independent
-    # character-class substitutions, which is what these helpers do.
-    script_q = _ps_dq_escape(_ps_sq_escape(script))
+    target_q = _ps_sq_escape(target)
+    arguments_q = _ps_sq_escape(_ps_dq_escape(arguments))
     wd_q = _ps_sq_escape(working_dir)
-    icon_q = _ps_sq_escape(icon_path)
+    icon_q = _ps_sq_escape(icon_location)
     ps_script = (
         f"$sh = New-Object -ComObject WScript.Shell; "
         f"$lnk = $sh.CreateShortcut('{lnk_q}'); "
-        f"$lnk.TargetPath = '{py_q}'; "
-        f"$lnk.Arguments = '\"{script_q}\"'; "
+        f"$lnk.TargetPath = '{target_q}'; "
+        f"$lnk.Arguments = '{arguments_q}'; "
         f"$lnk.WorkingDirectory = '{wd_q}'; "
-        f"$lnk.IconLocation = '{icon_q},0'; "
+        f"$lnk.IconLocation = '{icon_q}'; "
         f"$lnk.WindowStyle = 7; "
         f"$lnk.Description = 'Display Off - tray app autostart'; "
         f"$lnk.Save()"
     )
 
-    log.info("Creating startup shortcut: target=%s args=%s lnk=%s", py, script, _STARTUP_LNK_PATH)
+    log.info("Creating startup shortcut: target=%s args=%s lnk=%s", target, arguments, _STARTUP_LNK_PATH)
     proc = _ps_run(ps_script)
     if proc.returncode != 0:
         raise OSError(f"Could not create startup shortcut (PowerShell rc={proc.returncode}): "
@@ -815,9 +932,11 @@ def autostart_enabled():
 
     Checks (in order):
       1. Startup-folder .lnk exists AND its TargetPath matches our current
-         `_autostart_target_pythonw()` — a stale .lnk pointing at a moved
-         or uninstalled Python is treated as "not enabled" so the next
-         Save re-creates it correctly.
+         expected target — a stale .lnk pointing at a moved/uninstalled
+         Python interpreter (source-mode .lnk after a Python upgrade) OR a
+         pythonw.exe target from a previous source-mode install (v1.7.12 or
+         earlier) when we're now running as the frozen .exe (v1.7.13+) is
+         treated as "not enabled" so the next Save re-creates it correctly.
       2. Legacy HKCU\\...\\Run\\DisplayOff entry (v1.6.0 and earlier) —
          either being present is "enabled" for migration purposes.
 
@@ -827,16 +946,19 @@ def autostart_enabled():
     if not _STARTUP_LNK_PATH:
         return False
     if os.path.exists(_STARTUP_LNK_PATH):
-        # Validate the target matches our current Python install. If it
-        # doesn't, the .lnk is stale (e.g., Python upgraded from 3.13 to
-        # 3.14 and the old path doesn't exist anymore) — don't claim
-        # "enabled" when the .lnk wouldn't actually launch us at logon.
+        # Validate the target matches our current expected launcher. If it
+        # doesn't, the .lnk is stale — covers two cases:
+        #   - source-mode Python upgraded (3.13 → 3.14) and the old path is
+        #     gone, so the .lnk wouldn't actually launch us at logon
+        #   - we're the frozen v1.7.13+ .exe but the .lnk still points at
+        #     a v1.7.12-era pythonw.exe + script combo; toggle Save will
+        #     re-point it
         target = _read_lnk_target_path()
         if target is None:
             # Couldn't read it — assume valid and let the user reconcile
             # via a manual Save toggle if it turns out to be broken.
             return True
-        expected = _autostart_target_pythonw()
+        expected, _, _, _ = _autostart_target()
         # Use `realpath` not `abspath` — `realpath` resolves NTFS junctions,
         # symlinks, and 8.3 short names (`C:\PROGRA~1\...` ↔ `C:\Program
         # Files\...`). `WScript.Shell` sometimes returns the long form,
@@ -847,7 +969,7 @@ def autostart_enabled():
         # then lower-cases for case-insensitive NTFS matching.
         if _normalize_path(target) == _normalize_path(expected):
             return True
-        log.info("Stale startup shortcut: target=%r but current Python is %r — "
+        log.info("Stale startup shortcut: target=%r but current launcher is %r — "
                  "treating as 'not enabled' so next Save re-creates it.",
                  target, expected)
         return False
@@ -1481,6 +1603,53 @@ _GITHUB_REPO_URL = f"https://github.com/{_GITHUB_REPO}"
 _GITHUB_RELEASES_URL = f"{_GITHUB_REPO_URL}/releases"
 _RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 
+# ── Update host allowlist (HARDCODED — never config-driven) ────────────────
+# Validated as a prefix match (case-insensitive) against any URL the
+# rename-dance updater is about to fetch. Never read from config or env: a
+# config-driven allowlist becomes admin-elevation bait — poison the config,
+# poison the updater. Both entries cover the GitHub releases delivery path:
+#   - github.com/itsnateai/<repo>/releases/download/<tag>/<name>
+#     is the canonical URL the API returns in assets[].browser_download_url
+#     and what users see in their browser.
+#   - objects.githubusercontent.com/...?token=...
+#     is where the github.com URL above redirects (S3-backed asset host with
+#     a short-lived signed token). urllib follows that redirect by default,
+#     so even though we never see this host in the JSON response we still
+#     have to allowlist it for the download fetch to succeed.
+_ALLOWED_UPDATE_HOSTS = (
+    "https://github.com/itsnateai/",
+    "https://objects.githubusercontent.com/",
+)
+
+# Release-asset filenames the rename-dance expects. Static across versions
+# so v1.7.13 can recognize a v1.7.14 release without per-version updates.
+# The asset name comparison is exact — `displayoff_v1.7.14.exe` would NOT
+# match `displayoff.exe`.
+_UPDATE_EXE_NAME = "displayoff.exe"
+_UPDATE_MANIFEST_NAME = "SHA256SUMS.txt"
+
+# Filenames for the rename-dance intermediates. Live alongside the running
+# displayoff.exe in _INSTALL_DIR. `<exe>.tmp` is the freshly-downloaded
+# replacement during the dance. `<exe>.old` is the pre-dance backup that the
+# `--after-update` child deletes once it confirms the new build runs.
+_UPDATE_TMP_SUFFIX = ".tmp"
+_UPDATE_OLD_SUFFIX = ".old"
+
+# Relaunch-mode persistence: step 5 of the dance writes this file with the
+# new-version string + the launch mode (currently always "tray", but the
+# scaffolding lets future one-shot CLI invocations skip the tray-restart
+# branch of --after-update). Lives in _DATA_DIR so it survives the .exe
+# swap (which empties _INSTALL_DIR briefly between rename and move).
+_UPDATE_RELAUNCH_FILENAME = "_update_relaunch.json"
+_UPDATE_RELAUNCH_PATH = os.path.join(_DATA_DIR, _UPDATE_RELAUNCH_FILENAME)
+
+# Minimum size for a valid displayoff.exe download. Anything smaller is a
+# truncated transfer or, more dangerously, a 200-OK HTML error page (some
+# CDNs serve a "404" body with HTTP 200 — without a size floor, that HTML
+# would land on disk renamed as the .exe). The real Nuitka onefile build is
+# ~15-25 MB; 1 MB is a generous floor while still catching the failure mode.
+_UPDATE_MIN_EXE_SIZE = 1_000_000
+
 # Cache the last successful /releases/latest response to avoid burning
 # GitHub's 60-req/hr unauthenticated rate limit on repeated manual clicks.
 # That quota is shared per-IP with `gh`, GitHub Desktop, VS Code extension
@@ -1518,14 +1687,31 @@ def _version_tuple(v):
 def check_for_updates(timeout=5, force=False):
     """Query GitHub releases for the latest version.
 
-    Returns (has_update: bool, latest: str|None, html_url: str|None, error: str|None).
-    Network failures return (False, None, None, '<error>').
+    Returns (has_update, latest, html_url, error, assets):
+      - has_update: bool — True if a newer release exists
+      - latest:    str|None — version string with the leading "v" stripped
+      - html_url:  str|None — GitHub release page URL (browser fallback)
+      - error:     str|None — populated on network/parse failure
+      - assets:    dict[str, str] — {asset_name: browser_download_url} for
+                   every published asset on the latest release. Empty dict
+                   on source-only or pre-asset releases. Consumed by the
+                   rename-dance to locate `displayoff.exe` +
+                   `SHA256SUMS.txt`. Always validate the URLs against
+                   `_ALLOWED_UPDATE_HOSTS` before fetching.
+
+    Network/parse failures return (False, None, None, '<error>', {}).
 
     Successful results are cached for `_UPDATE_CHECK_CACHE_TTL` seconds —
     repeated clicks within that window hit the cache instead of GitHub's
     API. Errors are NOT cached so a transient outage doesn't poison future
     checks. Pass `force=True` to bypass the cache (not currently wired to
     any UI affordance — internal hook).
+
+    Schema change vs. v1.7.12: the 5th element (assets) was added in
+    v1.7.13. The cache also stores 5-tuples now, so a v1.7.12 cache loaded
+    by a v1.7.13 process would tuple-unpack-fail — but the cache lives only
+    in-process memory (not on disk), so a version bump means a cold cache
+    on first launch. No persistence migration needed.
     """
     import urllib.request, urllib.error
 
@@ -1553,19 +1739,462 @@ def check_for_updates(timeout=5, force=False):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as e:
-        return False, None, None, str(e)
+        return False, None, None, str(e), {}
     latest = data.get("tag_name") or data.get("name") or ""
     html_url = data.get("html_url", "")
     if not latest:
-        return False, None, None, "no tag in response"
+        return False, None, None, "no tag in response", {}
+    # Build the assets map: {name: browser_download_url}. The API returns a
+    # list of dicts, one per uploaded artifact. Filter for entries that have
+    # both a name AND a download URL — partially-failed asset uploads can
+    # leave entries with one but not the other in the API response.
+    assets = {
+        a["name"]: a["browser_download_url"]
+        for a in (data.get("assets") or [])
+        if a.get("name") and a.get("browser_download_url")
+    }
     has_update = _version_tuple(latest) > _version_tuple(__version__)
-    result = (has_update, latest.lstrip("vV"), html_url, None)
+    result = (has_update, latest.lstrip("vV"), html_url, None, assets)
 
     with _update_check_cache_lock:
         _update_check_cache["timestamp"] = now
         _update_check_cache["result"] = result
 
     return result
+
+
+# ── Rename-dance updater (v1.7.13+) ────────────────────────────────────────
+# Replaces the v1.7.12 "open release page in browser" flow when running as
+# the frozen displayoff.exe. Mechanics from
+# `_.claude/_templates/checklists/code-change/add-self-update.md` (the C#
+# canonical) adapted for a Python freeze:
+#
+#   1. Download new <exe>.tmp into _INSTALL_DIR
+#   2. SHA256-verify against SHA256SUMS.txt manifest from the same release
+#   3. os.rename current displayoff.exe → displayoff.exe.old
+#   4. os.rename displayoff.exe.tmp → displayoff.exe
+#   5. Write _UPDATE_RELAUNCH_PATH with the new-version string
+#   6. Spawn displayoff.exe --after-update detached
+#   7. Exit current process (Windows releases its file lock on .exe.old)
+#
+# Step 8 (in the new process):
+#   - --after-update reads + deletes _UPDATE_RELAUNCH_PATH
+#   - Deletes <exe>.old (now that Windows has released the lock)
+#   - Logs the new version
+#   - Continues to the normal tray-start path
+#
+# Recovery (called at the top of main()):
+#   - Stale <exe>.tmp from an interrupted download → delete (untrusted bytes)
+#   - Stale <exe>.old from a crashed dance → delete (we're already on new)
+#   - Stale _UPDATE_RELAUNCH_PATH without --after-update → log + delete
+
+
+def _download_url_allowed(url):
+    """Validate URL against the update allowlist. v1.7.13 verifier round
+    (T2-Sonnet + T3-Opus convergent) hardened this from a flat
+    `startswith(host)` check to a parsed (scheme, netloc, path) match:
+
+      - scheme MUST be `https` (no http downgrade, no `file://`,
+        no `javascript:`)
+      - host `github.com` ONLY for paths under `/itsnateai/displayoff/`
+        (NOT all itsnateai repos — a future `itsnateai/other` release
+        could otherwise impersonate displayoff)
+      - host `objects.githubusercontent.com` for any path (GitHub's
+        S3-backed asset CDN doesn't expose per-repo scoping in URLs;
+        the SHA256 verification is the actual integrity boundary here)
+
+    Case-insensitive on scheme + netloc (RFC 3986 §3.1/3.2.2 — both are
+    case-insensitive); path is exact-prefix per HTTP semantics.
+
+    Returns False for empty/None/malformed URLs.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    import urllib.parse
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() != "https":
+        return False
+    netloc_low = parts.netloc.lower()
+    if netloc_low == "github.com":
+        return parts.path.startswith("/itsnateai/displayoff/")
+    if netloc_low == "objects.githubusercontent.com":
+        return True
+    return False
+
+
+def _sha256_file(path, chunk_size=1 << 20):
+    """Stream-compute SHA256 of a file. 1 MB chunks keep peak memory bounded
+    for the ~15-25 MB .exe download — `f.read()` of the whole thing would
+    spike to ~25 MB momentarily, which matters under low-memory conditions
+    (the user clicked "Install now" because their machine is sluggish)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _parse_sha256_manifest(text, target_name):
+    """Extract the 64-hex SHA256 for `target_name` from a `sha256sum`-format
+    manifest. Returns lowercase hex on success, or None if `target_name`
+    is absent / malformed.
+
+    Format per line (GNU coreutils sha256sum -b):
+        <64_hex>  *<filename>   binary mode (Windows-typical)
+        <64_hex>  <filename>    text mode
+
+    Tolerates blank lines, `#` comments, and trailing whitespace.
+    """
+    target = target_name.strip()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        hex_part, name_part = parts
+        # Validate hex digest shape before string-comparison. Bare "len ==
+        # 64" wouldn't catch a 64-char string with non-hex chars; explicit
+        # int parse confirms it's a real digest.
+        if len(hex_part) != 64:
+            continue
+        try:
+            int(hex_part, 16)
+        except ValueError:
+            continue
+        name_part = name_part.lstrip("*").strip()
+        if name_part == target:
+            return hex_part.lower()
+    return None
+
+
+def _build_allowlist_opener():
+    """urllib opener that re-validates EVERY redirect hop against the host
+    allowlist. v1.7.13 verifier round (T3-Opus H1, T2-Sonnet C2, T2-Opus
+    convergent): the default `urllib.request.urlopen` follows redirects
+    with no re-check — a compromised github.com asset row could 302 to
+    arbitrary attacker-controlled hosts. SHA256 verification still catches
+    tampered bytes, but the redirect itself leaks the request fingerprint
+    (IP / User-Agent / request-time) to the attacker domain via the
+    Location-header GET. Override `redirect_request` so disallowed hops
+    raise URLError, which urlopen surfaces as a plain failure.
+    """
+    import urllib.request, urllib.error
+
+    class _AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not _download_url_allowed(newurl):
+                raise urllib.error.URLError(
+                    f"redirect target not in allowlist: {newurl!r}"
+                )
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return urllib.request.build_opener(_AllowlistedRedirectHandler())
+
+
+def _fetch_release_manifest_sha256(manifest_url, target_name, timeout=15):
+    """Fetch and parse SHA256SUMS.txt for `target_name`. Returns
+    (sha256_hex, None) on success or (None, error) on failure.
+
+    Validates the URL against `_ALLOWED_UPDATE_HOSTS`. Caps the read at
+    16 KiB so a malicious 200-OK response with a huge body can't OOM us
+    (a real manifest is < 200 bytes per asset entry).
+
+    Uses the allowlist-validating opener (`_build_allowlist_opener`) so
+    every redirect hop is re-checked — the default urllib behavior would
+    follow github.com → objects.gh.com → anywhere silently.
+    """
+    import urllib.error
+    if not _download_url_allowed(manifest_url):
+        return None, f"manifest URL host not allowed: {manifest_url!r}"
+    try:
+        opener = _build_allowlist_opener()
+        req = opener.open(manifest_url, timeout=timeout)  # noqa: S310 — allowlist-validated
+        try:
+            data = req.read(16 * 1024)
+        finally:
+            req.close()
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        return None, str(e)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return None, f"manifest is not UTF-8: {e}"
+    sha = _parse_sha256_manifest(text, target_name)
+    if sha is None:
+        return None, f"no SHA256 entry for {target_name!r} in manifest"
+    return sha, None
+
+
+def _download_to_path(url, dest_path, timeout=60):
+    """Download `url` to `dest_path`. Returns (ok, error). Validates URL
+    against `_ALLOWED_UPDATE_HOSTS` and minimum-size floor (`_UPDATE_MIN_EXE_SIZE`).
+
+    Truncated downloads + URLs that 200-OK with an HTML error page (some
+    CDNs do this) both get caught by the size check, which deletes the
+    partial file before returning failure. Files smaller than the floor
+    are deleted so the rename-dance never accidentally promotes a junk
+    download.
+
+    Uses `_build_allowlist_opener` so every redirect hop is re-validated
+    against the allowlist (github.com → objects.githubusercontent.com is
+    the expected path; anything else raises URLError from the
+    redirect_request override and surfaces as a download failure).
+    """
+    import urllib.request, urllib.error
+    if not _download_url_allowed(url):
+        return False, f"download URL host not allowed: {url!r}"
+    try:
+        opener = _build_allowlist_opener()
+        req = urllib.request.Request(url, headers={"User-Agent": "displayoff-updater"})
+        bytes_written = 0
+        with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — allowlist-validated
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    bytes_written += len(chunk)
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        # Cleanup partial write — a half-downloaded .tmp would survive to
+        # the next launch's recovery pass anyway, but explicit removal here
+        # closes the window between failure and recovery.
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        return False, str(e)
+
+    if bytes_written < _UPDATE_MIN_EXE_SIZE:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        return False, (f"download truncated or unexpected response body: "
+                       f"{bytes_written} bytes (expected >= {_UPDATE_MIN_EXE_SIZE})")
+    return True, None
+
+
+def _write_update_relaunch_state(new_version):
+    """Persist the relaunch state file. Called at step 5 of the dance, just
+    before spawning the --after-update child. Writes JSON: `{version,
+    timestamp, exe_path}`. The child reads + deletes it as the first thing
+    --after-update does."""
+    state = {
+        "version": new_version,
+        "exe_path": _EXE_PATH or "",
+        "timestamp": time.time(),
+        "pid": os.getpid(),  # forensics — which process wrote this
+    }
+    # Atomic write to defeat partial-state reads (the child could in
+    # principle race the parent's write). _DATA_DIR is on the same volume
+    # as %APPDATA% so os.replace is atomic per NTFS semantics.
+    tmp = _UPDATE_RELAUNCH_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, _UPDATE_RELAUNCH_PATH)
+
+
+def _read_and_clear_update_relaunch_state():
+    """Read the relaunch-state file written by the previous-version's
+    dance, then delete it. Returns the parsed dict (or None if absent /
+    corrupted). Called from the --after-update handler in main()."""
+    if not os.path.exists(_UPDATE_RELAUNCH_PATH):
+        return None
+    try:
+        with open(_UPDATE_RELAUNCH_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("Could not parse update-relaunch state %r: %s",
+                    _UPDATE_RELAUNCH_PATH, e)
+        state = None
+    try:
+        os.remove(_UPDATE_RELAUNCH_PATH)
+    except OSError as e:
+        log.warning("Could not delete update-relaunch state %r: %s",
+                    _UPDATE_RELAUNCH_PATH, e)
+    return state
+
+
+def _recover_from_failed_update():
+    """Clean up artifacts from a previous dance that crashed or hung.
+    Called at the top of main() — runs on every launch, cheap when there's
+    nothing to do.
+
+    Three independent cleanups:
+      1. `<exe>.tmp` — leftover download (untrusted bytes; delete)
+      2. `<exe>.old` — pre-dance backup that --after-update didn't get
+         around to deleting (we're already on the new build; safe to clean)
+      3. Stale `_update_relaunch.json` without a corresponding --after-update
+         CLI flag — the spawn-child step succeeded but the child crashed
+         before consuming the state. Log + delete.
+
+    Skipped under .py source mode — the rename-dance only applies to the
+    frozen .exe. Under source, `_EXE_PATH` is None and there's nothing to
+    clean up alongside.
+    """
+    if not _is_frozen() or not _EXE_PATH:
+        return
+    tmp_path = _EXE_PATH + _UPDATE_TMP_SUFFIX
+    old_path = _EXE_PATH + _UPDATE_OLD_SUFFIX
+    for path in (tmp_path, old_path):
+        if not os.path.exists(path):
+            continue
+        try:
+            os.remove(path)
+            log.info("Cleaned update artifact: %s", path)
+        except OSError as e:
+            # Most common cause: Windows still holds a file lock on .old
+            # because the just-finished process hasn't fully unwound. We're
+            # called from main() at startup, so the parent process is gone
+            # by the time we get here — but AV scanners can hold a lock
+            # for a few seconds after a write. Log and move on; the next
+            # launch retries.
+            log.warning("Could not clean update artifact %r: %s", path, e)
+
+
+def _execute_rename_dance(exe_url, exe_sha256, new_version):
+    """Execute the 5-step rename-dance. Returns (status, detail):
+      - ("relaunched", None)           — caller MUST exit immediately
+      - ("not_frozen", detail)         — running from .py source; N/A
+      - ("download_failed", detail)    — network/404/redirect outside allowlist
+      - ("sha256_mismatch", detail)    — download corrupted or tampered
+      - ("rename_failed", detail)      — .exe locked / AV / permissions
+      - ("spawn_failed", detail)       — new .exe in place but child didn't launch
+
+    URL allowlist re-validation happens here even though `_download_to_path`
+    also checks — belt-and-suspenders, especially relevant because this
+    function takes the URL as a parameter from the manifest+API flow and
+    we want a single audit checkpoint right at the dance entry.
+    """
+    if not _is_frozen() or not _EXE_PATH:
+        return "not_frozen", "rename-dance requires the frozen displayoff.exe build"
+    if not _download_url_allowed(exe_url):
+        return "rename_failed", f"download URL host not allowed: {exe_url!r}"
+    if not exe_sha256 or len(exe_sha256) != 64:
+        return "sha256_mismatch", "no SHA256 available for the new .exe"
+
+    current = _EXE_PATH
+    tmp = current + _UPDATE_TMP_SUFFIX
+    old = current + _UPDATE_OLD_SUFFIX
+
+    # Pre-clean any stale .tmp / .old from a prior attempt. _recover_from_failed_update
+    # also runs at startup, so this is belt-and-suspenders — but a same-session
+    # retry (user clicked Install after a network glitch) needs cleanup before
+    # the new attempt starts.
+    for path in (tmp, old):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as e:
+                return "rename_failed", f"cannot remove stale {path!r}: {e}"
+
+    # Step 1+2: download with SHA256 verify
+    log.info("Update dance: downloading %s -> %s", exe_url, tmp)
+    ok, err = _download_to_path(exe_url, tmp)
+    if not ok:
+        return "download_failed", err or "download failed"
+    actual_sha = _sha256_file(tmp)
+    if actual_sha.lower() != exe_sha256.lower():
+        # v1.7.13 verifier round (T2-Opus + T3-Sonnet convergent): DELETE the
+        # .tmp on hash mismatch instead of preserving it. Previously we kept
+        # the file "for forensics" on the theory that the user (or support)
+        # could inspect the failed download — but that left arbitrary
+        # unverified bytes on disk in _INSTALL_DIR with the .tmp suffix,
+        # right next to the running .exe. An attacker who controlled a
+        # release manifest could ship a 1.1 MB body that passes the size
+        # floor, fails SHA, and persists indefinitely (until next launch's
+        # recovery pass — which `log.warning`'s any unlinking failure and
+        # moves on silently). Log the actual hash inline so a future debug
+        # session has the diagnostic info without a malicious-bytes
+        # primitive on disk.
+        try:
+            os.remove(tmp)
+        except OSError as cleanup_err:
+            log.warning("Could not delete .tmp after sha256 mismatch %r: %s",
+                        tmp, cleanup_err)
+        return "sha256_mismatch", (
+            f"sha256 mismatch: expected {exe_sha256}, got {actual_sha}; "
+            f"corrupted download or tampered release. .tmp deleted."
+        )
+
+    # Step 3: rename current → .old. The os.rename across the same NTFS
+    # directory is atomic and (unlike os.replace) refuses to overwrite the
+    # destination if it exists — we pre-cleaned .old above, so a name
+    # collision here means a parallel update attempt is in flight (extremely
+    # unlikely given the single-instance mutex, but defended against).
+    log.info("Update dance: renaming %s -> %s", current, old)
+    try:
+        os.rename(current, old)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return "rename_failed", (
+            f"cannot rename {current!r} -> {old!r}: {e}. "
+            "The .exe may be locked by AV scanning or another process. "
+            "Try closing other Display Off instances and retry."
+        )
+
+    # Step 4: move .tmp → current. If this fails, restore .old → current
+    # so the user isn't left with a missing .exe.
+    log.info("Update dance: renaming %s -> %s", tmp, current)
+    try:
+        os.rename(tmp, current)
+    except OSError as e:
+        try:
+            os.rename(old, current)  # restore
+        except OSError as restore_err:
+            return "rename_failed", (
+                f"cannot rename {tmp!r} -> {current!r} ({e}), AND restore "
+                f"from {old!r} also failed ({restore_err}). "
+                f"MANUAL RECOVERY: rename {old!r} to {current!r}."
+            )
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return "rename_failed", f"cannot move .tmp into place: {e}. Restored from .old."
+
+    # Step 5: write relaunch state so the child knows what to do
+    try:
+        _write_update_relaunch_state(new_version)
+    except OSError as e:
+        # Non-fatal — the child will just skip the post-update toast and
+        # log entry. Keep going.
+        log.warning("Could not write update-relaunch state: %s", e)
+
+    # Step 6: spawn child --after-update detached, then return so the caller
+    # exits.
+    log.info("Update dance: spawning %s --after-update", current)
+    try:
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        # close_fds=True ensures no inherited file handles keep the parent's
+        # log file (or any opened tray pipe) locked into the child.
+        subprocess.Popen(
+            [current, "--after-update"],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+            cwd=_INSTALL_DIR,
+        )
+    except OSError as e:
+        return "spawn_failed", (
+            f"new .exe written successfully but spawn failed: {e}. "
+            "Restart Display Off manually."
+        )
+    return "relaunched", None
 
 
 # ── Dark theme palette + helpers ──────────────────────────────────────────
@@ -1763,45 +2392,39 @@ def _set_dpi_awareness():
     Cascades V2 → Per-Monitor → System Aware → silent fallback so we cope
     with older Win10 builds that lack the newer entry points.
 
-    v1.7.12: converted from `ctypes.windll.*` to bound WinDLL names per the
-    workspace convention "Never call ctypes.windll.* directly outside the
-    bindings block." The bound names (_user32, _shcore) have explicit
-    use_last_error=True so any future LastError inspection sees the
-    intended thread-local. _shcore is None on Win7 (no shcore.dll); the
-    second-tier path is skipped on those systems, falling through to the
-    third tier (SetProcessDPIAware, universally available).
+    v1.7.13: argtypes/restype declarations now live in the module-level
+    bindings block (above) — `_SetProcessDpiAwarenessContext`,
+    `_SetProcessDpiAwareness`, `_SetProcessDPIAware`. Each is None when the
+    corresponding entry point is missing from the running Windows build
+    (e.g. SetProcessDpiAwarenessContext is None on pre-Win10-1607).
+    Previously this function mutated `fn.argtypes`/`fn.restype` on the
+    shared function-object attrs every invocation — idempotent in practice
+    but a convention violation flagged by T2 Opus + T3 Sonnet round 5.
     """
     if sys.platform != "win32":
         return
     # Tier 1 — Win10 1607+ per-monitor V2.
-    try:
-        fn = _user32.SetProcessDpiAwarenessContext
-        fn.argtypes = [ctypes.c_void_p]
-        fn.restype = ctypes.wintypes.BOOL
-        # DPI_AWARENESS_CONTEXT is a pseudo-handle (pointer-sized); pass via
-        # c_void_p so -4 sign-extends correctly on 64-bit Windows.
-        fn(ctypes.c_void_p(-4))  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        return
-    except (AttributeError, OSError):
-        pass
-    # Tier 2 — Win8.1+ per-monitor (no V2).
-    if _shcore is not None:
+    if _SetProcessDpiAwarenessContext is not None:
         try:
-            fn = _shcore.SetProcessDpiAwareness
-            fn.argtypes = [ctypes.c_int]   # PROCESS_DPI_AWARENESS enum
-            fn.restype = ctypes.c_long      # HRESULT
-            fn(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+            # DPI_AWARENESS_CONTEXT is a pseudo-handle (pointer-sized);
+            # pass via c_void_p so -4 sign-extends correctly on 64-bit Windows.
+            _SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
             return
-        except (AttributeError, OSError):
+        except OSError:
+            pass
+    # Tier 2 — Win8.1+ per-monitor (no V2).
+    if _SetProcessDpiAwareness is not None:
+        try:
+            _SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+            return
+        except OSError:
             pass
     # Tier 3 — Vista+ system-aware (every supported Windows).
-    try:
-        fn = _user32.SetProcessDPIAware
-        fn.argtypes = []
-        fn.restype = ctypes.wintypes.BOOL
-        fn()
-    except (AttributeError, OSError):
-        pass
+    if _SetProcessDPIAware is not None:
+        try:
+            _SetProcessDPIAware()
+        except OSError:
+            pass
 
 
 def _create_icon_image():
@@ -2447,13 +3070,23 @@ def _enable_dark_mode_menus():
     against future Windows builds that might rename them)."""
     if sys.platform != "win32":
         return
+    if _uxtheme is None:
+        log.warning("Could not enable dark-mode menus: uxtheme.dll not loadable")
+        return
     try:
-        uxtheme = ctypes.windll.uxtheme
-        # Resolve by ordinal — these functions are name-less exports.
-        SetPreferredAppMode = uxtheme[135]
+        # v1.7.13: use the bound `_uxtheme` from the module-level bindings
+        # block instead of raw `ctypes.windll.uxtheme`. Ordinal indexing
+        # (`_uxtheme[135]`) works identically on bound and raw WinDLL
+        # objects, but the bound name carries use_last_error=True so any
+        # future GetLastError consultation reads this DLL's thread-local
+        # rather than picking up a stale value from an unrelated syscall.
+        # SetPreferredAppMode (ordinal 135) and FlushMenuThemes (ordinal
+        # 136) are name-less exports — Microsoft documents the behavior but
+        # not the symbols; ordinal lookup is the only access path.
+        SetPreferredAppMode = _uxtheme[135]
         SetPreferredAppMode.argtypes = [ctypes.c_int]
         SetPreferredAppMode.restype = ctypes.c_int
-        FlushMenuThemes = uxtheme[136]
+        FlushMenuThemes = _uxtheme[136]
         FlushMenuThemes.argtypes = []
         FlushMenuThemes.restype = ctypes.c_int
 
@@ -2583,12 +3216,133 @@ def _open_url(url):
         log.warning("webbrowser.open(%s) returned False — no URL handler registered.", url)
 
 
+def _can_use_rename_dance(assets):
+    """True when the v1.7.13+ rename-dance update flow is viable for the
+    current launch context. Requires (1) running as the frozen .exe, (2)
+    both `displayoff.exe` and `SHA256SUMS.txt` published as release assets,
+    and (3) both URLs on the hardcoded allowlist. Any miss falls back to
+    the v1.7.12 "open release page" flow.
+    """
+    if not _is_frozen() or not _EXE_PATH:
+        return False
+    exe_url = assets.get(_UPDATE_EXE_NAME)
+    manifest_url = assets.get(_UPDATE_MANIFEST_NAME)
+    if not exe_url or not manifest_url:
+        return False
+    return _download_url_allowed(exe_url) and _download_url_allowed(manifest_url)
+
+
+def _run_rename_dance_flow(parent_root, assets, latest):
+    """Run the rename-dance in a background thread. On success, terminate
+    the current process via os._exit(0) after the spawned child .exe has
+    had a moment to come up. On failure, marshal back to the Tk thread and
+    show a themed error dialog with a "Open releases page" fallback.
+
+    parent_root is the Settings dialog's Tk root — used as the marshalling
+    target for after() so the error dialog renders correctly as a child of
+    the open Settings window.
+    """
+
+    import tkinter as _tk_local
+
+    def _show_error(title, detail):
+        try:
+            btn = _themed_dialog(
+                parent_root,
+                "Display Off",
+                f"{title}\n\n{detail}\n\n"
+                "You can open the release page manually to download v"
+                f"{latest} yourself.",
+                buttons=("Open releases page", "Cancel"),
+                default_idx=0,
+                kind="error",
+            )
+            if btn == "Open releases page":
+                _open_url(_GITHUB_RELEASES_URL)
+        except _tk_local.TclError:
+            log.error("Update error: %s — %s (parent window closed before "
+                      "dialog could render)", title, detail)
+        except Exception as e:
+            log.exception("Update error dialog crashed: %s", e)
+
+    def _marshal_error(title, detail):
+        try:
+            parent_root.after(0, lambda: _show_error(title, detail))
+        except _tk_local.TclError:
+            log.error("Update error (Tk gone): %s — %s", title, detail)
+        except Exception as e:
+            log.exception("Failed to marshal update error: %s", e)
+
+    def _worker():
+        manifest_url = assets.get(_UPDATE_MANIFEST_NAME)
+        exe_url = assets.get(_UPDATE_EXE_NAME)
+        log.info("Update dance starting: latest=%s exe_url=%s manifest_url=%s",
+                 latest, exe_url, manifest_url)
+
+        sha, manifest_err = _fetch_release_manifest_sha256(
+            manifest_url, _UPDATE_EXE_NAME
+        )
+        if manifest_err:
+            _marshal_error("Update failed",
+                           f"Could not fetch SHA256 manifest: {manifest_err}")
+            return
+
+        status, detail = _execute_rename_dance(exe_url, sha, latest)
+        if status == "relaunched":
+            log.info("Rename-dance complete; exiting current process so the "
+                     "spawned child .exe (--after-update) can take over.")
+            # v1.7.13 verifier round (T3-Sonnet + T3-Opus convergent):
+            # logging.shutdown() flushes the RotatingFileHandler's pending
+            # writes so the dance's last 3-4 log lines ("downloading",
+            # "renaming", "spawning child") survive into displayoff.log.
+            # Without this, os._exit skips Python's normal teardown and the
+            # buffered writes are lost — the very log lines that matter
+            # most for diagnosing an update problem evaporate. Pystray icon
+            # teardown still gets skipped (icon.run lives on the main
+            # thread, can't be safely stopped from this daemon worker),
+            # but the OS reclaims the tray slot via Shell_NotifyIcon when
+            # the process dies, and the spawned child registers a fresh
+            # icon a few hundred ms later.
+            try:
+                logging.shutdown()
+            except Exception:
+                # logging.shutdown() catches its own internal errors per
+                # Python docs, but be defensive about a corrupted logging
+                # state mid-dance never blocking the relaunch.
+                pass
+            # Brief settle so the OS has a chance to start the child process
+            # before the current one releases its tray icon. Without this,
+            # the tray briefly shows no icon between exit and child-startup.
+            # 300ms is short enough to feel instant.
+            time.sleep(0.3)
+            # os._exit skips Python's interpreter shutdown — necessary
+            # because pystray's icon.run() owns the main thread and a clean
+            # exit from a daemon thread isn't straightforward. The spawned
+            # child process is already running; this process is dead weight.
+            os._exit(0)
+
+        # Failure path
+        log.warning("Rename-dance failed: status=%s detail=%s", status, detail)
+        title = {
+            "not_frozen":      "Update not available in source mode",
+            "download_failed": "Update download failed",
+            "sha256_mismatch": "Update download corrupted",
+            "rename_failed":   "Update could not replace running .exe",
+            "spawn_failed":    "Update applied but relaunch failed",
+        }.get(status, f"Update failed ({status})")
+        _marshal_error(title, detail or "(no detail)")
+
+    threading.Thread(
+        target=_worker, daemon=True, name="displayoff-update-dance"
+    ).start()
+
+
 def _run_update_check(parent_root):
     """Hit the GitHub releases API and show a result dialog as a child of
     `parent_root`. Network call runs in a daemon thread so the Tk event loop
     stays responsive; result is marshalled back via `parent_root.after`."""
 
-    def _show_result(has_update, latest, html_url, err):
+    def _show_result(has_update, latest, html_url, err, assets):
         import tkinter as _tk_local
         try:
             if err:
@@ -2632,28 +3386,63 @@ def _run_update_check(parent_root):
                     )
                 _themed_dialog(parent_root, "Display Off", msg, kind="error")
             elif has_update:
-                if _themed_dialog(
-                    parent_root,
-                    "Display Off — Update available",
-                    f"A newer version is available.\n\n"
-                    f"Current: v{__version__}\n"
-                    f"Latest:  v{latest}\n\n"
-                    "Open the release page in your browser?",
-                    buttons=("Yes", "No"),
-                    default_idx=0,
-                    kind="info",
-                ) == "Yes":
-                    # html_url comes from GitHub API response — validate it
-                    # before passing to webbrowser.open. A compromised release
-                    # or MITM-injected JSON could set html_url to a
-                    # `file://` or `javascript:` URI; the OS handler then
-                    # opens whatever the attacker wants. Allowlist
-                    # https://github.com/ prefix; otherwise fall back to
-                    # the hardcoded releases page.
-                    if html_url and html_url.startswith("https://github.com/"):
-                        _open_url(html_url)
-                    else:
-                        _open_url(_GITHUB_RELEASES_URL)
+                # v1.7.13+ split: when running as the frozen .exe AND the
+                # release publishes both displayoff.exe + SHA256SUMS.txt as
+                # assets on allowlisted hosts, offer the in-app rename-dance
+                # update. Falls back to the v1.7.12 "open release page" flow
+                # when running from source, or when the release predates the
+                # .exe asset (e.g., v1.7.12 viewed from a v1.7.13 client).
+                if _can_use_rename_dance(assets):
+                    btn = _themed_dialog(
+                        parent_root,
+                        "Display Off — Update available",
+                        f"A newer version is available.\n\n"
+                        f"Current: v{__version__}\n"
+                        f"Latest:  v{latest}\n\n"
+                        "Install now will download the new build, verify its\n"
+                        "SHA256 against the published manifest, replace the\n"
+                        "running .exe, and relaunch.\n\n"
+                        "Open releases page lets you download manually.",
+                        buttons=("Install now", "Open releases page", "Cancel"),
+                        default_idx=0,
+                        kind="info",
+                    )
+                    if btn == "Install now":
+                        _run_rename_dance_flow(parent_root, assets, latest)
+                        # Worker either os._exit's on success or marshals an
+                        # error dialog back via parent_root.after — nothing
+                        # more to do here.
+                        return
+                    if btn == "Open releases page":
+                        if html_url and html_url.startswith("https://github.com/"):
+                            _open_url(html_url)
+                        else:
+                            _open_url(_GITHUB_RELEASES_URL)
+                    # btn == "Cancel" (or dialog closed) → no-op
+                else:
+                    # v1.7.12 flow — source mode or missing .exe asset.
+                    if _themed_dialog(
+                        parent_root,
+                        "Display Off — Update available",
+                        f"A newer version is available.\n\n"
+                        f"Current: v{__version__}\n"
+                        f"Latest:  v{latest}\n\n"
+                        "Open the release page in your browser?",
+                        buttons=("Yes", "No"),
+                        default_idx=0,
+                        kind="info",
+                    ) == "Yes":
+                        # html_url comes from GitHub API response — validate
+                        # it before passing to webbrowser.open. A compromised
+                        # release or MITM-injected JSON could set html_url
+                        # to a `file://` or `javascript:` URI; the OS handler
+                        # then opens whatever the attacker wants. Allowlist
+                        # https://github.com/ prefix; otherwise fall back to
+                        # the hardcoded releases page.
+                        if html_url and html_url.startswith("https://github.com/"):
+                            _open_url(html_url)
+                        else:
+                            _open_url(_GITHUB_RELEASES_URL)
             else:
                 _themed_dialog(
                     parent_root,
@@ -2677,7 +3466,9 @@ def _run_update_check(parent_root):
         try:
             result = check_for_updates()
         except Exception as e:
-            result = (False, None, None, e)
+            # v1.7.13: 5-tuple (assets dict added). Empty {} keeps
+            # _can_use_rename_dance from claiming the dance is viable.
+            result = (False, None, None, e, {})
         # Marshal back to the Tk thread. parent_root.after is thread-safe.
         import tkinter as _tk_local
         try:
@@ -3074,6 +3865,65 @@ def main():
     )
     if _root_has_real_handler:
         _MIGRATION_LOG.clear()
+
+    # v1.7.13: clean up artifacts from a previous launch's rename-dance that
+    # may have crashed or been interrupted before --after-update could fire.
+    # Cheap when there's nothing to do; no-op under .py source. Runs BEFORE
+    # the --after-update handler so a legitimate post-update launch goes
+    # through the dedicated path below rather than the generic cleanup.
+    # (--after-update both reads the relaunch-state file AND triggers the
+    # same .tmp/.old cleanup; ordering means cleanup happens once per launch
+    # regardless of which path fired it.)
+    _recover_from_failed_update()
+
+    # v1.7.13: --after-update is the relaunch entry point used by the
+    # rename-dance. The previous-version's _execute_rename_dance() wrote the
+    # state file just before spawning us with this flag, so reading +
+    # clearing it gives us forensics for "we just upgraded from X to Y".
+    # We then strip the flag from sys.argv so the rest of main() doesn't
+    # treat the post-update launch any differently than a normal tray
+    # startup — tray-mode is the default, so falling through is correct.
+    if "--after-update" in sys.argv:
+        state = _read_and_clear_update_relaunch_state()
+        if state is not None:
+            persisted_version = state.get("version") or "?"
+            # v1.7.13 verifier round (T2-Opus C3): cross-check the state
+            # file's recorded target-version against the running binary's
+            # __version__. They should always match — the previous-version
+            # dance wrote the API's "latest" tag into state, then spawned
+            # the binary it just installed (which compiles that same tag's
+            # source). A mismatch indicates either (a) a stale state file
+            # from an earlier failed dance got consumed by a manually-
+            # launched --after-update, or (b) the rename step succeeded
+            # but the wrong .exe ended up at the canonical path (extreme
+            # FS corruption). Either way: forensics are unreliable, so
+            # surface the divergence instead of silently logging the
+            # bogus persisted value.
+            if persisted_version != "?" and persisted_version != __version__:
+                log.warning(
+                    "After-update: state file says target version v%s but "
+                    "running binary is v%s — possible stale state from a "
+                    "prior failed dance, or wrong .exe at install path. "
+                    "Forensics below may be misleading.",
+                    persisted_version, __version__,
+                )
+            log.info(
+                "After-update: relaunched as v%s (parent pid %s, parent exe %r)",
+                persisted_version,
+                state.get("pid") or "?",
+                state.get("exe_path") or "?",
+            )
+        else:
+            # No state file. Either the user manually invoked --after-update
+            # (unusual but harmless — fall through to normal startup) or the
+            # state file disappeared between the parent's write and our read
+            # (sync-software, AV, manual delete). Log so it's diagnosable.
+            log.info("After-update: launched without relaunch state — "
+                     "manual invocation or state file lost")
+        # Strip --after-update from argv so it doesn't survive into any
+        # later argv-scanning code. Idempotent (no-op if a future code path
+        # also tries to strip it).
+        sys.argv = [a for a in sys.argv if a != "--after-update"]
 
     if "--version" in sys.argv:
         print(f"displayoff {__version__}")

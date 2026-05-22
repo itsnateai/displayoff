@@ -45,3 +45,10 @@ CLAUDE.md
 
 # swarmaudit artifacts (audit cache, never publish)
 .swarmaudit/
+
+# Nuitka build artifacts (v1.7.13+ frozen .exe build dir + crash reports)
+# build/ holds the displayoff.dist + displayoff.onefile-build + displayoff.exe
+# from `bash build-release.sh` or `build-exe.bat`. The .exe gets uploaded
+# as a release asset; the build dir is local-only scratch.
+build/
+nuitka-crash-report.xml

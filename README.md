@@ -16,14 +16,24 @@ The classic `SC_MONITORPOWER` mechanism — used by NirCmd, AutoHotkey scripts, 
 
 ## Quickstart
 
+Two install options — pick whichever fits.
+
+### Option A: Single .exe (no Python required, recommended)
+
+Download `displayoff.exe` from the [latest release](https://github.com/itsnateai/displayoff/releases/latest), double-click to launch. The tray icon appears.
+
+Built-in self-updater: tray → right-click → **Settings → Updates → Install now**. Downloads the new release, verifies its SHA256 against the published `SHA256SUMS.txt` manifest, atomically replaces the running `.exe`, and relaunches. No installer, no admin.
+
+### Option B: Python source
+
 ```bash
 pip install -r requirements.txt
 python displayoff.py
 ```
 
-Then double-click the tray icon, or press **Ctrl+Alt+F12**.
+Requires **Python 3.8+** and **Windows**. Same logic as the .exe; the .exe is a frozen build of this source via Nuitka onefile.
 
-Requires **Python 3.8+** and **Windows**.
+Both modes use the same global hotkey (**Ctrl+Alt+F12** by default) and the same `%APPDATA%\displayoff\` state directory, so you can switch between them without losing config.
 
 ## Features
 
@@ -36,7 +46,15 @@ Requires **Python 3.8+** and **Windows**.
 
 ## Usage
 
+CLI flags work identically whether you launch `displayoff.exe` or `python displayoff.py` — pick whichever your install uses.
+
 ```bash
+# Frozen .exe (v1.7.13+)
+displayoff.exe                    # Start in system tray (no console)
+displayoff.exe --off              # Turn off displays immediately, then exit
+displayoff.exe --version          # Print version
+
+# Python source — same flags, prefix with `python` (or `pythonw` for no-console)
 python displayoff.py              # Start in system tray
 python displayoff.py --off        # Turn off displays immediately, then exit (honors lock-on-off + path config)
 python displayoff.py --native-off # Force the native idle-display-off path (regardless of config)
@@ -58,12 +76,12 @@ Right-click the tray icon → **Settings**:
 |---|---|
 | **Hotkey** | Click the field, then press your combination. Esc cancels recording. |
 | **Lock workstation when blanking** | Locks via Win+L before powering off the screens. |
-| **Run at Windows startup** | Creates `Display Off.lnk` in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\` (uses `pythonw.exe` so there's no console flash). Legacy `HKCU\...\Run` entries auto-cleaned on first toggle. |
+| **Run at Windows startup** | Creates `Display Off.lnk` in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`. Targets `displayoff.exe` when launched from the frozen build, or `pythonw.exe displayoff.py` when launched from source — auto-refreshes the .lnk if you switch between modes. Legacy `HKCU\...\Run` entries auto-cleaned on first toggle. |
 | **Auto-blank after N minutes idle** | Polls `GetLastInputInfo` every 15s, fires once when idle ≥ threshold. Set to 0 to disable. |
 
 **Save** = apply and close. **Apply** = persist and stay open. **Cancel** = close, discard in-dialog edits (already-applied changes stay persisted).
 
-Settings live in `displayoff_config.json` next to the script.
+Settings live in `%APPDATA%\displayoff\displayoff_config.json` (per-user, since v1.7.9). Logs and the crash-recovery sentinel share that directory.
 
 ### Choosing the blank mechanism
 
