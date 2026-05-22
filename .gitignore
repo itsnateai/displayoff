@@ -30,7 +30,11 @@ $RECYCLE.BIN/
 # next to displayoff.exe in the install dir — usually cleaned by
 # _recover_from_failed_update on next launch, but defensive against any
 # .exe.old / .exe.tmp ever landing in the repo via build/ tinkering).
-*.old
+# v1.7.17: narrowed `*.old` (which shadowed legitimate `.old` files
+# anywhere in the tree, like backup notes or test fixtures) to the two
+# specific rename-dance patterns. Any future updater intermediate gets
+# its own explicit line here.
+*.exe.old
 *.exe.tmp
 
 # Python

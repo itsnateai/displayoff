@@ -1,5 +1,62 @@
 # Changelog — Display Off
 
+## [1.7.17] — 2026-05-22
+
+The actual fix for the rename-dance, tray promoter, and autostart `.lnk` — each of which has been **structurally broken under freeze since v1.7.13**. v1.7.13's freeze pass added a comment block claiming `sys.executable` returns the on-disk `displayoff.exe` under Nuitka onefile (the PyInstaller-onefile behavior). That assumption is empirically false on Nuitka 4.1.1: `sys.executable` returns the per-launch temp-extracted python.exe (e.g., `C:\Users\<user>\AppData\Local\Temp\onefile_<pid>_<rand>_<hash>\python.exe`), not the on-disk .exe. v1.7.16's release notes claimed the dance "should work end-to-end this time" — also false; the v1.7.16 URL-allowlist fix made the network step pass but the rename targeted the wrong directory. v1.7.17 ships the path-resolution fix that finally makes the dance work.
+
+### Fixed
+
+- **`_resolve_on_disk_exe_path()` — corrected on-disk .exe path resolver under Nuitka onefile.** Layered fallback chain that no longer trusts `sys.executable`:
+  1. **`NUITKA_ONEFILE_PARENT` + `QueryFullProcessImageNameW(parent_pid)`** (primary). Nuitka sets `NUITKA_ONEFILE_PARENT` in the child process's env to the bootstrap (parent) process's PID. The bootstrap IS the on-disk `displayoff.exe`. `QueryFullProcessImageNameW` returns the kernel-tracked image path of any open process handle — ground truth, immune to argv tampering by upstream parents. ctypes bindings inline in the helper (self-contained because the file's main win32 bindings block is defined later in the module init order) with explicit `argtypes`/`restype` matching the file's pointer-width discipline.
+  2. **`os.path.abspath(sys.argv[0])`** if it ends in `.exe` and is NOT under `%TEMP%`. Per Nuitka docs `sys.argv[0]` is the original onefile binary path. Used as fallback in case `NUITKA_ONEFILE_PARENT` is unset (older Nuitka, or a future Nuitka that changes its env contract) or `OpenProcess` fails (Defender / EDR blocking process queries).
+  3. **`sys.executable`** with a WARNING log (last resort). If we land here, both primary strategies failed and the rename-dance / autostart / tray promoter will mis-target — but the WARNING points the user at the issue tracker so we can patch in v1.7.18.
+
+   Every candidate value (`sys.executable`, `sys.argv[0]`, `NUITKA_ONEFILE_PARENT`, `__compiled__.original_argv0`, `__compiled__.containing_dir`) is logged to `displayoff.log` at module import so future verifier rounds can read the empirical answer rather than re-derive it. Under .py source mode the resolver returns `None` (no freeze, no rename-dance applicable) and `_INSTALL_DIR` falls back to the script directory as before.
+
+- **`_EXE_PATH` and `_INSTALL_DIR` rewired through the resolver.** Every downstream call site picks up the corrected path automatically:
+  - `_autostart_target()` — the Startup-folder `.lnk` now points at the persistent on-disk `displayoff.exe` instead of a per-launch temp path. v1.7.13 → v1.7.16 users who had autostart enabled would see "Stale startup shortcut" in `displayoff.log` every relaunch as the symptom; v1.7.17 next-Save (Settings → Autostart → toggle off + on) rewrites the `.lnk` correctly.
+  - `_execute_rename_dance()` — downloads `displayoff.exe.tmp` into `_INSTALL_DIR` (the on-disk install dir), atomic-renames `displayoff.exe` → `displayoff.exe.old` and `displayoff.exe.tmp` → `displayoff.exe`, then spawns `displayoff.exe --after-update` from the persistent path. v1.7.13 → v1.7.16 attempts would download to + rename inside the temp extraction dir and never touch the actual installation — the on-disk binary stayed at the old version no matter how many times "Install now" was clicked.
+  - `tray_promoter.promote_in_background(exe_path=...)` — receives the on-disk `displayoff.exe` path so it matches Win11's `NotifyIconSettings\<hash>\ExecutablePath` (which the kernel correctly records for the on-disk .exe via `CreateProcessW` attribution). Match succeeds → `IsPromoted=1` is written → tray icon stays visible across Explorer restarts and login cycles. v1.7.13 → v1.7.16 users would see "tray-icon promotion timed out — entry for 'Display Off' not found in registry" repeatedly in `displayoff.log` and have to manually flip Settings ▸ Personalization ▸ Taskbar ▸ Other system tray icons every install.
+
+- **`_PING_FIRED_THIS_PROCESS` is now lock-guarded** via `_PING_GATE_LOCK` + `_try_claim_ping_gate()` / `_release_ping_gate()` claim-then-fire-then-release pattern. v1.7.15 introduced the in-process dedupe as a bare module-level boolean — flagged by the v1.7.16 8-agent verifier round as a violation of the workspace's "no GIL-only assumptions on shared state" discipline. The new pattern claims the gate atomically up front (so two simultaneous spawns of `_frozen_promote_ping` — today there's only one, defended against future refactors — cannot both pass the check) and releases it only on `icon.notify` failure so a retry can still fire on next launch. Successful notify keeps the gate claimed for the lifetime of the process.
+
+- **`_themed_dialog` chrome margin is DPI-relative** (`dlg.winfo_pixels("0.4i")` ≈ 38 px at 100% DPI, scales correctly at 125%/150%/175%/200%). v1.7.16's hardcoded `chrome_margin = 40` was a fixed-pixel budget that under high-DPI scaling could leave the button row clipped on the right edge — the original problem v1.7.16 had just closed at 100% DPI. The 0.4" choice keeps the 100% DPI behavior identical to v1.7.16 (≈38 vs 40 px is below the practical threshold for layout drift) while scaling correctly above. Flagged by the v1.7.16 8-agent verifier convergent finding.
+
+- **`_recover_from_failed_update` preserves manual rollback artifacts.** v1.7.13 → v1.7.16 unconditionally deleted `displayoff.exe.old` on every launch, which was hostile if a user had manually backed up the current install (e.g., `copy displayoff.exe displayoff.exe.old` after install — NTFS bumps `.old`'s mtime to "now" while current's mtime stays at the original rename-dance time). v1.7.17 compares mtimes: if `.old` is newer than the current `.exe`, the cleanup is skipped and the artifact stays put. The `.tmp` cleanup is unchanged (untrusted download bytes; always clean). v1.7.17 also fixes a related edge case caught by the verifier round: if `os.path.getmtime(_EXE_PATH)` raises (e.g., crash mid-rename left the install in pieces), we now PRESERVE `.old` rather than fall through to delete — destroying the only good copy was the prior behavior's hostile failure mode. Flagged by the v1.7.16 8-agent verifier convergent finding + the v1.7.17 6-agent round T2-Sonnet gap finding.
+
+- **`_autostart_target_pythonw()` now asserts `not _is_frozen()`.** Defensive — the function uses `sys.executable` directly (legitimate under source mode, where `sys.executable` IS the Python interpreter), and is only called from the source-mode branch of `_autostart_target()`. But the v1.7.13 → v1.7.16 latent bug taught us that "called from a safe branch today" is fragile; a future refactor that accidentally plumbs this under a frozen branch would re-introduce the same temp-path `.lnk` bug. The assert makes the source-only contract enforced at runtime. Flagged by the v1.7.17 6-agent round T3-Opus + T2-Sonnet convergent finding.
+
+- **`.gitignore *.old` narrowed to `*.exe.old`.** v1.7.16's broad `*.old` pattern would have shadowed any legitimate `.old` file anywhere in the repo (backup notes, test fixtures, manual saved copies). Only the rename-dance intermediate needs to be ignored; the specific pattern matches.
+
+- **`build-exe.bat` version + comment refreshed.** `VERSION=1.7.16` → `1.7.17`, stale "should print 'displayoff 1.7.13'" verification comment updated to match the actual current version. The earlier sandbox-test recommendation reference is removed (it pointed at a workspace-private path that doesn't belong in a public file).
+
+### Notes — what was broken from v1.7.13 through v1.7.16
+
+Be honest about the regression scope: the rename-dance has never worked end-to-end since it was introduced in v1.7.13. v1.7.13 was the freeze pass that introduced the wrong `sys.executable` assumption. v1.7.14 hardened the first-launch promote ping (correct in its own scope, didn't touch the path bug). v1.7.15 added the CI release workflow and the in-process ping dedupe (also correct, also didn't surface the bug). v1.7.16 hotfixed the GitHub release-asset CDN allowlist (necessary, but not sufficient — the URL fix made the network step pass but the rename still targeted the temp dir). The 8-agent verifier rounds on each release couldn't catch this because the v1.7.13 comment block claimed `sys.executable` was correct, and the verifiers trusted the docstring over the actual runtime behavior.
+
+The empirical proof landed in `displayoff.log` after v1.7.16 was installed at `proggy\Tools\displayoff.exe`: the log lines `current launcher is 'C:\Users\nate\AppData\Local\Temp\onefile_42604_561348_DreZIYVFd8M\python.exe'` showed `sys.executable` returning the temp path. That's what triggered the v1.7.17 work.
+
+User-facing impact for the v1.7.13 → v1.7.16 cohort:
+
+- **Tray icon defaulted to hidden** on every install / relocation, requiring a manual flip of Settings ▸ Personalization ▸ Taskbar ▸ Other system tray icons. The `tray_promoter` polling timed out without finding our subkey because the path it polled with (the temp dir) never matched what Explorer recorded (the on-disk dir).
+- **"Install now" appeared to succeed but the on-disk .exe never changed**. Network download succeeded, SHA verified, status returned `relaunched` — but the rename happened inside the per-launch temp dir, which got cleaned up on process exit anyway. Next launch was still the old version.
+- **Autostart `.lnk` pointed at a transient temp path** that changed every launch. Result: the `.lnk` would silently break every time, and `displayoff.log` would log "Stale startup shortcut" on relaunch. Re-saving from Settings ▸ Autostart would briefly fix it until the next launch.
+
+After installing v1.7.17 manually (download from the release page, replace `proggy\Tools\displayoff.exe`), all three issues are resolved automatically — the resolver runs at module import, picks up the correct on-disk path, and the rename-dance / autostart / tray promoter all start working as designed. The next "Install now" exercise (v1.7.17 → v1.7.18, whenever there is one) will be the actual inaugural successful in-the-wild dance.
+
+### Notes — what didn't get fixed yet (deferred)
+
+From the v1.7.16 verifier backlog, lower-priority items still pending:
+
+- `objects-origin.githubusercontent.com` defensive allowlist add (forward-compat for future GitHub CDN-host changes).
+- `release.yml` permissions tightening (`contents: read` at workflow level, `write` only on the upload step).
+- Post-upload redirect-host smoke test in `release.yml` (proactive future-CDN-change detection).
+- `_UPDATE_MIN_EXE_SIZE = 1 MB` floor → tighter (real .exe is ~52 MB).
+- 300 ms parent-`os._exit` vs child-`_acquire_single_instance` race in the rename-dance child relaunch.
+- `_themed_dialog.minsize()` sticky-floor (currently one-shot `geometry()`-based — survives DPI changes during dialog lifetime, but not Tk geometry re-solves).
+
+None block the v1.7.17 ship; the rename-dance + tray promoter + autostart triad were the critical path. Backlog reconsidered for v1.7.18.
+
 ## [1.7.16] — 2026-05-21
 
 Hotfix. The v1.7.14 → v1.7.15 rename-dance update attempt — the first time the dance ran in production after v1.7.13 introduced it — failed because GitHub had migrated the release-asset CDN to a domain not in the hardcoded allowlist. The dialog button row also clipped at default DPI. Both fixed here. v1.7.16 is the third-time's-the-charm — v1.7.13/14 were dance code-but-untested, v1.7.15 was dance live-but-broken-at-GitHub-end, v1.7.16 should be dance live-and-working.

@@ -13,11 +13,8 @@ REM
 REM Build time: ~3-8 minutes on first run, ~2-4 minutes incremental.
 REM
 REM Verify after build:
-REM   build\displayoff.exe --version       (should print "displayoff 1.7.13")
+REM   build\displayoff.exe --version       (should print "displayoff 1.7.17")
 REM   build\displayoff.exe                 (should start tray icon)
-REM
-REM Sandbox-test recommended path:
-REM   _.claude\_tools\sandbox\Sandbox_Diag.wsb  (verify freeze-mode parity)
 REM
 REM ── Why Nuitka and not PyInstaller ──
 REM Nuitka compiles Python to C → native binary. Smaller (~15-25 MB vs ~30-40
@@ -32,7 +29,7 @@ REM files alongside (no extraction step). We use --onefile so the install is
 REM a single file the rename-dance updater can swap atomically.
 
 setlocal
-set VERSION=1.7.16
+set VERSION=1.7.17
 set VERSION_FOUR=%VERSION%.0
 
 REM Embed the icon as a Windows resource (--windows-icon-from-ico) AND bundle

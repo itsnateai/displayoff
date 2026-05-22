@@ -1,32 +1,51 @@
-Hotfix. v1.7.15's first live exercise of the rename-dance updater (introduced in v1.7.13) failed because GitHub had migrated the release-asset CDN to a domain not in the hardcoded allowlist. The update-available dialog also had a clipped button row. Both fixed.
+The actual fix for the rename-dance, tray promoter, and autostart `.lnk` — each of which has been structurally broken under freeze since v1.7.13. v1.7.13's freeze pass assumed `sys.executable` returns the on-disk `displayoff.exe` under Nuitka onefile (which is true for PyInstaller, but false for Nuitka 4.1.1). Empirically `sys.executable` returns the per-launch temp-extracted `python.exe` (e.g., `%TEMP%\onefile_<pid>_<rand>_<hash>\python.exe`), so every downstream consumer — the rename-dance, the autostart shortcut, and the tray-icon promoter — got the wrong path and silently mis-targeted.
+
+v1.7.16's release notes claimed the dance "should work end-to-end this time" — also wrong; the v1.7.16 URL-allowlist fix made the network step pass but the rename targeted the wrong directory. v1.7.17 ships the path-resolution fix that finally makes the dance work.
 
 ## What's fixed
 
-- **Self-updater works again** — added `release-assets.githubusercontent.com` to the update-host allowlist. GitHub migrated the release-asset CDN from `objects.githubusercontent.com` to the new host over 2025; the hardcoded allowlist hadn't caught up. v1.7.13 / v1.7.14 / v1.7.15 all carried this latent bug — it only surfaced when v1.7.15 was the first release to have ANOTHER release (this one) to update to. The legacy `objects.githubusercontent.com` is still in the list for any older release whose URLs were baked before the migration.
-- **Update-available dialog button row no longer clips.** Middle button label shortened to "Releases page" (was "Open releases page") so the three-button row fits the dialog at default DPI. `_themed_dialog` now also floors the dialog's geometry width to the button row's required width as a defense against future widening.
+- **Self-updater finally works end-to-end.** A new `_resolve_on_disk_exe_path()` helper uses `NUITKA_ONEFILE_PARENT` + `QueryFullProcessImageNameW(parent_pid)` to query the kernel-tracked image path of the bootstrap process — which IS the on-disk `displayoff.exe`. Two-layer fallback (`sys.argv[0]` if outside `%TEMP%`, then last-resort `sys.executable` with a WARNING log) covers edge cases without trusting the original wrong API. All candidate values are logged to `displayoff.log` at module import so future debugging has the empirical answer in plain sight.
+- **Tray icon stays visible across Explorer restarts / installs.** `tray_promoter.promote_in_background` now receives the correct on-disk path so it matches Win11's `NotifyIconSettings\<hash>\ExecutablePath` and writes `IsPromoted=1`. Prior versions would silently fail the match (the registry recorded the on-disk .exe but the promoter polled with the temp path) and the icon defaulted to hidden, requiring a manual Settings ▸ Personalization ▸ Taskbar ▸ Other system tray icons toggle on every install.
+- **Autostart `.lnk` points at the persistent on-disk .exe.** The Startup-folder shortcut no longer references a per-launch temp path that changes every launch. v1.7.13 → v1.7.16 users who had autostart enabled would see "Stale startup shortcut" in `displayoff.log` every relaunch as the symptom. After installing v1.7.17, toggle Settings → Autostart off and back on to refresh the `.lnk` to the corrected path.
+- **`_PING_FIRED_THIS_PROCESS` lock-guarded** via a `threading.Lock` + claim-then-fire-then-release pattern (was a bare module-level bool — flagged by the v1.7.16 8-agent verifier as a violation of the project's free-threaded discipline).
+- **`_themed_dialog` chrome margin is DPI-relative** (`dlg.winfo_pixels("0.4i")` instead of hardcoded `40` px) so button rows don't clip at 125% / 150% / 175% / 200% DPI scaling.
+- **`_recover_from_failed_update` preserves manual rollback artifacts.** If `displayoff.exe.old` is newer than the current `displayoff.exe` (signal of a deliberate manual rollback), the auto-cleanup is skipped. Prior versions deleted it unconditionally.
+- **`.gitignore` narrowed** from `*.old` to `*.exe.old` so legitimate `.old` files anywhere in a fork's tree aren't shadowed.
 
-## Upgrade path — **manual install required for v1.7.13 / v1.7.14 / v1.7.15**
+## Upgrade path — **manual install required for v1.7.13 / v1.7.14 / v1.7.15 / v1.7.16**
 
-The bugs fixed in v1.7.16 are in the **client's own** updater code, not on the server side. That means v1.7.13 / v1.7.14 / v1.7.15 clients still hit the broken allowlist when they try to fetch any newer release — including this one. The chicken-and-egg solution is to install v1.7.16 manually, ONCE; from then on the in-app updater works for future releases.
+The bug is in the client's path-resolution logic. v1.7.13 → v1.7.16 clients downloading the v1.7.17 asset would succeed at the network step but still rename inside the temp dir, leaving the on-disk install untouched. So the in-app update WILL "succeed" but won't actually upgrade you. Install manually, once.
 
-**Manual install steps (from v1.7.13 / v1.7.14 / v1.7.15):**
+**Manual install steps:**
 
 1. Right-click the Display Off tray icon → **Quit** (releases the .exe file lock).
-2. Download `displayoff.exe` from this page (the button below — or use the in-app "Open releases page" fallback if the dance failed and put you here).
+2. Download `displayoff.exe` from this release (the button below).
 3. Replace your existing `displayoff.exe` with the new file (same filename, same location).
-4. Launch the new v1.7.16. Your config + autostart .lnk + idle settings carry over unchanged (config lives in `%APPDATA%\displayoff\`, the .lnk references the .exe by path).
+4. Launch v1.7.17. Your config + autostart `.lnk` + idle settings carry over unchanged (config lives in `%APPDATA%\displayoff\`; the `.lnk` references the .exe by path).
+5. Optional: toggle Settings ▸ Autostart off and back on to refresh the Startup-folder shortcut to the corrected on-disk path. Same for any tray-icon hidden-by-default behavior — v1.7.17's auto-promote should fix it on the first launch, but a one-time Settings ▸ Personalization ▸ Taskbar ▸ Other system tray icons toggle is the manual remedy if it doesn't.
 
-**From v1.7.16 onward,** "Settings → Check for updates → Install now" should work end-to-end. The "Releases page" fallback button is also relabeled (was clipped as "Open releases pa…") and reliably opens this page if the dance ever fails again.
+**From v1.7.17 onward,** "Settings → Check for updates → Install now" should work end-to-end. The next "Install now" exercise (v1.7.17 → v1.7.18, whenever there is one) will be the inaugural in-the-wild successful dance.
 
-If you're on the .py source channel, no action needed — the dance only applies to the frozen `.exe`.
+If you're on the `.py` source channel, no action needed — the resolver returns `None` under source mode and the rename-dance is skipped entirely.
 
-## What this exposes
+## What v1.7.17 exposes about prior releases
 
-v1.7.16 is the third-time's-the-charm for the rename-dance:
+Be honest about regression scope: the rename-dance has **never** worked end-to-end since it was introduced in v1.7.13.
 
-- **v1.7.13** — dance code shipped, no version to update FROM.
-- **v1.7.14** — same-day patch on the dance's first-launch promotion ping; still no real update flow exercised.
-- **v1.7.15** — dance live-but-broken-at-GitHub-end. First live attempt failed at the URL allowlist.
-- **v1.7.16** — dance live-and-fixed. The v1.7.15 release brief explicitly deferred the sandbox-style end-to-end test; that deferral was the actual root cause of this hotfix. A 5-minute sandbox run would have caught the CDN-domain change before users did.
+- **v1.7.13** — shipped the freeze pass with the wrong `sys.executable` assumption. No prior version to update FROM, so the dance was never exercised live.
+- **v1.7.14** — same-day hardening of the first-launch promotion ping (correct in its own scope; didn't touch the path bug).
+- **v1.7.15** — added CI release workflow + in-process ping dedupe (also correct; also didn't surface the bug).
+- **v1.7.16** — hotfixed the GitHub release-asset CDN allowlist. Necessary, but not sufficient — the URL fix made the network step pass but the rename still targeted the temp dir.
+- **v1.7.17** — the actual fix. The 8-agent verifier rounds on each release couldn't catch this because the v1.7.13 comment block claimed `sys.executable` was correct, and the verifiers trusted the docstring over runtime behavior.
+
+The empirical proof showed up in `displayoff.log` after the v1.7.16 manual install at `proggy\Tools\displayoff.exe`:
+
+```
+Stale startup shortcut: target='...pythonw.exe' but current launcher is
+'C:\Users\nate\AppData\Local\Temp\onefile_42604_561348_DreZIYVFd8M\python.exe'
+— treating as 'not enabled' so next Save re-creates it.
+```
+
+That's `sys.executable` returning the temp path. That log line is what triggered the v1.7.17 work.
 
 Full changelog: see `CHANGELOG.md`.

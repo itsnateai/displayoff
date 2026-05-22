@@ -35,7 +35,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.16"
+__version__ = "1.7.17"
 
 log = logging.getLogger("displayoff")
 
@@ -46,14 +46,39 @@ log = logging.getLogger("displayoff")
 # source still works as a parallel distribution channel — both modes share
 # the same logic, dispatched on freeze-mode detection.
 #
-#   - Nuitka onefile: sets the `__compiled__` module attr at compile time,
-#     bootloader extracts to a per-launch temp dir, `sys.executable` is the
-#     on-disk .exe, `__file__` points into the temp extraction dir.
+#   - Nuitka onefile: sets the `__compiled__` module attr at compile time.
+#     The on-disk displayoff.exe is the BOOTSTRAP process; it extracts the
+#     real CPython interpreter + compiled modules to %TEMP%\onefile_<pid>_…
+#     then CreateProcessW-spawns a child python.exe inside that temp dir.
+#     The Python code we're reading runs in the CHILD, where:
+#       - `sys.executable` = the temp-extracted python.exe (NOT the on-disk
+#         .exe — `sys.executable` here is the interpreter actually executing
+#         this code, which is the freshly-extracted CPython under TEMP).
+#       - `__file__`       = the temp extraction dir's compiled module path.
+#       - `sys.argv[0]`    = path the bootstrap was invoked with (typically
+#         the on-disk .exe, but argv can be lied about by an upstream parent).
+#       - `os.environ["NUITKA_ONEFILE_PARENT"]` = bootstrap process PID. The
+#         bootstrap IS the on-disk .exe → QueryFullProcessImageNameW on this
+#         PID yields the kernel-tracked image path = ground truth.
+#       - `__compiled__.original_argv0` may exist on newer Nuitkas; we treat
+#         it as advisory candidate, not authoritative.
+#
+#     v1.7.17 fixes a latent bug present since v1.7.13's freeze pass: the
+#     comment block previously claimed "sys.executable is the on-disk .exe"
+#     (matching PyInstaller's behavior). Empirically false on Nuitka 4.1.1
+#     — displayoff.log captured `'C:\Users\nate\AppData\Local\Temp\onefile_
+#     42604_561348_DreZIYVFd8M\python.exe'` as `sys.executable`'s value.
+#     `_resolve_on_disk_exe_path()` below is the corrected resolver.
+#
 #   - PyInstaller onefile (defensive — we don't ship this, but the helper
 #     stays correct if someone builds with PyInstaller for testing): sets
-#     `sys.frozen = True` and exposes `sys._MEIPASS` (temp extract dir).
+#     `sys.frozen = True` and exposes `sys._MEIPASS` (temp extract dir);
+#     under PyInstaller `sys.executable` IS the on-disk .exe, so the
+#     resolver's sys.argv[0] strategy catches that case too.
 #   - .py source: neither sentinel is set, `sys.executable` is the Python
 #     interpreter (python.exe / pythonw.exe), `__file__` is the script.
+#     The resolver returns None under source mode and the rename-dance
+#     is skipped entirely.
 #
 # Two distinct directories under freeze:
 #   _HERE        — bundle's temp extraction dir (where displayoff.ico and
@@ -70,6 +95,157 @@ def _is_frozen():
     return getattr(sys, "frozen", False) or "__compiled__" in globals()
 
 
+# Buffer for migration + diagnostic messages emitted before basicConfig
+# wires up the file handler. main() flushes this list once the logger is
+# live. Module-level so the path resolver, ensure_data_dir, and
+# _migrate_legacy_data can all append.
+_MIGRATION_LOG: list[str] = []
+
+
+def _resolve_on_disk_exe_path():
+    """Resolve the on-disk displayoff.exe path under freeze. None under .py.
+
+    v1.7.17 fix: see freeze-mode comment block above for why sys.executable
+    is wrong here. Layered fallback chain:
+
+      1. `NUITKA_ONEFILE_PARENT` + `QueryFullProcessImageNameW(parent_pid)`
+         — bootstrap IS the on-disk .exe, kernel-tracked image path = truth.
+      2. `os.path.abspath(sys.argv[0])` if it ends in .exe and isn't under
+         %TEMP%. Per Nuitka docs sys.argv[0] is the original onefile binary.
+      3. Final fallback: `sys.executable` with a WARNING log. We get here
+         only if both primary strategies failed — Nuitka likely changed its
+         environment contract; v1.7.18 patch territory.
+
+    Diagnostic logging captures every candidate so future verifier rounds
+    can read the log rather than re-derive."""
+    if not _is_frozen():
+        return None
+
+    candidates = {
+        "sys.executable": os.path.abspath(sys.executable) if sys.executable else None,
+        "sys.argv[0]": os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else None,
+        "NUITKA_ONEFILE_PARENT": os.environ.get("NUITKA_ONEFILE_PARENT"),
+        "__compiled__.original_argv0": getattr(
+            globals().get("__compiled__"), "original_argv0", None
+        ),
+        "__compiled__.containing_dir": getattr(
+            globals().get("__compiled__"), "containing_dir", None
+        ),
+    }
+    _MIGRATION_LOG.append(
+        "_resolve_on_disk_exe_path candidates: " + ", ".join(
+            f"{k}={v!r}" for k, v in candidates.items()
+        )
+    )
+
+    # Strategy 1: NUITKA_ONEFILE_PARENT → QueryFullProcessImageNameW.
+    # Self-contained ctypes inside the helper because the file's main win32
+    # bindings block is defined later (this helper runs at module import
+    # before that block executes). argtypes/restype set explicitly per the
+    # file's pointer-width discipline (HANDLE is pointer-sized; default
+    # c_int restype would truncate on 64-bit).
+    #
+    # Trust-boundary note: `NUITKA_ONEFILE_PARENT` is parent-controlled
+    # env. An attacker who can `CreateProcessW` displayoff.exe with a
+    # spoofed env block could redirect this resolver to an arbitrary PID's
+    # image. The attacker already has local code-exec as the current user
+    # at that point (they spawned us with a controlled env), so this is
+    # not a privilege escalation — the trust boundary was broken upstream.
+    # The strategy 1 result is filtered through `.endswith(".exe")` as a
+    # weak sanity check; downstream consumers (rename-dance, autostart
+    # .lnk) write only inside the resolved path's directory, which the
+    # spawning user already controls.
+    #
+    # PID-reuse race: Nuitka's bootstrap parent stays alive until the
+    # child exits (the onefile model), so the parent_pid is still bound
+    # to the actual bootstrap process at module-import time. PID-reuse
+    # race window is effectively zero. If a future Nuitka version
+    # detaches the bootstrap, the `.endswith(".exe")` check and strategy
+    # 2's TEMP-prefix filter still bound the damage.
+    parent_pid_str = os.environ.get("NUITKA_ONEFILE_PARENT")
+    if sys.platform == "win32" and parent_pid_str:
+        try:
+            parent_pid = int(parent_pid_str)
+        except ValueError:
+            parent_pid = 0
+        if parent_pid:
+            try:
+                import ctypes.wintypes as _wt
+                _k = ctypes.WinDLL("kernel32", use_last_error=True)
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                _OpenProcess = _k.OpenProcess
+                _OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+                _OpenProcess.restype = _wt.HANDLE
+                _QueryImg = _k.QueryFullProcessImageNameW
+                _QueryImg.argtypes = [
+                    _wt.HANDLE, _wt.DWORD, _wt.LPWSTR, ctypes.POINTER(_wt.DWORD)
+                ]
+                _QueryImg.restype = _wt.BOOL
+                _Close = _k.CloseHandle
+                _Close.argtypes = [_wt.HANDLE]
+                _Close.restype = _wt.BOOL
+                handle = _OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, parent_pid
+                )
+                if handle:
+                    try:
+                        # 32768 chars = the Win32 \\?\-prefixed long-path
+                        # ceiling. QueryFullProcessImageNameW returns the
+                        # path without \\?\ prefix (dwFlags=0), so the
+                        # actual ceiling is MAX_PATH-style ~260, but we
+                        # over-allocate for safety against future kernel
+                        # changes — it's a one-time module-init alloc.
+                        buf = ctypes.create_unicode_buffer(32768)
+                        size = _wt.DWORD(len(buf))
+                        if _QueryImg(handle, 0, buf, ctypes.byref(size)):
+                            resolved = buf.value
+                            _MIGRATION_LOG.append(
+                                f"_resolve_on_disk_exe_path: "
+                                f"NUITKA_ONEFILE_PARENT pid={parent_pid} -> "
+                                f"{resolved!r}"
+                            )
+                            if resolved and resolved.lower().endswith(".exe"):
+                                return os.path.abspath(resolved)
+                    finally:
+                        _Close(handle)
+                else:
+                    _MIGRATION_LOG.append(
+                        f"_resolve_on_disk_exe_path: OpenProcess failed for "
+                        f"parent_pid={parent_pid} (err="
+                        f"{ctypes.get_last_error()}) — falling back"
+                    )
+            except Exception as e:
+                _MIGRATION_LOG.append(
+                    f"_resolve_on_disk_exe_path: parent-PID strategy "
+                    f"errored ({e!r}) — falling back"
+                )
+
+    # Strategy 2: sys.argv[0] if it's outside TEMP and ends with .exe.
+    argv0 = candidates.get("sys.argv[0]")
+    if argv0 and argv0.lower().endswith(".exe"):
+        temp_dir = os.environ.get("TEMP", "")
+        in_temp = bool(temp_dir) and argv0.lower().startswith(
+            os.path.abspath(temp_dir).lower()
+        )
+        if not in_temp:
+            _MIGRATION_LOG.append(
+                f"_resolve_on_disk_exe_path: sys.argv[0] strategy -> {argv0!r}"
+            )
+            return argv0
+
+    # Strategy 3: last-resort fallback to sys.executable. BOTH primary
+    # strategies failed — Nuitka likely changed its environment contract.
+    exe = candidates.get("sys.executable")
+    _MIGRATION_LOG.append(
+        f"_resolve_on_disk_exe_path: WARNING — both primary strategies "
+        f"failed; falling back to sys.executable={exe!r}. The on-disk "
+        f"path may be wrong; rename-dance + autostart .lnk + tray_promoter "
+        f"will mis-target. Please report displayoff.log to "
+        f"github.com/itsnateai/displayoff/issues."
+    )
+    return exe
+
+
 # ── Paths ──────────────────────────────────────────────────────────────────
 # See the freeze-mode block above for why _HERE and _INSTALL_DIR can
 # differ under one-file freezers.
@@ -82,18 +258,13 @@ def _is_frozen():
 # autostart section below — both use the same `APPDATA` env var, so when the
 # fallback to _HERE fires here it also fires for autostart).
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_EXE_PATH = os.path.abspath(sys.executable) if _is_frozen() else None
+_EXE_PATH = _resolve_on_disk_exe_path()
 _INSTALL_DIR = (os.path.dirname(_EXE_PATH) if _EXE_PATH
                 else os.path.dirname(os.path.abspath(__file__)))
 _DATA_DIR = (os.path.join(os.environ.get("APPDATA", ""), "displayoff")
              if os.environ.get("APPDATA") else _HERE)
 _ICON_PATH = os.path.join(_HERE, "displayoff.ico")
 _CONFIG_PATH = os.path.join(_DATA_DIR, "displayoff_config.json")
-
-# Buffer for migration messages emitted before basicConfig wires up the file
-# handler. main() flushes this list once the logger is live. Module-level
-# so both ensure_data_dir and _migrate_legacy_data can append.
-_MIGRATION_LOG: list[str] = []
 
 # One-shot gate (v1.7.12): _migrate_legacy_data is idempotent by design (each
 # file check is `src exists AND dst missing`), but the existence-check loop
@@ -658,7 +829,23 @@ def _require_appdata():
 
 def _autostart_target_pythonw():
     """Resolve the `pythonw.exe` path that should launch us at logon. Prefers
-    `pythonw.exe` over `python.exe` so there's no console flash."""
+    `pythonw.exe` over `python.exe` so there's no console flash.
+
+    Source-mode only — never call under freeze. Under Nuitka onefile,
+    `sys.executable` is the temp-extracted python.exe under `%TEMP%` and
+    would produce a .lnk that breaks the moment the bootstrap exits (the
+    temp dir is per-launch, the .lnk would point at a path that vanishes).
+    The assert below is defense-in-depth: every other v1.7.17 call site
+    that touched `sys.executable` got migrated to the resolver; this one
+    is gated by the freeze check at the only caller (`_autostart_target`),
+    but a future refactor could plumb it under a frozen branch by mistake.
+    The same docstring-trust failure that bit v1.7.13 → v1.7.16 is the
+    exact thing we're defending against."""
+    assert not _is_frozen(), (
+        "_autostart_target_pythonw must never be called under freeze — "
+        "sys.executable is the temp-extracted python.exe, not the on-disk "
+        ".exe. Use _EXE_PATH for the .lnk target under freeze."
+    )
     py = sys.executable
     if py.lower().endswith("python.exe"):
         pyw = py[:-len("python.exe")] + "pythonw.exe"
@@ -1708,7 +1895,37 @@ _update_check_cache_lock = threading.Lock()
 # etc.) the bool prevents a second toast within one process invocation. The
 # acceptable degradation under RO-APPDATA is still "one toast per launch",
 # never "two toasts per launch".
+# v1.7.17: lock-guarded gate. Previously a bare bool, flagged by the
+# workspace's "no GIL-only assumptions" rule. The lock protects the
+# claim-then-fire-then-release pattern: a caller claims the gate up front,
+# fires the toast, and releases on notify failure (so a retry on next
+# launch is possible). Two simultaneous _frozen_promote_ping invocations
+# (today only spawned once per launch, but defended against future
+# refactors) cannot both win the claim.
+_PING_GATE_LOCK = threading.Lock()
 _PING_FIRED_THIS_PROCESS = False
+
+
+def _try_claim_ping_gate():
+    """Atomic test-and-set. Returns True iff this caller wins the slot to
+    fire the frozen-first-launch promotion ping. Subsequent callers in the
+    same process get False until `_release_ping_gate` is called (which only
+    happens on notify failure)."""
+    global _PING_FIRED_THIS_PROCESS
+    with _PING_GATE_LOCK:
+        if _PING_FIRED_THIS_PROCESS:
+            return False
+        _PING_FIRED_THIS_PROCESS = True
+        return True
+
+
+def _release_ping_gate():
+    """Release the gate so a later caller can retry. Only called when the
+    icon.notify call raised — the toast didn't actually fire, so the gate
+    must not stay claimed."""
+    global _PING_FIRED_THIS_PROCESS
+    with _PING_GATE_LOCK:
+        _PING_FIRED_THIS_PROCESS = False
 
 
 def _version_tuple(v):
@@ -2130,6 +2347,52 @@ def _recover_from_failed_update():
     for path in (tmp_path, old_path):
         if not os.path.exists(path):
             continue
+        # v1.7.17: preserve `.old` if its mtime is newer than current. The
+        # realistic scenario this protects: user did
+        # `copy displayoff.exe displayoff.exe.old` AS A MANUAL BACKUP after
+        # install (NTFS `copy` updates the destination's mtime to "now"
+        # while current's mtime stays at the original rename-dance time).
+        # `.old.mtime > current.mtime` then, and auto-cleanup of such a
+        # user-curated backup is hostile — keep it around until the user
+        # moves or deletes it themselves. Doesn't apply to `.tmp`
+        # (untrusted download bytes; always clean).
+        #
+        # The post-successful-update common case is `.old.mtime <
+        # current.mtime` (rename-dance: download → current at T1, current
+        # → .old at T0+ε; current ends up with the LATER mtime), so the
+        # preserve branch doesn't fire and cleanup runs as designed.
+        if path == old_path:
+            try:
+                old_mtime = os.path.getmtime(path)
+                cur_mtime = os.path.getmtime(_EXE_PATH)
+                # Strict > (not >=): equal mtimes (e.g. filesystem
+                # truncation to 1-second resolution when current and .old
+                # were written within the same second) fall through to
+                # the delete branch. The post-rename common case is
+                # current.mtime > .old.mtime by milliseconds, so equal
+                # mtime is the ambiguous edge and we default to cleanup.
+                if old_mtime > cur_mtime:
+                    log.info(
+                        "Preserving %s (mtime %.0f > current .exe mtime "
+                        "%.0f) — looks like a deliberate manual rollback "
+                        "backup; user can delete it manually.",
+                        path, old_mtime, cur_mtime,
+                    )
+                    continue
+            except OSError as e:
+                # mtime read failed. PRESERVE `.old` rather than fall
+                # through to delete: the most likely cause is that
+                # `_EXE_PATH` is missing (crash mid-rename left current
+                # in pieces). In that scenario `.old` is the only good
+                # copy — auto-deleting it would destroy the user's last
+                # recoverable artifact. Belt-and-suspenders: log and skip.
+                log.warning(
+                    "Could not compare mtimes for %r vs current .exe "
+                    "(%s) — preserving %r as a safe default rather than "
+                    "deleting an artifact we can't classify.",
+                    path, e, path,
+                )
+                continue
         try:
             os.remove(path)
             log.info("Cleaned update artifact: %s", path)
@@ -2460,7 +2723,14 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
     # margin. winfo_reqwidth includes Tk's padding from pack(padx=...).
     btn_row_w = btn_frame.winfo_reqwidth()
     body_w = body.winfo_reqwidth()
-    chrome_margin = 40  # rough Toplevel chrome + Tk's pack padding budget
+    # v1.7.17: DPI-relative chrome margin. winfo_pixels("0.4i") returns
+    # ~38 px at 100% DPI (close to the prior hardcoded 40) and scales
+    # correctly at 125%/150%/175%/200% so the button row's right edge isn't
+    # clipped under high-DPI scaling. 0.4" rather than 0.3" so the 100%
+    # case stays at ~38 px (parity with prior behavior), preserving the
+    # v1.7.16 fix that closed the 3-button-row clip without regressing
+    # standard-DPI users who had been fine with 40.
+    chrome_margin = dlg.winfo_pixels("0.4i")
     min_dialog_w = max(body_w, btn_row_w + chrome_margin)
     w, h = max(dlg.winfo_reqwidth(), min_dialog_w), dlg.winfo_reqheight()
     try:
@@ -3879,8 +4149,12 @@ def run_tray():
         # the tray overflow flyout for the first time), which can happen
         # hours after launch. The promoter uses backoff (0.5s for the
         # first minute, then 30s thereafter) so the CPU cost is negligible.
+        # v1.7.17: prefer the resolved on-disk .exe under freeze. Under
+        # .py source `_EXE_PATH is None` and we fall back to sys.executable
+        # (pythonw.exe), which is the correct ExecutablePath for the source
+        # mode anyway since pystray uses pythonw to attach the icon.
         promote_in_background(
-            exe_path=sys.executable,
+            exe_path=_EXE_PATH or sys.executable,
             tooltip=tray_tooltip,
             baseline=tray_baseline,
             max_wait_secs=None,
@@ -3962,8 +4236,14 @@ def run_tray():
             # config flag is the cross-launch gate; this module-level bool
             # is the within-process gate that holds even when the disk
             # write fails (RO-APPDATA, AV lock, locked-down policy).
-            global _PING_FIRED_THIS_PROCESS
-            if _PING_FIRED_THIS_PROCESS:
+            #
+            # v1.7.17: lock-guarded claim/release pattern (see
+            # _try_claim_ping_gate / _release_ping_gate). Claim up front so
+            # two simultaneous spawns of this thread (today there's only
+            # one, but the rule about no-bare-bool-shared-state applies
+            # regardless) can't both pass the gate and both fire the toast.
+            # Release on notify failure so next launch retries.
+            if not _try_claim_ping_gate():
                 log.info("Frozen-first-launch promotion ping already fired this "
                          "process — skipping (in-memory dedupe).")
                 return
@@ -3972,7 +4252,8 @@ def run_tray():
             # notification — gives pystray's NIM_ADD time to register
             # before we fire NIF_INFO. If notify fires before NIM_ADD
             # lands, pystray silently no-ops; we catch the exception
-            # below and DON'T set the flag, so next launch retries.
+            # below, release the gate, and DON'T persist the disk flag,
+            # so next launch retries.
             time.sleep(_TRAY_SETTLE_SECS)
             notify_ok = False
             try:
@@ -3989,19 +4270,19 @@ def run_tray():
                 log.warning("Could not fire frozen-first-launch promotion "
                             "notification: %s. Tray icon may stay hidden; user "
                             "can manually toggle Settings ▸ Personalization "
-                            "▸ Taskbar ▸ Other system tray icons. The flag is "
-                            "NOT being set, so a retry will fire on next "
+                            "▸ Taskbar ▸ Other system tray icons. The gate is "
+                            "released so a retry will fire on next "
                             "launch.", e)
 
             if not notify_ok:
+                _release_ping_gate()
                 return
 
-            # Flag the in-memory dedupe BEFORE the disk write attempt: even
-            # if save_config raises (RO-APPDATA), within-process re-entry
-            # must still be blocked. The toast already fired; firing a
-            # second one in the same process is the failure mode the bool
-            # is preventing.
-            _PING_FIRED_THIS_PROCESS = True
+            # Gate stays claimed (already set by _try_claim_ping_gate).
+            # Disk write can fail (RO-APPDATA, AV lock) but within-process
+            # re-entry is already blocked by the claimed gate. The toast
+            # already fired; firing a second one in the same process is
+            # the failure mode the gate is preventing.
 
             # Read-modify-write off the on-disk config to defeat the race
             # against a concurrent Settings → Save: the user's just-edited
