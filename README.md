@@ -44,6 +44,12 @@ Both modes use the same global hotkey (**Ctrl+Alt+F12** by default) and the same
 - **Autostart toggle** — one-click register/unregister at Windows startup
 - **No admin required, no telemetry, no automatic phone-home** — manual update-check only
 
+## Screenshots
+
+| Tray Menu | Settings |
+|:---:|:---:|
+| ![Menu](screenshots/displayoffmenu.png) | ![Settings](screenshots/displayoffsettings.png) |
+
 ## Usage
 
 CLI flags work identically whether you launch `displayoff.exe` or `python displayoff.py` — pick whichever your install uses.
