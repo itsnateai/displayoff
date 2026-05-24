@@ -34,6 +34,15 @@ A 6-agent verifier pass (3 topics × Sonnet + Opus pair-by-topic) caught four is
 
 Verifier output landed in `~/.claude/state/verification-log.jsonl`. The blue-team-only paths (Settings dialog Cancel doesn't revert in-memory cfg, hotkey lock-edge race window, toast-text doesn't name non-PT-Awake culprits, syscall inside lock window) were intentionally left as-is — each one matches existing v1.7.20 convention or a documented trade-off.
 
+### Verifier-round convergent (Round 2 doc-only)
+
+A second 6-agent verifier round (after the mid-round hardening above) returned `[VERIFY-CLEAN]` from every agent. Two pair-convergent LOW observations were addressed as doc-only follow-ups:
+
+- **T3 pair (Sonnet + Opus) convergent:** the `powrprof.dll` binding comment at the top of the file claimed `CallNtPowerInformation(SystemExecutionState)` was a per-session aggregate. T3-Sonnet fetched Microsoft Learn live; the docs name the value "system execution state buffer" without explicit per-session qualifier, and `SetThreadExecutionState` is documented as a machine-global mechanism — together those put the system-wide interpretation on solid ground, even if MS Learn doesn't state the cross-session corollary in so many words. Comment updated to say SYSTEM-WIDE and the Fast-User-Switching false-positive case (User B's wake-lock causing User A's blocked-toast under FUS) is now called out inline so future readers don't expect session-scoping.
+- **T2 pair (Sonnet + Opus) convergent (post-fix residual):** the original toast-spam was rated MEDIUM by T2-Opus and LOW by T2-Sonnet in Round 1; both drove the mid-round state-transition rate-limit fix. After that fix landed, both agents independently re-evaluated the residual 5-min `_WARN_COOLDOWN_SECS` window — which still permits ~12 toasts/hour for a user who has idle-blank set AND PT Awake intentionally on (e.g. watching a long video) — and called the residual a defensible trade-off rather than a bug. `warn_on_blocked_blank` is the user-facing escape hatch. Added an inline comment near `_WARN_COOLDOWN_SECS` documenting the acceptance and pointing to the Settings checkbox as the user-visible workaround.
+
+Neither change touches behavior. Both are anchored next to the relevant code so a future maintainer doesn't re-derive the trade-off from scratch.
+
 ## [1.7.20] — 2026-05-22
 
 **Final planned release. Maintenance-only mode after this.** Bundle of every deferred and out-of-scope item from the v1.7.17 / v1.7.18 / v1.7.19 train: 14 items grouped as resolver hardening (A1–A3), UX + observability (B4–B6), build + release hygiene (C7–C12), cosmetic (D13–D14).

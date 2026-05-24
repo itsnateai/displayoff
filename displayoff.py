@@ -946,7 +946,8 @@ if sys.platform == "win32":
 
     # powrprof.dll — CallNtPowerInformation(SystemExecutionState) returns the
     # kernel's aggregate EXECUTION_STATE bitmask (the OR of every active
-    # SetThreadExecutionState call across the session). Used by
+    # SetThreadExecutionState call SYSTEM-WIDE, across every session — verified
+    # against Microsoft Learn `nf-powerbase-callntpowerinformation`). Used by
     # _check_display_blocked() to detect when PowerToys Awake / video players /
     # presentation apps are holding the display awake via
     # ES_DISPLAY_REQUIRED. Unprivileged — `powercfg /requests` would give us
@@ -954,6 +955,16 @@ if sys.platform == "win32":
     # runs under the user's standard token. Try-import so a stripped
     # powrprof.dll (rare; some hardened Win images) leaves the helper as a
     # silent no-op rather than crashing the tray.
+    #
+    # System-wide scope means: under Fast User Switching, a wake-lock held by
+    # User B's PT Awake (while B is switched-away) will appear in User A's
+    # blocked-check too, producing a false-positive toast for A. The blank
+    # still attempts (the toast is advisory), so this is a UX inaccuracy not
+    # a correctness regression — flagged here so future-readers don't expect
+    # session-scoping. (Note: displayoff itself runs per-session — the
+    # single-instance mutex is `Local\` scope, so each FUS user has their
+    # own tray — but the kernel-state read crosses the session boundary
+    # because the kernel's SetThreadExecutionState bookkeeping is global.)
     try:
         _powrprof = ctypes.WinDLL("powrprof", use_last_error=True)
         CallNtPowerInformation = _powrprof.CallNtPowerInformation
@@ -1771,6 +1782,14 @@ _tray_icon_ref = None
 # _WARN_COOLDOWN_SECS (so idle-watcher refires + rapid-fire hotkey presses
 # don't spam). The blank attempt itself still fires every call — the
 # rate-limit only gates the notification, not the action.
+#
+# Accepted UX trade-off: a user with idle-blank set AND PT Awake
+# intentionally on (e.g. watching a long video) gets one toast every 5
+# minutes for the duration of the video. The escape hatch is the Settings
+# checkbox "Warn when something is keeping the display awake" — they can
+# disable the warn without disabling the idle-blank. Better than v1.7.20's
+# silent failure for the "forgot PT Awake was on" case, which is the
+# bug-fix this whole rate-limit exists to surface.
 _WARN_COOLDOWN_SECS = 300.0
 _last_warn_ts = 0.0
 _last_warn_was_blocked = False
