@@ -1,5 +1,39 @@
 # Changelog — Display Off
 
+## [1.7.21] — 2026-05-23
+
+**Maintenance-mode exception** — one user-reported UX gap surfaced after v1.7.20's "final release" tag: when something held `ES_DISPLAY_REQUIRED` (PowerToys Awake's "Keep screen on", a fullscreen video player, presentation mode), the hotkey appeared to silently no-op. The blank attempt actually fired correctly, but the kernel's native idle-blank path respects display wake-locks by design — so the user saw "nothing happens" with no signal as to why.
+
+### Added
+
+- **Blocked-blank tray notification.** Before each blank attempt on the native path, `turn_off_monitors()` calls a new `_check_display_blocked()` helper which uses `CallNtPowerInformation(SystemExecutionState, ...)` to read the kernel's aggregate `EXECUTION_STATE` bitmask. If `ES_DISPLAY_REQUIRED` is set, a tray toast fires naming the most common culprit ("an app is keeping the display awake (e.g. PowerToys Awake)"). The blank attempt still runs afterward — the check is advisory, not a suppression gate. Skipped on the legacy `SC_MONITORPOWER` path because that path bypasses the wake-lock on most hardware; warning there would scare the user about a state that doesn't actually affect them.
+- **`warn_on_blocked_blank` config key (default: True).** New Settings checkbox: "Warn when something is keeping the display awake". Stored in `displayoff_config.json`; backfilled by `load_config` for existing configs from older versions.
+
+### Why `CallNtPowerInformation` rather than `powercfg /requests`
+
+`powercfg /requests` would give us the responsible process names (e.g. `[PROCESS] \Device\HarddiskVolumeX\Program Files\PowerToys\PowerToys.Awake.exe`) but it requires administrator privileges. Displayoff intentionally runs under the user's standard token — adding elevation just to show a tooltip would mangle the tray-attach UX and trip UAC on every launch. `CallNtPowerInformation(SystemExecutionState)` is the unprivileged equivalent for the `SetThreadExecutionState` side of the API, which is the side PowerToys Awake uses. The trade-off is that we lose process names and we miss any wake-locks set via `PoCreatePowerRequest` (rare; mostly old media players). The toast text generalizes to "an app is keeping the display awake (e.g. PowerToys Awake)" rather than naming a specific process, which is honest about what we can and can't see.
+
+### Mechanism details
+
+- New `powrprof.dll` binding alongside the existing `kernel32` / `user32` / `advapi32` block, with try-import fallback so a stripped `powrprof.dll` on a hardened Win image leaves the helper as a silent no-op rather than crashing the tray.
+- Module-level `_tray_icon_ref` (set inside `run_tray()` immediately after `pystray.Icon(...)` constructs) so `turn_off_monitors()` can fire `icon.notify()` from the hotkey / idle-watcher / icon-double-click paths without threading the `icon` reference through every call site. None-guarded — pre-tray paths (`--off` CLI, etc.) skip the toast cleanly.
+- `_check_display_blocked()` fails quiet on every error path: missing binding, `OSError`, non-zero NTSTATUS. The blank itself is the contract; the toast is a hint. A debug-level log entry records the failure mode for forensic purposes.
+
+### Settings dialog
+
+- New checkbox added to `_build_options_section`: "Warn when something is keeping the display awake". One new builder argument, one new row index. Footer row bumped 7 → 8 to make room. The dialog's other options remain in the same visual order.
+
+### Verifier-round convergent (mid-round)
+
+A 6-agent verifier pass (3 topics × Sonnet + Opus pair-by-topic) caught four issues that were rolled into v1.7.21 before tag:
+
+- **`build-exe.bat` VERSION pin was still `1.7.20`** — local builds (Nate's daily-driver path; CI uses `build-release.sh` which scrapes `__version__` from source) would have stamped a v1.7.21-source binary with `--product-version=1.7.20.0` / `--file-version=1.7.20.0`. Bumped to `1.7.21`. The `REM Verify:` comment line was also updated to `1.7.21`. **Convergence:** T2-Opus HIGH.
+- **Idle-watcher + rapid-hotkey toast spam** — both T2-Sonnet and T2-Opus flagged that the idle watcher refires `turn_off_monitors()` every `_IDLE_REFIRE_COOLDOWN_SECS` (60 s) while the user stays idle, and that the original implementation would toast on every refire. Replaced the time-only rate-limit with a state-transition logic: toast IMMEDIATELY on a fresh `not-blocked → blocked` transition (so the user toggling PT Awake off-and-back-on re-warns immediately), suppress back-to-back `blocked` detections within a 5-minute window, reset state on any `not-blocked` read. The blank attempt still fires on every call — the rate-limit only gates the notification, not the action. **Convergence:** T2-Sonnet LOW + T2-Opus MEDIUM.
+- **Stale row-layout comment block above `_build_header`** — the comment documented the old 3-option / footer-at-row-7 layout, and silently misled a future contributor adding a fifth row. Updated to show row 6 = warn checkbox, row 7 = idle spinbox, row 8 = footer. **Convergence:** T1-Opus LOW.
+- **CHANGELOG / project CLAUDE.md referenced a `setup_tray()` symbol that doesn't exist** — the ref-stash code lives inline in `run_tray()`, not a separate `setup_tray()`. Future readers would have grepped for a non-existent symbol. **Convergence:** T2-Opus LOW.
+
+Verifier output landed in `~/.claude/state/verification-log.jsonl`. The blue-team-only paths (Settings dialog Cancel doesn't revert in-memory cfg, hotkey lock-edge race window, toast-text doesn't name non-PT-Awake culprits, syscall inside lock window) were intentionally left as-is — each one matches existing v1.7.20 convention or a documented trade-off.
+
 ## [1.7.20] — 2026-05-22
 
 **Final planned release. Maintenance-only mode after this.** Bundle of every deferred and out-of-scope item from the v1.7.17 / v1.7.18 / v1.7.19 train: 14 items grouped as resolver hardening (A1–A3), UX + observability (B4–B6), build + release hygiene (C7–C12), cosmetic (D13–D14).

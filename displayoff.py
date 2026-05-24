@@ -36,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.20"
+__version__ = "1.7.21"
 
 log = logging.getLogger("displayoff")
 
@@ -695,6 +695,18 @@ SMTO_ABORTIFHUNG = 0x0002
 SM_REMOTESESSION = 0x1000  # GetSystemMetrics index for "is this an RDP session?"
 ERROR_ALREADY_EXISTS = 183
 
+# CallNtPowerInformation level for the aggregate EXECUTION_STATE bitmask.
+# Documented value is 16 (POWER_INFORMATION_LEVEL::SystemExecutionState).
+_SYSTEM_EXECUTION_STATE = 16
+# EXECUTION_STATE bit flags (winnt.h). Only ES_DISPLAY_REQUIRED would suppress
+# the native idle-blank — ES_SYSTEM_REQUIRED alone (e.g. PT Awake's "keep
+# awake without screen-on") lets the display blank normally, so we don't warn
+# on it. ES_CONTINUOUS is the marker bit; it's always set whenever any other
+# bit is set and isn't itself a wake-lock.
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+_ES_CONTINUOUS = 0x80000000
+
 # ── Tunables ───────────────────────────────────────────────────────────────
 _TRIGGER_SETTLE_SECS = 0.5      # Delay before powering off so the trigger keypress doesn't immediately wake.
 _LOCK_SETTLE_SECS = 0.3         # Delay between LockWorkStation and the blank.
@@ -931,6 +943,30 @@ if sys.platform == "win32":
                                      ctypes.wintypes.DWORD,
                                      ctypes.POINTER(ctypes.wintypes.DWORD)]
     GetTokenInformation.restype = ctypes.wintypes.BOOL
+
+    # powrprof.dll — CallNtPowerInformation(SystemExecutionState) returns the
+    # kernel's aggregate EXECUTION_STATE bitmask (the OR of every active
+    # SetThreadExecutionState call across the session). Used by
+    # _check_display_blocked() to detect when PowerToys Awake / video players /
+    # presentation apps are holding the display awake via
+    # ES_DISPLAY_REQUIRED. Unprivileged — `powercfg /requests` would give us
+    # the responsible process names too, but requires admin and displayoff
+    # runs under the user's standard token. Try-import so a stripped
+    # powrprof.dll (rare; some hardened Win images) leaves the helper as a
+    # silent no-op rather than crashing the tray.
+    try:
+        _powrprof = ctypes.WinDLL("powrprof", use_last_error=True)
+        CallNtPowerInformation = _powrprof.CallNtPowerInformation
+        CallNtPowerInformation.argtypes = [
+            ctypes.c_int,                    # POWER_INFORMATION_LEVEL
+            ctypes.c_void_p,                 # InputBuffer
+            ctypes.wintypes.ULONG,           # InputBufferLength
+            ctypes.c_void_p,                 # OutputBuffer
+            ctypes.wintypes.ULONG,           # OutputBufferLength
+        ]
+        CallNtPowerInformation.restype = ctypes.c_long   # NTSTATUS
+    except (OSError, AttributeError):
+        CallNtPowerInformation = None
 else:
     SendMessageTimeoutW = None
     GetForegroundWindow = None
@@ -951,6 +987,7 @@ else:
     OpenProcess = None
     OpenProcessToken = None
     GetTokenInformation = None
+    CallNtPowerInformation = None
     _uxtheme = None
     _SetProcessDpiAwarenessContext = None
     _SetProcessDpiAwareness = None
@@ -1030,6 +1067,11 @@ _DEFAULT_CONFIG = {
     # hybrid GPU laptops). Set true to force the legacy SC_MONITORPOWER path
     # used in v1.0-1.5.
     "use_legacy_sc_monitorpower": False,
+    # v1.7.21: when True, show a tray toast on hotkey/icon/idle blank attempts
+    # if the kernel reports ES_DISPLAY_REQUIRED (PowerToys Awake "Keep screen
+    # on", fullscreen video players, presentation apps). Default ON because
+    # the alternative is the silent failure that motivated the feature.
+    "warn_on_blocked_blank": True,
     # v1.7.13: one-shot flag set after the first successful tray-promotion
     # notification fires under the frozen .exe build. Win11 22H2+ defaults
     # new tray icons (new ExecutablePath in NotifyIconSettings) to hidden-
@@ -1709,6 +1751,78 @@ def lock_workstation():
         return False
 
 
+# ── Display-blocked detection (v1.7.21) ───────────────────────────────────
+# Module-level tray-icon ref so turn_off_monitors() can fire icon.notify()
+# from the hotkey/idle/menu paths without having to thread `icon` through
+# every call site. Set once in run_tray() right after pystray.Icon(...) is
+# constructed; read with a None check (helper is a no-op until set, which
+# means pre-tray paths like --off CLI flags don't try to notify). The
+# --start-off CLI path also predates _tray_icon_ref being assigned (it
+# fires turn_off_monitors() BEFORE run_tray()) — that's an intentional
+# trade-off so autostart-blank stays fast.
+_tray_icon_ref = None
+
+# Toast rate-limit: the idle watcher retries the blank every
+# _IDLE_REFIRE_COOLDOWN_SECS while the user stays idle and PT Awake stays
+# on; without this gate, the user would get a tray toast every minute.
+# State-transition logic: we ALWAYS toast on a fresh blocked→not-blocked-
+# →blocked transition (so disabling PT Awake and re-enabling it re-warns
+# immediately), and we suppress back-to-back blocked detections within
+# _WARN_COOLDOWN_SECS (so idle-watcher refires + rapid-fire hotkey presses
+# don't spam). The blank attempt itself still fires every call — the
+# rate-limit only gates the notification, not the action.
+_WARN_COOLDOWN_SECS = 300.0
+_last_warn_ts = 0.0
+_last_warn_was_blocked = False
+_warn_lock = threading.Lock()  # protects _last_warn_ts / _last_warn_was_blocked RMW
+
+
+def _check_display_blocked():
+    """Return (blocked, reason) tuple.
+
+    blocked: True iff the kernel's aggregate EXECUTION_STATE has
+    ES_DISPLAY_REQUIRED set — meaning some process called
+    SetThreadExecutionState(ES_DISPLAY_REQUIRED) and the native idle-blank
+    will be suppressed by the kernel even though we'll write the 1s timeout
+    cleanly. PowerToys Awake's "Keep screen on" toggle, video players in
+    fullscreen, and presentation apps all do this.
+
+    reason: short user-facing string naming the most common culprit on hit.
+    Empty string when not blocked.
+
+    Fails quiet: any binding/syscall failure returns (False, "") so a broken
+    powrprof.dll never prevents a blank from firing. This is a UX hint, not
+    a correctness gate.
+
+    Trade-off note: `powercfg /requests` would give us the responsible
+    process names, but it requires admin and displayoff runs unelevated.
+    `CallNtPowerInformation(SystemExecutionState)` is the unprivileged
+    equivalent for the SetThreadExecutionState side of the API; processes
+    using only PoCreatePowerRequest won't show up here. Covers the
+    user-reported case (PT Awake) which is what matters for this version.
+    """
+    if CallNtPowerInformation is None:
+        return False, ""
+    state = ctypes.wintypes.ULONG(0)
+    try:
+        status = CallNtPowerInformation(
+            _SYSTEM_EXECUTION_STATE, None, 0,
+            ctypes.byref(state), ctypes.sizeof(state),
+        )
+    except OSError as e:
+        log.debug("CallNtPowerInformation raised: %s", e)
+        return False, ""
+    # STATUS_SUCCESS == 0. Anything else (STATUS_ACCESS_DENIED on locked-down
+    # systems, STATUS_INVALID_PARAMETER on stripped power profiles, etc.) =
+    # fail-quiet.
+    if status != 0:
+        log.debug("CallNtPowerInformation returned NTSTATUS 0x%08x", status & 0xFFFFFFFF)
+        return False, ""
+    if state.value & _ES_DISPLAY_REQUIRED:
+        return True, "an app is keeping the display awake (e.g. PowerToys Awake)"
+    return False, ""
+
+
 def turn_off_monitors(lock_first=None, force_path=None):
     """Blank all displays without putting the PC to sleep.
 
@@ -1755,6 +1869,65 @@ def turn_off_monitors(lock_first=None, force_path=None):
         cfg = load_config()
         if lock_first is None:
             lock_first = bool(cfg.get("lock_on_off", False))
+
+        # v1.7.21: surface display-blocking wake-locks BEFORE the blank attempt
+        # so the user gets a tray toast naming the likely culprit instead of
+        # "I pressed Ctrl+Alt+F12 and nothing happened". Still attempt the
+        # blank afterward — the check is advisory, not a suppression gate (the
+        # legacy SC_MONITORPOWER path actually bypasses ES_DISPLAY_REQUIRED on
+        # some hardware, so refusing to fire would be over-eager). Only
+        # relevant to the native path; SC_MONITORPOWER ignores the wake-lock,
+        # so we skip the toast there to avoid scaring the user about a state
+        # that won't affect them. Failures (missing icon ref, notify
+        # exception) are swallowed — this is a hint, not a contract.
+        if cfg.get("warn_on_blocked_blank", True):
+            using_native = (force_path == "native") or (
+                force_path is None and not cfg.get("use_legacy_sc_monitorpower", False)
+            )
+            if using_native and _tray_icon_ref is not None:
+                blocked, reason = _check_display_blocked()
+                # Always log the kernel-state read so the diagnostic trail
+                # stays complete regardless of toast-rate-limit decisions.
+                if blocked:
+                    log.info("Blank may be suppressed: %s", reason)
+                # State-transition rate limit: toast immediately on
+                # not-blocked → blocked, suppress back-to-back blocked
+                # within _WARN_COOLDOWN_SECS. Reset state on any
+                # not-blocked read so the next blocked detection toasts.
+                global _last_warn_ts, _last_warn_was_blocked
+                now = time.monotonic()
+                show_toast = False
+                # Snapshot the elapsed-since-last value INSIDE the lock so
+                # the debug log line below reads a consistent number even
+                # if another thread updates _last_warn_ts after we release.
+                suppress_elapsed = 0.0
+                with _warn_lock:
+                    if not blocked:
+                        _last_warn_was_blocked = False
+                    elif not _last_warn_was_blocked:
+                        # Fresh transition into blocked state — always toast.
+                        _last_warn_ts = now
+                        _last_warn_was_blocked = True
+                        show_toast = True
+                    elif now - _last_warn_ts >= _WARN_COOLDOWN_SECS:
+                        # Still blocked but cooldown elapsed — toast again
+                        # as a periodic reminder.
+                        _last_warn_ts = now
+                        show_toast = True
+                    else:
+                        suppress_elapsed = now - _last_warn_ts
+                if show_toast:
+                    try:
+                        _tray_icon_ref.notify(
+                            f"Blank may be blocked — {reason}. "
+                            f"Disable it and try again.",
+                            "Display Off",
+                        )
+                    except Exception as e:
+                        log.debug("icon.notify for blocked-blank warning failed: %s", e)
+                elif blocked:
+                    log.debug("Blocked-blank toast suppressed (rate-limit, %.1fs since last)",
+                              suppress_elapsed)
 
         if lock_first:
             if lock_workstation():
@@ -3413,8 +3586,9 @@ def _validate_hotkey_safety(captured):
 # Row layout (lets you add new rows without re-threading indices through the impl):
 #   row 0 — header label                row 4 — lock-on-blank checkbox
 #   row 1 — separator                   row 5 — autostart checkbox
-#   row 2 — hotkey label + field        row 6 — auto-blank-when-idle spinbox
-#   row 3 — hotkey hint                 row 7 — footer (GitHub / Apply / Save / Cancel)
+#   row 2 — hotkey label + field        row 6 — warn-on-blocked-blank checkbox
+#   row 3 — hotkey hint                 row 7 — auto-blank-when-idle spinbox
+#                                       row 8 — footer (GitHub / Apply / Save / Cancel)
 # To add a new option row, pick the next unused row, drop in a `_build_*` call
 # in `_open_settings_impl`, and bump the footer row.
 
@@ -3564,11 +3738,11 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
     hotkey_display.bind("<Button-1>", start_recording)
 
 
-def _build_options_section(root, row, pad, lock_var, autostart_var, idle_var):
-    """Lock-on-blank + autostart checkboxes + idle-trigger spinbox.
-    Spans (row, row+2).
+def _build_options_section(root, row, pad, lock_var, autostart_var, idle_var, warn_var):
+    """Lock-on-blank + autostart + blocked-blank-warn checkboxes + idle-trigger spinbox.
+    Spans (row, row+3).
 
-    To add a fourth option, give it the next row index and bump the footer
+    To add a fifth option, give it the next row index and bump the footer
     in _open_settings_impl.
     """
     import tkinter as tk
@@ -3590,8 +3764,13 @@ def _build_options_section(root, row, pad, lock_var, autostart_var, idle_var):
                                    variable=autostart_var, **_chk_kw)
     autostart_chk.grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=pad, pady=2)
 
+    warn_chk = tk.Checkbutton(root,
+                              text="Warn when something is keeping the display awake",
+                              variable=warn_var, **_chk_kw)
+    warn_chk.grid(row=row + 2, column=0, columnspan=3, sticky="w", padx=pad, pady=2)
+
     idle_frame = tk.Frame(root, bg=_THEME_BG)
-    idle_frame.grid(row=row + 2, column=0, columnspan=3, sticky="w", padx=pad, pady=(6, 2))
+    idle_frame.grid(row=row + 3, column=0, columnspan=3, sticky="w", padx=pad, pady=(6, 2))
     tk.Label(idle_frame, text="Auto-blank after",
              font=("Segoe UI", 10), bg=_THEME_BG, fg=_THEME_FG).pack(side="left")
     tk.Spinbox(idle_frame, from_=0, to=999, width=5, textvariable=idle_var,
@@ -3716,13 +3895,14 @@ def _open_settings_impl(tray_icon, on_saved):
     lock_var = tk.BooleanVar(value=bool(cfg.get("lock_on_off", False)))
     autostart_var = tk.BooleanVar(value=autostart_state["enabled"])
     idle_var = tk.IntVar(value=int(cfg.get("idle_blank_minutes", 0) or 0))
+    warn_var = tk.BooleanVar(value=bool(cfg.get("warn_on_blocked_blank", True)))
 
     # Build sections — row indices live here, so adding a row is a one-line change.
     _build_header(root, row=0, pad=PAD)
     _build_hotkey_row(root, row=2, pad=PAD, cfg=cfg, captured=captured, recording=recording)
     _build_options_section(root, row=4, pad=PAD,
                            lock_var=lock_var, autostart_var=autostart_var,
-                           idle_var=idle_var)
+                           idle_var=idle_var, warn_var=warn_var)
 
     root.columnconfigure(1, weight=1)
 
@@ -3748,6 +3928,7 @@ def _open_settings_impl(tray_icon, on_saved):
         cfg["hotkey"] = dict(captured)
         cfg["lock_on_off"] = bool(lock_var.get())
         cfg["idle_blank_minutes"] = idle_minutes
+        cfg["warn_on_blocked_blank"] = bool(warn_var.get())
         try:
             save_config(cfg)
         except OSError as e:
@@ -3823,7 +4004,9 @@ def _open_settings_impl(tray_icon, on_saved):
     def on_updates_btn():
         _run_update_check(root)
 
-    _build_footer(root, row=7, pad=PAD,
+    # Footer row bumped 7→8 in v1.7.21 because _build_options_section grew
+    # from 3 rows (lock/autostart/idle) to 4 (lock/autostart/warn/idle).
+    _build_footer(root, row=8, pad=PAD,
                   on_save=on_save, on_cancel=on_cancel, on_apply=on_apply,
                   on_about=on_about_btn, on_check_updates=on_updates_btn)
 
@@ -4612,6 +4795,14 @@ def run_tray():
         title=tray_tooltip,
         menu=menu,
     )
+    # v1.7.21: stash a module-level ref so turn_off_monitors() can fire the
+    # blocked-blank toast from the hotkey/idle paths without threading `icon`
+    # through every call site. Set AFTER pystray.Icon(...) returns so the
+    # ref is never read pre-construction (helper is None-guarded regardless).
+    # Note: assigned BEFORE start_hotkey_listener so there's no race window
+    # where a Ctrl+Alt+F12 fires between listener-start and ref-assign.
+    global _tray_icon_ref
+    _tray_icon_ref = icon
 
     start_hotkey_listener(cfg)
     _start_listener_watchdog()
