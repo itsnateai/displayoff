@@ -63,20 +63,65 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout (push trigger)
-        if: github.event_name == 'push'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-
-      - name: Checkout (manual-dispatch trigger)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Checkout
+        # One step handles both triggers via conditional ref:
+        # - push: ref = github.sha (the commit the tag points to; stable
+        #   against tag re-resolution between trigger and checkout)
+        # - workflow_dispatch: ref = inputs.tag (the explicit tag the user
+        #   asked to build; default checkout behavior would otherwise pick
+        #   default-branch HEAD, not the tag)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
 
       - name: Setup Python 3.14
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.14"
+
+      - name: Verify tag matches __version__ (drift guard)
+        # build-release.sh derives the zip name from `__version__` in
+        # displayoff.py. The smoke test downstream constructs its URL from
+        # ${TAG}. If tag and __version__ drift (e.g. tag is v1.7.23 but
+        # __version__ still reads 1.7.22 at the checked-out ref), the build
+        # produces displayoff-v1.7.22.zip, softprops uploads it (the glob
+        # build/displayoff-v*.zip is permissive), and the smoke test 404s on
+        # displayoff-v1.7.23.zip — with the misleading error "CDN host not in
+        # allowlist" rather than the real cause. Fail loudly HERE instead.
+        shell: bash
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Defense-in-depth: reject anything other than a strict semver tag
+          # `vMAJOR.MINOR.PATCH` BEFORE using TAG in any downstream string.
+          # The trigger glob `v*.*.*` (line 36) also matches pre-release
+          # (`v1.7.22-rc1`), build-metadata (`v1.7.22+build5`), and 4-segment
+          # (`v1.7.22.1`) tags — none of which build-release.sh's zip naming
+          # supports. workflow_dispatch additionally accepts arbitrary strings
+          # (the input is `type: string`), so a typo like `main` would otherwise
+          # reach the URL construction step. Fail loudly here with a clear
+          # message, not later with a misleading "drift" or "404" error.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not strict semver vMAJOR.MINOR.PATCH"
+            echo "::error::This workflow does not currently support pre-release tags (e.g. v1.7.22-rc1)"
+            echo "::error::or build-metadata tags (e.g. v1.7.22+build5). If you need that, extend"
+            echo "::error::build-release.sh's zip naming + this guard together."
+            exit 1
+          fi
+          # Strip leading 'v' from TAG; __version__ in displayoff.py has no prefix.
+          EXPECTED="${TAG#v}"
+          # encoding='utf-8' so the guard doesn't crash on non-ASCII bytes above
+          # the __version__ line (windows-latest default is cp1252).
+          ACTUAL=$(python -c "import re,sys; m=re.search(r'^__version__\s*=\s*[\"\x27]([^\"\x27]+)[\"\x27]', open('displayoff.py', encoding='utf-8').read(), re.M); sys.exit('no __version__ found in displayoff.py') if not m else print(m.group(1))")
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Tag/version drift: TAG=$TAG (expected __version__=$EXPECTED) but displayoff.py has __version__=$ACTUAL"
+            echo "::error::Fix one of:"
+            echo "::error::  (a) bump __version__ in displayoff.py to $EXPECTED, commit, retag at HEAD"
+            echo "::error::  (b) move the tag to the commit where __version__=$EXPECTED"
+            exit 1
+          fi
+          echo "OK: tag $TAG matches __version__=$ACTUAL"
 
       - name: Install build dependencies
         shell: bash
@@ -137,14 +182,60 @@ jobs:
           # TAG is the full tag like `v1.7.22`; the zip is named
           # `displayoff-vX.Y.Z.zip` so concatenating ${TAG} into the URL gives
           # the right asset name without a second parse of the version string.
+          # The drift guard above ensures TAG and __version__ agree, so the
+          # zip the build produced is the zip this URL points to.
           URL="https://github.com/itsnateai/displayoff/releases/download/${TAG}/displayoff-${TAG}.zip"
           echo "Probing redirect chain from: $URL"
-          # -L follows redirects; -I emits only headers; -s suppresses
-          # progress noise. The final "location:" line is the resolved
-          # CDN host after all redirects have been followed (curl's
-          # --write-out %{url_effective} would give the same answer).
-          FINAL_URL="$(curl -sIL "$URL" -o /dev/null -w '%{url_effective}\n')"
-          echo "Final URL after redirects: $FINAL_URL"
+          # Capture BOTH the HTTP status of the final response AND the resolved
+          # URL via --write-out, so we can distinguish "asset is missing"
+          # (HTTP 404) from "asset is present but CDN host drifted"
+          # (HTTP 200 + new host).
+          #
+          # Why explicit HTTP_CODE check instead of `curl --fail`: curl --fail
+          # exits non-zero on 4xx/5xx but suppresses the --write-out body on
+          # failure, so we'd lose %{url_effective} in the error path. Capturing
+          # status + URL unconditionally and asserting status==200 ourselves
+          # keeps the diagnostic intact. Asserting HTTP 200 BEFORE the host
+          # allowlist is load-bearing: without it, a 404-page redirected to an
+          # allowed CDN host would pass the allowlist silently on a missing
+          # asset, masking softprops upload failures behind a green CI.
+          #
+          # Retry-with-backoff handles the documented GitHub release mirror
+          # lag (cause (c) in the error block below). Three attempts at
+          # 0s/15s/30s covers the typical propagation window without making
+          # CI wait absurdly on real failures.
+          # BACKOFF drives ATTEMPTS — derive count from array length so a
+          # future edit that extends one stays in sync with the other. Bump
+          # BACKOFF=(0 15 30 60) to get 4 attempts; ATTEMPTS follows.
+          BACKOFF=(0 15 30)
+          ATTEMPTS=${#BACKOFF[@]}
+          HTTP_CODE=""
+          FINAL_URL=""
+          CURL_RC=1
+          for i in $(seq 0 $((ATTEMPTS - 1))); do
+            sleep "${BACKOFF[$i]}"
+            echo "Probe attempt $((i + 1))/$ATTEMPTS (after ${BACKOFF[$i]}s wait)"
+            set +e
+            RESPONSE="$(curl -sIL --max-time 30 -o /dev/null -w '%{http_code} %{url_effective}' "$URL")"
+            CURL_RC=$?
+            set -e
+            HTTP_CODE="${RESPONSE%% *}"
+            FINAL_URL="${RESPONSE#* }"
+            echo "  rc=$CURL_RC  http=$HTTP_CODE  final=$FINAL_URL"
+            if [ "$CURL_RC" -eq 0 ] && [ "$HTTP_CODE" = "200" ]; then
+              break
+            fi
+          done
+          if [ "$CURL_RC" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Asset HEAD probe failed after $ATTEMPTS attempts: rc=$CURL_RC http=$HTTP_CODE"
+            echo "::error::URL: $URL"
+            echo "::error::Final URL after redirects: $FINAL_URL"
+            echo "::error::Likely causes (in order of probability):"
+            echo "::error::  (a) softprops upload silently failed despite fail_on_unmatched_files (rare)"
+            echo "::error::  (b) build produced a zip whose name doesn't match TAG (check drift guard above)"
+            echo "::error::  (c) GitHub release mirror lag past 45s of accumulated sleep / up to 135s wall (rare; manual re-run usually succeeds)"
+            exit 1
+          fi
           ALLOWED_HOSTS=(
             "release-assets.githubusercontent.com"
             "objects.githubusercontent.com"
@@ -153,7 +244,7 @@ jobs:
           MATCHED=0
           for HOST in "${ALLOWED_HOSTS[@]}"; do
             if [[ "$FINAL_URL" == https://${HOST}/* ]]; then
-              echo "OK: final host matches allowlist entry '${HOST}'"
+              echo "OK: HTTP 200 + final host matches allowlist entry '${HOST}'"
               MATCHED=1
               break
             fi
