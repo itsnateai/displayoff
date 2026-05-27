@@ -2382,6 +2382,14 @@ _ALLOWED_UPDATE_HOSTS = (
 # release's assets dict, not by exact filename, since the version-stamped
 # zip name (`displayoff-v1.7.23.zip`) changes every release. SHA256SUMS.txt
 # stays a stable name across versions; it's parsed by zip-filename key.
+# v1.7.22 verifier-round R2 convergent fix (T2 Opus G4 + T3 Opus): the
+# canonical install dir name had been hardcoded as the literal "displayoff"
+# in 5 places (_extract_zip_bundle, _recover_from_failed_update's
+# half-swap detector + artifact list, --after-update-folder-swap's path
+# discovery). Hoisting to a single constant means a future rebrand or
+# install-dir-naming-convention change is a one-line edit, not a grep-
+# and-pray exercise.
+_CANONICAL_INSTALL_NAME = "displayoff"
 _UPDATE_ZIP_SUFFIX = ".zip"
 _UPDATE_MANIFEST_NAME = "SHA256SUMS.txt"
 
@@ -2400,6 +2408,7 @@ _UPDATE_MANIFEST_NAME = "SHA256SUMS.txt"
 #                            (best-effort deleted by --after-update-folder-swap)
 _UPDATE_NEW_ZIP_SUFFIX = ".new.zip"
 _UPDATE_NEW_DIR_SUFFIX = ".new"
+_UPDATE_NEW_STAGING_SUFFIX = ".new.staging"
 _UPDATE_OLD_DIR_SUFFIX = ".old"
 
 # Relaunch-mode persistence: the dance writes this file before spawning the
@@ -2936,8 +2945,10 @@ def _extract_zip_bundle(zip_path, install_parent, log=log):
     import shutil
     import zipfile
 
-    staging = os.path.join(install_parent, "displayoff.new.staging")
-    new_dir = os.path.join(install_parent, "displayoff.new")
+    staging = os.path.join(install_parent,
+                           _CANONICAL_INSTALL_NAME + _UPDATE_NEW_STAGING_SUFFIX)
+    new_dir = os.path.join(install_parent,
+                           _CANONICAL_INSTALL_NAME + _UPDATE_NEW_DIR_SUFFIX)
 
     # Pre-clean any stale artifacts from a crashed prior attempt.
     for path in (staging, new_dir):
@@ -2984,10 +2995,16 @@ def _extract_zip_bundle(zip_path, install_parent, log=log):
     except OSError as e:
         shutil.rmtree(staging, ignore_errors=True)
         return False, f"could not list staging dir {staging!r}: {e}"
+    # Case-fold compare via `.casefold()` (not `.lower()`) so a zip whose
+    # top-level uses a non-ASCII case (e.g. Turkish locale's `İ` → `i̇`
+    # mismatch under `.lower()`) is still matched correctly. R2 T3 Opus
+    # flag — vanishingly unlikely in practice but defends the documented
+    # case-insensitive contract.
+    _expected = _CANONICAL_INSTALL_NAME.casefold()
     matching = [
         e for e in top_entries
         if os.path.isdir(os.path.join(staging, e))
-        and e.lower() == "displayoff"
+        and e.casefold() == _expected
     ]
     if len(matching) != 1:
         shutil.rmtree(staging, ignore_errors=True)
@@ -3244,28 +3261,94 @@ def _recover_from_failed_update():
     # `.old/` artifacts, destroying ALL the user's installed bytes.
     # Resume by completing the second rename — gets the user onto the new
     # version they wanted; .old/ gets cleaned by the loop below.
-    canonical_name = "displayoff"
-    canonical_dir = os.path.join(install_parent, canonical_name)
-    new_dir = os.path.join(install_parent, canonical_name + _UPDATE_NEW_DIR_SUFFIX)
-    old_dir = os.path.join(install_parent, canonical_name + _UPDATE_OLD_DIR_SUFFIX)
-    if (not os.path.exists(canonical_dir)
+    canonical_dir = os.path.join(install_parent, _CANONICAL_INSTALL_NAME)
+    new_dir = os.path.join(install_parent,
+                           _CANONICAL_INSTALL_NAME + _UPDATE_NEW_DIR_SUFFIX)
+    old_dir = os.path.join(install_parent,
+                           _CANONICAL_INSTALL_NAME + _UPDATE_OLD_DIR_SUFFIX)
+
+    # R2 T2 Opus G4: detect the half-swap state EITHER when canonical
+    # doesn't exist at all OR when it exists but is empty. The
+    # empty-but-exists case arises when AV partially-quarantined the
+    # bundle (deleted all files but left the parent dir) or a partial
+    # `rmdir /s` was interrupted by a permission error. Without the
+    # empty-dir branch, the resume is skipped and the cleanup loop then
+    # deletes `.new/` and `.old/`, leaving the user with an empty
+    # canonical and nothing usable — hard brick.
+    canonical_missing_or_empty = False
+    if not os.path.exists(canonical_dir):
+        canonical_missing_or_empty = True
+    else:
+        try:
+            with os.scandir(canonical_dir) as it:
+                # Any entry inside means it's a real install, not empty.
+                if not any(True for _ in it):
+                    canonical_missing_or_empty = True
+                    log.warning(
+                        "Canonical install dir %r exists but is empty — "
+                        "likely a partial-quarantine or interrupted "
+                        "remove. Treating as half-swap candidate.",
+                        canonical_dir,
+                    )
+        except OSError as e:
+            # Permission denied or similar. Conservative default: do NOT
+            # treat as half-swap (we can't prove it's empty), and let
+            # the cleanup loop's identity guard handle it.
+            log.warning("Cannot scandir canonical %r (%s) — skipping "
+                        "half-swap detection.", canonical_dir, e)
+
+    if (canonical_missing_or_empty
             and os.path.isdir(new_dir)
             and os.path.isdir(old_dir)
             and os.path.isfile(os.path.join(new_dir, "displayoff.exe"))):
         log.warning(
-            "Detected half-swapped install layout: canonical %r missing, "
+            "Detected half-swapped install layout: canonical %r missing/empty, "
             "but %r and %r both exist. Resuming the swap by completing "
             "the .new -> canonical rename.",
             canonical_dir, new_dir, old_dir,
         )
+        # If canonical exists but is empty, remove it first so os.rename
+        # can target the canonical name (Windows rename refuses to
+        # overwrite a non-empty dst, but actually also refuses to
+        # overwrite an empty dst too on some Win versions). shutil.rmtree
+        # handles the empty-dir case cleanly.
+        if os.path.exists(canonical_dir):
+            try:
+                import shutil
+                shutil.rmtree(canonical_dir)
+            except OSError as e:
+                log.error("Could not remove empty canonical %r before "
+                          "half-swap resume (%s). MANUAL RECOVERY: "
+                          "remove %r, then rename %r to %r. Skipping "
+                          "artifact cleanup pass.", canonical_dir, e,
+                          canonical_dir, new_dir, canonical_dir)
+                return
         try:
             os.rename(new_dir, canonical_dir)
             log.info("Half-swap resumed: %r -> %r", new_dir, canonical_dir)
-            # If we're CURRENTLY running from new_dir (because the user
-            # manually launched <install_parent>/displayoff.new/displayoff.exe
-            # because their autostart .lnk was broken), re-resolve our
-            # cached paths so the cleanup loop's identity guard works.
-            if _INSTALL_DIR == new_dir:
+            # R2 T3 Sonnet + Opus: replace the prior `_INSTALL_DIR ==
+            # new_dir` string comparison with `os.path.samefile` /
+            # normpath-normcase equivalence so junction loops, trailing-
+            # slash drift, 8.3-short-name variants, or abspath-vs-realpath
+            # mismatches don't false-negative. We do an EXIST check
+            # first — `os.path.samefile` raises if either path is gone.
+            # `new_dir` is gone post-rename (we just renamed it), so the
+            # samefile would raise — guard via fallback to the cheap
+            # normalized-string compare against the pre-rename `new_dir`.
+            install_dir_was_new_dir = False
+            try:
+                # The pre-rename samefile-equivalent: normalize both to
+                # the same canonical form. _INSTALL_DIR is set via
+                # os.path.dirname(os.path.abspath(...)) at module import;
+                # new_dir is built via os.path.join from the same parent.
+                _install_norm = os.path.normcase(
+                    os.path.normpath(_INSTALL_DIR or ""))
+                _new_norm = os.path.normcase(os.path.normpath(new_dir))
+                install_dir_was_new_dir = _install_norm == _new_norm
+            except (OSError, AttributeError):
+                install_dir_was_new_dir = False
+
+            if install_dir_was_new_dir:
                 _re_resolve_exe_path_post_swap()
                 # Refresh the install_parent + current_real values we
                 # already computed before this rename.
@@ -3287,10 +3370,14 @@ def _recover_from_failed_update():
             return
 
     artifacts = [
-        (os.path.join(install_parent, "displayoff.new.zip"), "file"),
-        (os.path.join(install_parent, "displayoff.new"), "dir"),
-        (os.path.join(install_parent, "displayoff.new.staging"), "dir"),
-        (os.path.join(install_parent, "displayoff.old"), "dir"),
+        (os.path.join(install_parent,
+                      _CANONICAL_INSTALL_NAME + _UPDATE_NEW_ZIP_SUFFIX), "file"),
+        (os.path.join(install_parent,
+                      _CANONICAL_INSTALL_NAME + _UPDATE_NEW_DIR_SUFFIX), "dir"),
+        (os.path.join(install_parent,
+                      _CANONICAL_INSTALL_NAME + _UPDATE_NEW_STAGING_SUFFIX), "dir"),
+        (os.path.join(install_parent,
+                      _CANONICAL_INSTALL_NAME + _UPDATE_OLD_DIR_SUFFIX), "dir"),
     ]
     # v1.7.22 verifier-round MINOR fix (T1 Opus): the docstring lists 5
     # cleanups but the loop only ran 4. Item 5 — the stale
@@ -3392,9 +3479,12 @@ def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename):
             "a non-root path (e.g., %LOCALAPPDATA%\\Programs\\displayoff\\)."
         )
 
-    zip_path = os.path.join(install_parent, "displayoff" + _UPDATE_NEW_ZIP_SUFFIX)
-    new_dir = os.path.join(install_parent, "displayoff" + _UPDATE_NEW_DIR_SUFFIX)
-    staging_dir = os.path.join(install_parent, "displayoff.new.staging")
+    zip_path = os.path.join(install_parent,
+                            _CANONICAL_INSTALL_NAME + _UPDATE_NEW_ZIP_SUFFIX)
+    new_dir = os.path.join(install_parent,
+                           _CANONICAL_INSTALL_NAME + _UPDATE_NEW_DIR_SUFFIX)
+    staging_dir = os.path.join(install_parent,
+                               _CANONICAL_INSTALL_NAME + _UPDATE_NEW_STAGING_SUFFIX)
 
     # Pre-clean any stale staging artifacts from a prior attempt.
     # _recover_from_failed_update also runs at startup, so this is
