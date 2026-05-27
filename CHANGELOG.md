@@ -18,9 +18,33 @@ Switching to `--standalone` eliminates the Temp extraction step. The .exe and al
 - **CDN redirect-host smoke test URL bumped from `displayoff.exe` to `displayoff-${TAG}.zip`.** Same allowlist + same defensive purpose; just the asset path under the release URL changed.
 - **README.md install instructions updated.** Option A now says "download zip, extract to `<install_dir>/`, end up with `<install_dir>/displayoff/displayoff.exe`" instead of "drop the .exe in `<install_dir>/`". Added a "Why a folder, not a single .exe?" section linking the Bearfoos.A!ml context.
 
-### Folder-swap self-updater
+### Folder-swap self-updater (displayoff.py)
 
-*See Commit B for the runtime/displayoff.py changes — those land in a separate commit so this build-pipeline change can be reviewed independently.*
+The v1.7.13–v1.7.21 rename-dance atomically swapped `displayoff.exe` for `displayoff.exe.tmp` via `os.rename` and let the OS clean up the old file's locks via the spawned-then-exited-parent pattern. That trick doesn't work for a folder of ~150 locked DLLs — Windows allows directory rename with open files inside, but in-place file-by-file replacement of memory-mapped DLLs fails immediately. The unit of swap moves from a single file to the whole bundle directory, with two structural changes:
+
+- **Staging artifacts live as SIBLINGS of `_INSTALL_DIR`,** not inside it: `<install_parent>/displayoff.new.zip` (downloaded), `<install_parent>/displayoff.new/` (extracted bundle), `<install_parent>/displayoff.new.staging/` (interrupted extracts), `<install_parent>/displayoff.old/` (pre-swap backup). Sibling placement is load-bearing because the dance renames `_INSTALL_DIR` itself — staging inside would carry the staging dirs along.
+- **The child process performs the rename, not the parent.** The parent extracts the bundle to `displayoff.new/` then spawns `<new_bundle>/displayoff.exe --after-update-folder-swap` and exits (releasing the install-dir lock). The child — now running from `displayoff.new/` — renames the old install dir → `.old/`, renames its own `.new/` dir → canonical install dir name, re-resolves `_EXE_PATH` via `GetModuleFileNameW(NULL)` (Windows updates this on directory rename, unlike Nuitka's compile-time `__compiled__.original_argv0` which captures the launch path), and best-effort cleans up the `.old/` backup. The existing `Local\DisplayOff_UpdateChildReady` event handshake protocol is reused — child signals first, parent exits, child swaps.
+
+### Runtime constant changes
+
+- **`_UPDATE_EXE_NAME = "displayoff.exe"` → `_UPDATE_ZIP_SUFFIX = ".zip"`.** Asset matching shifts from exact-filename comparison to suffix matching; the dance picks the first `*.zip` asset on the release (preferring `displayoff-*.zip` if multiple zips are uploaded). The version-stamped zip name (`displayoff-v1.7.23.zip`) changes every release, so a stable-name match across versions isn't possible.
+- **`_UPDATE_MIN_EXE_SIZE = 40_000_000` → `_UPDATE_MIN_ZIP_SIZE = 15_000_000`.** New floor matches the expected compressed zip size (deflate ratio ~0.5–0.6 against the ~52 MB standalone bundle gives ~25–35 MB; floor at 15 MB catches 200-OK HTML disguised-as-zip).
+- **New constants for staging dir naming:** `_UPDATE_NEW_ZIP_SUFFIX = ".new.zip"`, `_UPDATE_NEW_DIR_SUFFIX = ".new"`, `_UPDATE_OLD_DIR_SUFFIX = ".old"`. The old `_UPDATE_TMP_SUFFIX` / `_UPDATE_OLD_SUFFIX` constants are removed (they were `.exe.tmp` / `.exe.old`).
+
+### Runtime helper changes
+
+- **`_extract_zip_bundle(zip_path, install_parent)`** — new helper. Extracts the zip via a staging dir to defeat Zip Slip (per-entry rejection of absolute paths, drive letters, `..` segments before extraction), verifies the zip contains a top-level `displayoff/` dir with `displayoff.exe`, and promotes the inner dir to `<install_parent>/displayoff.new/`.
+- **`_re_resolve_exe_path_post_swap()`** — new helper. After the child renames `displayoff.new/` → `displayoff/`, the module-level `_EXE_PATH` and `_INSTALL_DIR` (resolved at module import) point at the stale `.new/` path. Calls `GetModuleFileNameW(NULL)` (which Windows updates to track the process's current image path post-rename) and reassigns the globals.
+- **`_find_release_zip_asset(assets)`** — new helper. Returns `(zip_filename, zip_url)` for the first `.zip` asset in the release's assets dict, preferring `displayoff-*.zip` if multiple zips coexist.
+- **`_execute_rename_dance(exe_url, exe_sha256, new_version)` → `_execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename)`.** Wholesale rewrite: download zip → SHA256 → `_extract_zip_bundle` → delete zip → write relaunch-state with `old_install_dir` + `new_install_dir` → spawn child `--after-update-folder-swap` from `displayoff.new/displayoff.exe`. Returns a new `extract_failed` status for `_extract_zip_bundle` errors (bad zip, Zip Slip rejection, missing inner `displayoff/` directory).
+- **`_write_update_relaunch_state(new_version)` → `_write_update_relaunch_state(new_version, old_install_dir, new_install_dir)`.** State JSON now records the dirs the child needs to rename.
+- **`_recover_from_failed_update()` rewritten** for the new artifact set (`displayoff.new.zip`, `displayoff.new/`, `displayoff.new.staging/`, `displayoff.old/` siblings). Includes a realpath-based identity guard so a junction/symlink loop can't trick the cleanup into deleting the current install dir.
+- **`main()` `--after-update` → `--after-update-folder-swap`** with the rename logic inline. The new branch signals the parent first (existing event protocol), reads + clears relaunch state, validates the discovered swap paths against the running process's `_INSTALL_DIR` (refuses to rename non-canonical layouts), performs the two renames with full rollback on failure (restore `.old` → canonical if the `.new` → canonical step fails), re-resolves `_EXE_PATH` via `GetModuleFileNameW`, best-effort deletes `.old/`, then falls through to normal tray startup. Mid-swap failures are non-destructive — if anything fails the user is left running v-new from `.new/` with a log warning rather than losing their install.
+- **Freeze-mode comment block updated** to document `--standalone` mode paths alongside the existing `--onefile` and `.py` source paths. Strategy 0 (`__compiled__.original_argv0`) and Strategy 2 (`sys.argv[0]`) in `_resolve_on_disk_exe_path()` both work identically under standalone because Nuitka populates `original_argv0` the same way and there's no Temp extraction to confuse `sys.argv[0]`.
+
+### Ancillary
+
+- **`tray_promoter.py` docstring** updated to acknowledge `--standalone`'s `sys.executable == on-disk .exe` behavior (the v1.7.20 fix was specific to the onefile pattern where `sys.executable` is the temp-extracted python.exe). The `_EXE_PATH or sys.executable` fallback pattern stays correct under both modes.
 
 ## [1.7.21] — 2026-05-23
 

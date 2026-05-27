@@ -117,18 +117,25 @@ def sweep_stale_entries(our_exe_name, current_exe_path):
 
     The function also ships as a **template-portable helper** for future
     Python tray projects that bundle to a stable named .exe (e.g., via
-    PyInstaller onefile with `--name`); those projects should invoke
+    Nuitka --standalone, Nuitka --onefile, or PyInstaller); those projects
+    should invoke
     `sweep_stale_entries(our_exe_name="myapp.exe", current_exe_path=_EXE_PATH or sys.executable)`
-    once at startup before `capture_baseline()`. v1.7.20 docstring fix:
-    under Nuitka onefile freeze, `sys.executable` is the per-launch
-    TEMP-extracted python.exe (NOT the on-disk .exe), so a freeze-mode
-    template-copier passing it would tag the wrong path. `_EXE_PATH`
-    is the resolved on-disk path (None under .py source — fall through
-    to sys.executable in that case). The actual displayoff call site
-    in `run_tray()` (search for `sweep_stale_entries(our_exe_name="displayoff.exe"`)
-    already does this correctly via an outer `if _is_frozen() and _EXE_PATH:`
-    guard around the call; this is purely a docstring example correction so
-    template-copiers without the surrounding guard get the right pattern.
+    once at startup before `capture_baseline()`. The `_EXE_PATH or
+    sys.executable` pattern is load-bearing under any freezer that puts
+    a real CPython interpreter on `sys.executable` somewhere other than
+    the on-disk install path:
+      - Nuitka --onefile (v1.7.13-v1.7.21): `sys.executable` is the
+        per-launch %TEMP%-extracted python.exe.
+      - Nuitka --standalone (v1.7.22+): `sys.executable` IS the on-disk
+        .exe inside the install bundle dir — same string `_EXE_PATH`
+        would resolve to. Falling through to sys.executable is safe here.
+      - PyInstaller onefile: same per-launch-temp pattern as Nuitka onefile.
+    Under .py source `_EXE_PATH` is None and the fall-through gives the
+    Python interpreter — `sweep_stale_entries` then early-returns on the
+    `pythonw.exe` / `python.exe` basename to keep the sweep scoped. The
+    actual displayoff call site in `run_tray()` is guarded by an outer
+    `if _is_frozen() and _EXE_PATH:` so this docstring is purely
+    template-copier guidance.
 
     Conservative — only touches entries that:
       (a) have ExecutablePath populated (skips orphans / sparse subkeys),

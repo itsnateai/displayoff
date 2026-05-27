@@ -36,18 +36,38 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.21"
+__version__ = "1.7.22"
 
 log = logging.getLogger("displayoff")
 
 
 # ── Freeze-mode detection ─────────────────────────────────────────────────
-# v1.7.13 ships a single-file `displayoff.exe` built by Nuitka onefile
-# (--onefile + --windows-icon-from-ico + --include-data-files). The .py
-# source still works as a parallel distribution channel — both modes share
-# the same logic, dispatched on freeze-mode detection.
+# v1.7.22 ships a Nuitka --standalone bundle (build/displayoff/displayoff.exe
+# + ~150 runtime DLLs alongside it, packaged for distribution as
+# displayoff-vX.Y.Z.zip). v1.7.13–v1.7.21 used --onefile, but that mode's
+# %TEMP%\onefile_<pid>_<rand>\ extraction pattern matched Defender's
+# Trojan:Win32/Bearfoos.A!ml heuristic on every launch — the path/strategy
+# logic below dates from the --onefile era and still covers it for users
+# building locally with the legacy flag. The .py source mode is still a
+# valid parallel distribution channel for development.
 #
-#   - Nuitka onefile: sets the `__compiled__` module attr at compile time.
+#   - Nuitka --standalone (v1.7.22+ shipped builds): sets `__compiled__`.
+#     The .exe lives PERSISTENTLY in <install_dir>/displayoff/, alongside
+#     all its bundled DLLs. There is NO temp extraction:
+#       - `sys.executable` = the on-disk .exe (path on disk, in the bundle dir).
+#       - `__file__`       = the bundle dir's compiled module path (under
+#         <install_dir>/displayoff/).
+#       - `sys.argv[0]`    = path the bundle was invoked with (typically the
+#         on-disk .exe; argv can still be lied about by an upstream parent).
+#       - `os.environ["NUITKA_ONEFILE_PARENT"]` = UNSET (no bootstrap parent).
+#       - `__compiled__.original_argv0` = the launch path. Same Nuitka attr
+#         as under --onefile; populated identically.
+#     The strategies below still work — Strategy 0 (__compiled__.original_argv0)
+#     and Strategy 2 (sys.argv[0]) both point at the on-disk .exe directly,
+#     and the `_path_under_temp` filter is a no-op under standalone.
+#
+#   - Nuitka --onefile (legacy, v1.7.13–v1.7.21 + anyone still building
+#     locally with the old flag): also sets the `__compiled__` module attr.
 #     The on-disk displayoff.exe is the BOOTSTRAP process; it extracts the
 #     real CPython interpreter + compiled modules to %TEMP%\onefile_<pid>_…
 #     then CreateProcessW-spawns a child python.exe inside that temp dir.
@@ -2355,40 +2375,49 @@ _ALLOWED_UPDATE_HOSTS = (
     "https://objects.githubusercontent.com/",
 )
 
-# Release-asset filenames the rename-dance expects. Static across versions
-# so v1.7.13 can recognize a v1.7.14 release without per-version updates.
-# The asset name comparison is exact — `displayoff_v1.7.14.exe` would NOT
-# match `displayoff.exe`.
-_UPDATE_EXE_NAME = "displayoff.exe"
+# Release-asset filenames the folder-swap updater expects. Static across
+# versions so v1.7.22 can recognize a v1.7.23 release without per-version
+# updates. v1.7.22 switched from a `.exe` asset to a `.zip` containing the
+# Nuitka --standalone bundle — the updater matches by `.zip` suffix in the
+# release's assets dict, not by exact filename, since the version-stamped
+# zip name (`displayoff-v1.7.23.zip`) changes every release. SHA256SUMS.txt
+# stays a stable name across versions; it's parsed by zip-filename key.
+_UPDATE_ZIP_SUFFIX = ".zip"
 _UPDATE_MANIFEST_NAME = "SHA256SUMS.txt"
 
-# Filenames for the rename-dance intermediates. Live alongside the running
-# displayoff.exe in _INSTALL_DIR. `<exe>.tmp` is the freshly-downloaded
-# replacement during the dance. `<exe>.old` is the pre-dance backup that the
-# `--after-update` child deletes once it confirms the new build runs.
-_UPDATE_TMP_SUFFIX = ".tmp"
-_UPDATE_OLD_SUFFIX = ".old"
+# Filenames for the folder-swap dance intermediates. These live as siblings
+# of _INSTALL_DIR (i.e., under _INSTALL_DIR's parent), NOT inside _INSTALL_DIR.
+# Sibling placement is load-bearing: the dance needs to atomically rename
+# _INSTALL_DIR to <something>.old AND rename <something>.new to _INSTALL_DIR.
+# Both renames operate on parent-directory entries, so the staging dirs HAVE
+# to live in that parent. If they lived inside _INSTALL_DIR, renaming
+# _INSTALL_DIR would carry the staging dirs along for the ride.
+#
+#   <_INSTALL_DIR>.new.zip  — freshly-downloaded zip (deleted after extract)
+#   <_INSTALL_DIR>.new      — extracted bundle staging dir
+#                            (becomes _INSTALL_DIR after the swap)
+#   <_INSTALL_DIR>.old      — pre-swap backup of the previous _INSTALL_DIR
+#                            (best-effort deleted by --after-update-folder-swap)
+_UPDATE_NEW_ZIP_SUFFIX = ".new.zip"
+_UPDATE_NEW_DIR_SUFFIX = ".new"
+_UPDATE_OLD_DIR_SUFFIX = ".old"
 
-# Relaunch-mode persistence: step 7 of the dance writes this file with the
-# new-version string + the launch mode (currently always "tray", but the
-# scaffolding lets future one-shot CLI invocations skip the tray-restart
-# branch of --after-update). Lives in _DATA_DIR so it survives the .exe
-# swap (which empties _INSTALL_DIR briefly between rename and move).
+# Relaunch-mode persistence: the dance writes this file before spawning the
+# --after-update-folder-swap child. The child reads + deletes it as its
+# first act. Lives in _DATA_DIR (%APPDATA%\displayoff\) so it survives the
+# folder swap, which renames _INSTALL_DIR mid-flight.
 _UPDATE_RELAUNCH_FILENAME = "_update_relaunch.json"
 _UPDATE_RELAUNCH_PATH = os.path.join(_DATA_DIR, _UPDATE_RELAUNCH_FILENAME)
 
-# Minimum size for a valid displayoff.exe download. Anything smaller is a
-# truncated transfer or, more dangerously, a 200-OK HTML error page (some
-# CDNs serve a "404" body with HTTP 200 — without a size floor, that HTML
-# would land on disk renamed as the .exe). The real Nuitka onefile build is
-# ~55 MB (with `--onefile-no-compression` workaround for the Nuitka 4.1.1
-# + py3.14 zstd packing bug). v1.7.20: raised from 1 MB to 40 MB to also
-# catch mis-shipped stub builds (e.g., `--onefile` with a stripped data-
-# files set producing a 5-10 MB bootstrap-only binary that wouldn't actually
-# run). 40 MB is below the ~55 MB real size with margin for a future smaller
-# build (e.g., zstd-fix unlocking compression — would shrink the .exe to
-# ~20 MB; loosen this floor at that point).
-_UPDATE_MIN_EXE_SIZE = 40_000_000
+# Minimum size for a valid downloaded zip. Anything smaller is a truncated
+# transfer or, more dangerously, a 200-OK HTML error page (some CDNs serve
+# a "404" body with HTTP 200 — without a size floor, that HTML would land
+# on disk renamed as the .zip). v1.7.22 standalone bundle is ~52 MB raw,
+# zip with deflate compression is typically ~25-35 MB. 15 MB floor catches
+# truncated transfers, mis-shipped stub builds, and HTML-disguised-as-zip,
+# while allowing for compression-ratio variance across Nuitka rebuilds and
+# Python-version drift.
+_UPDATE_MIN_ZIP_SIZE = 15_000_000
 
 # Cache the last successful /releases/latest response to avoid burning
 # GitHub's 60-req/hr unauthenticated rate limit on repeated manual clicks.
@@ -2548,44 +2577,65 @@ def check_for_updates(timeout=5, force=False):
     return result
 
 
-# ── Rename-dance updater (v1.7.13+) ────────────────────────────────────────
-# Replaces the v1.7.12 "open release page in browser" flow when running as
-# the frozen displayoff.exe. Mechanics from
-# `_.claude/_templates/checklists/code-change/add-self-update.md` (the C#
-# canonical) adapted for a Python freeze. Step numbering matches the v1.7.13
-# CHANGELOG entry verbatim so a maintainer cross-referencing the public
-# release notes lands on the right inline label here. v1.7.15 reconciliation
-# (T1 from v1.7.13 verifier round) — previously the outer comment used 1-7+8
-# while _execute_rename_dance's body labelled steps 1+2 through 6, neither
-# matching the CHANGELOG.
+# ── Folder-swap updater (v1.7.22+) ──────────────────────────────────────────
+# Replaces v1.7.13's single-file rename-dance (which atomically swapped
+# `displayoff.exe` ↔ `displayoff.exe.old` via os.rename) when running as the
+# frozen --standalone bundle. The standalone bundle is a folder of ~150
+# DLLs; mid-flight individual-file rename of DLLs that are memory-mapped
+# by the running process can't work, so the unit-of-swap moved from a
+# single file to the whole bundle directory.
+#
+# All staging artifacts live as SIBLINGS of the canonical install dir
+# (i.e., under `<install_parent>/`, NOT inside `<install_dir>/`). Sibling
+# placement is load-bearing because the dance renames the install dir
+# itself.
 #
 # Caller responsibility (the Settings "Install now" worker):
 #   1. Hit GitHub releases API for latest tag + assets list
 #      (check_for_updates) — already exists pre-dance
-#   2. Fetch SHA256SUMS.txt from same release + parse the displayoff.exe
-#      entry (_fetch_release_manifest_sha256)
+#   2. Identify the `*.zip` asset for the new version + fetch
+#      SHA256SUMS.txt; parse the SHA256 keyed by the zip's filename
+#      (_fetch_release_manifest_sha256)
 #
 # _execute_rename_dance handles:
-#   3. Download new <exe>.tmp into _INSTALL_DIR (_download_to_path)
-#   4. SHA256-verify the .tmp against the manifest digest; on mismatch,
-#      delete .tmp and return "sha256_mismatch"
-#   5. os.rename current displayoff.exe → displayoff.exe.old (atomic NTFS)
-#   6. os.rename displayoff.exe.tmp → displayoff.exe (atomic; restore
-#      from .old on failure)
-#   7. Write _UPDATE_RELAUNCH_PATH with the new-version string
-#   8. Spawn displayoff.exe --after-update detached + caller os._exit(0)
-#      after a 300 ms settle so the child can claim the tray
+#   3. Download zip to `<install_parent>/displayoff.new.zip`
+#      (_download_to_path)
+#   4. SHA256-verify the zip against the manifest digest; on mismatch,
+#      delete the zip and return "sha256_mismatch"
+#   5. Extract the zip's top-level `displayoff/` folder into
+#      `<install_parent>/displayoff.new/` (_extract_zip_bundle)
+#   6. Delete the downloaded zip (no longer needed)
+#   7. Write _UPDATE_RELAUNCH_PATH with the new-version string + the
+#      original install dir path (so the child knows what to rename)
+#   8. Spawn `<install_parent>/displayoff.new/displayoff.exe
+#      --after-update-folder-swap` detached, then caller waits for child
+#      signal + os._exit(0)
 #
-# Step 9 (in the new --after-update process):
-#   - Reads + deletes _UPDATE_RELAUNCH_PATH
-#   - Deletes <exe>.old (Windows has released the lock by now)
-#   - Logs the version transition + parent PID
+# Step 9 (in the new --after-update-folder-swap process, running from
+# the `.new/` dir):
+#   - Signals the parent via named event (parent then exits, releasing
+#     the single-instance mutex)
+#   - Reads + deletes _UPDATE_RELAUNCH_PATH (forensics)
+#   - os.rename(`<install_parent>/displayoff`,
+#               `<install_parent>/displayoff.old`)    — old install backed up
+#   - os.rename(`<install_parent>/displayoff.new`,
+#               `<install_parent>/displayoff`)        — we become canonical
+#   - Re-resolves `_EXE_PATH` and `_INSTALL_DIR` post-rename via
+#     GetModuleFileNameW(NULL) so downstream callers (autostart .lnk,
+#     forensics) see the canonical paths
+#   - shutil.rmtree(`<install_parent>/displayoff.old`) — best-effort
+#     cleanup (AV may briefly hold locks; left for _recover_from_failed_update
+#     on next launch if it fails)
 #   - Continues to the normal tray-start path
 #
 # Recovery (called at the top of main(), independent of the dance):
-#   - Stale <exe>.tmp from an interrupted download → delete (untrusted bytes)
-#   - Stale <exe>.old from a crashed dance → delete (we're already on new)
-#   - Stale _UPDATE_RELAUNCH_PATH without --after-update → log + delete
+#   - Stale `displayoff.new.zip` (interrupted download) → delete
+#   - Stale `displayoff.new/` (extracted but never swapped) → delete
+#   - Stale `displayoff.new.staging/` (interrupted extraction) → delete
+#   - Stale `displayoff.old/` (post-swap leftover from crashed cleanup)
+#     → delete recursively (best-effort)
+#   - Stale _UPDATE_RELAUNCH_PATH without --after-update-folder-swap →
+#     log + delete
 
 
 def _download_url_allowed(url):
@@ -2812,24 +2862,27 @@ def _fetch_release_manifest_sha256(manifest_url, target_name, timeout=15):
     return sha, None
 
 
-def _download_to_path(url, dest_path, timeout=60):
+def _download_to_path(url, dest_path, timeout=60, min_size=None):
     """Download `url` to `dest_path`. Returns (ok, error). Validates URL
-    against `_ALLOWED_UPDATE_HOSTS` and minimum-size floor (`_UPDATE_MIN_EXE_SIZE`).
+    against `_ALLOWED_UPDATE_HOSTS` and a minimum-size floor (defaults to
+    `_UPDATE_MIN_ZIP_SIZE` for the standalone-bundle zip).
 
     Truncated downloads + URLs that 200-OK with an HTML error page (some
     CDNs do this) both get caught by the size check, which deletes the
     partial file before returning failure. Files smaller than the floor
-    are deleted so the rename-dance never accidentally promotes a junk
-    download.
+    are deleted so the folder-swap dance never accidentally promotes a
+    junk download.
 
     Uses `_build_allowlist_opener` so every redirect hop is re-validated
-    against the allowlist (github.com → objects.githubusercontent.com is
-    the expected path; anything else raises URLError from the
+    against the allowlist (github.com → release-assets.githubusercontent.com
+    is the expected path; anything else raises URLError from the
     redirect_request override and surfaces as a download failure).
     """
     import urllib.request, urllib.error
     if not _download_url_allowed(url):
         return False, f"download URL host not allowed: {url!r}"
+    if min_size is None:
+        min_size = _UPDATE_MIN_ZIP_SIZE
     try:
         opener = _build_allowlist_opener()
         req = urllib.request.Request(url, headers={"User-Agent": "displayoff-updater"})
@@ -2843,7 +2896,7 @@ def _download_to_path(url, dest_path, timeout=60):
                     f.write(chunk)
                     bytes_written += len(chunk)
     except (urllib.error.URLError, OSError, TimeoutError) as e:
-        # Cleanup partial write — a half-downloaded .tmp would survive to
+        # Cleanup partial write — a half-downloaded zip would survive to
         # the next launch's recovery pass anyway, but explicit removal here
         # closes the window between failure and recovery.
         try:
@@ -2853,24 +2906,155 @@ def _download_to_path(url, dest_path, timeout=60):
             pass
         return False, str(e)
 
-    if bytes_written < _UPDATE_MIN_EXE_SIZE:
+    if bytes_written < min_size:
         try:
             os.remove(dest_path)
         except OSError:
             pass
         return False, (f"download truncated or unexpected response body: "
-                       f"{bytes_written} bytes (expected >= {_UPDATE_MIN_EXE_SIZE})")
+                       f"{bytes_written} bytes (expected >= {min_size})")
     return True, None
 
 
-def _write_update_relaunch_state(new_version):
+def _extract_zip_bundle(zip_path, install_parent, log=log):
+    """Extract `zip_path` into `install_parent`, expecting a top-level
+    `displayoff/` directory inside the zip. Stages extraction through a
+    scratch directory so a partial extract on failure doesn't pollute the
+    canonical `<install_parent>/displayoff.new` target.
+
+    Returns (ok, error). On success the bundle is at
+    `<install_parent>/displayoff.new/displayoff.exe` (+ siblings).
+
+    Defense layers:
+      - Reject zip entries with absolute paths, drive letters, or `..`
+        segments before extracting (Zip Slip protection).
+      - Reject any extracted layout that doesn't have a top-level
+        `displayoff/` directory containing `displayoff.exe`.
+      - Clean any pre-existing `displayoff.new.staging/` or
+        `displayoff.new/` from a prior crashed dance before extracting.
+    """
+    import shutil
+    import zipfile
+
+    staging = os.path.join(install_parent, "displayoff.new.staging")
+    new_dir = os.path.join(install_parent, "displayoff.new")
+
+    # Pre-clean any stale artifacts from a crashed prior attempt.
+    for path in (staging, new_dir):
+        if os.path.exists(path):
+            shutil.rmtree(path, ignore_errors=True)
+            if os.path.exists(path):
+                return False, f"cannot remove stale {path!r} (locked?)"
+
+    try:
+        os.makedirs(staging, exist_ok=True)
+    except OSError as e:
+        return False, f"could not create staging dir {staging!r}: {e}"
+
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            for info in z.infolist():
+                name = info.filename
+                normalized = name.replace("\\", "/")
+                # Zip Slip: reject absolute paths, drive letters, traversal.
+                if (normalized.startswith("/")
+                        or (len(normalized) >= 2 and normalized[1] == ":")
+                        or ".." in normalized.split("/")):
+                    return False, (f"zip contains suspicious path "
+                                   f"(possible Zip Slip): {name!r}")
+            z.extractall(staging)
+    except (zipfile.BadZipFile, OSError) as e:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, f"zip extraction failed: {e}"
+
+    # Expect a top-level `displayoff/` directory containing `displayoff.exe`.
+    inner = os.path.join(staging, "displayoff")
+    inner_exe = os.path.join(inner, "displayoff.exe")
+    if not os.path.isdir(inner) or not os.path.isfile(inner_exe):
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, ("zip does not contain a top-level 'displayoff/' "
+                       "directory with displayoff.exe — release packaging "
+                       "may be broken.")
+
+    # Promote the inner dir to the canonical .new/ location, then clean
+    # the now-empty staging tree.
+    try:
+        os.rename(inner, new_dir)
+    except OSError as e:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, f"could not move extracted bundle to {new_dir!r}: {e}"
+    shutil.rmtree(staging, ignore_errors=True)
+
+    log.info("Extracted %s -> %s (%d files)",
+             zip_path, new_dir,
+             sum(1 for _ in _walk_files(new_dir)))
+    return True, None
+
+
+def _walk_files(root):
+    """Yield every file path under `root`. Helper for sizing/logging — kept
+    standalone so callers can pass it to sum()/len() without lambdas."""
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            yield os.path.join(dirpath, name)
+
+
+def _re_resolve_exe_path_post_swap():
+    """After the --after-update-folder-swap rename, the cached `_EXE_PATH`
+    and `_INSTALL_DIR` (resolved at module import) point at the pre-swap
+    `<install_parent>/displayoff.new/displayoff.exe` location — which no
+    longer exists because we just renamed `displayoff.new/` → `displayoff/`.
+
+    Re-resolve via `GetModuleFileNameW(NULL)` which Windows updates to
+    track the process's current image path after directory rename. Updates
+    the module globals so downstream callers (autostart .lnk target,
+    forensics log lines, future update attempts) see the canonical path.
+
+    No-op on non-Windows or if the GetModuleFileNameW call fails — the
+    caller should still continue; degradation is "stale `_EXE_PATH`
+    values used for autostart .lnk target" rather than crash.
+    """
+    global _EXE_PATH, _INSTALL_DIR
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes as _wt
+        _k = ctypes.WinDLL("kernel32", use_last_error=True)
+        _GetModuleFileNameW = _k.GetModuleFileNameW
+        _GetModuleFileNameW.argtypes = [_wt.HMODULE, _wt.LPWSTR, _wt.DWORD]
+        _GetModuleFileNameW.restype = _wt.DWORD
+        buf = ctypes.create_unicode_buffer(32768)
+        n = _GetModuleFileNameW(None, buf, len(buf))
+        if n > 0 and buf.value and os.path.isfile(buf.value):
+            new_path = os.path.abspath(buf.value)
+            log.info("Re-resolved _EXE_PATH post-folder-swap: %r -> %r",
+                     _EXE_PATH, new_path)
+            _EXE_PATH = new_path
+            _INSTALL_DIR = os.path.dirname(new_path)
+    except (OSError, AttributeError) as e:
+        log.warning("Could not re-resolve _EXE_PATH post-swap "
+                    "(GetModuleFileNameW failed: %s); leaving cached "
+                    "value %r. Autostart .lnk re-toggle may produce a "
+                    "stale target until next launch.", e, _EXE_PATH)
+
+
+def _write_update_relaunch_state(new_version, old_install_dir=None,
+                                 new_install_dir=None):
     """Persist the relaunch state file. Called at step 7 of the dance, just
-    before spawning the --after-update child. Writes JSON: `{version,
-    timestamp, exe_path}`. The child reads + deletes it as the first thing
-    --after-update does."""
+    before spawning the --after-update-folder-swap child. Writes JSON:
+    `{version, timestamp, exe_path, old_install_dir, new_install_dir, pid}`.
+    The child reads + deletes it as one of its first acts.
+
+    `old_install_dir` and `new_install_dir` are load-bearing for v1.7.22's
+    folder-swap dance: the child needs to know which sibling dir to
+    rename → .old and which (its own .new dir) to rename → canonical.
+    Both default to None for backward compatibility with any legacy
+    callers (shouldn't exist post-v1.7.22, but defensive)."""
     state = {
         "version": new_version,
         "exe_path": _EXE_PATH or "",
+        "old_install_dir": old_install_dir or "",
+        "new_install_dir": new_install_dir or "",
         "timestamp": time.time(),
         "pid": os.getpid(),  # forensics — which process wrote this
     }
@@ -2905,207 +3089,208 @@ def _read_and_clear_update_relaunch_state():
 
 
 def _recover_from_failed_update():
-    """Clean up artifacts from a previous dance that crashed or hung.
-    Called at the top of main() — runs on every launch, cheap when there's
-    nothing to do.
+    """Clean up artifacts from a previous folder-swap dance that crashed or
+    hung. Called at the top of main() — runs on every launch, cheap when
+    there's nothing to do.
 
-    Three independent cleanups:
-      1. `<exe>.tmp` — leftover download (untrusted bytes; delete)
-      2. `<exe>.old` — pre-dance backup that --after-update didn't get
-         around to deleting (we're already on the new build; safe to clean)
-      3. Stale `_update_relaunch.json` without a corresponding --after-update
-         CLI flag — the spawn-child step succeeded but the child crashed
-         before consuming the state. Log + delete.
+    Four independent cleanups in `<install_parent>/`:
+      1. `displayoff.new.zip` — partial download (untrusted bytes; delete)
+      2. `displayoff.new/` — extracted bundle that never made it through
+         the swap step (we're already running from the canonical
+         `displayoff/` dir, so the staged copy is dead weight)
+      3. `displayoff.new.staging/` — interrupted zip extraction
+      4. `displayoff.old/` — pre-swap backup that
+         --after-update-folder-swap didn't get around to deleting (we're
+         already running from the new install dir; safe to clean)
+      5. Stale `_update_relaunch.json` without a corresponding
+         --after-update-folder-swap CLI flag — the spawn-child step
+         succeeded but the child crashed before consuming the state. Log
+         + delete.
 
-    Skipped under .py source mode — the rename-dance only applies to the
-    frozen .exe. Under source, `_EXE_PATH` is None and there's nothing to
-    clean up alongside.
+    Skipped under .py source mode — the folder-swap dance only applies to
+    the frozen --standalone bundle. Under source, `_EXE_PATH` is None and
+    there's nothing to clean up alongside.
+
+    Defensive identity check before deleting any sibling dir: never delete
+    a sibling that resolves (via realpath) to the current install dir.
+    Without this, an unusual install layout (junction loops, an APP that
+    sits at install_parent/displayoff and also at
+    install_parent/displayoff.new because of an external symlink) could
+    delete the running app.
     """
-    if not _is_frozen() or not _EXE_PATH:
+    if not _is_frozen() or not _EXE_PATH or not _INSTALL_DIR:
         return
-    tmp_path = _EXE_PATH + _UPDATE_TMP_SUFFIX
-    old_path = _EXE_PATH + _UPDATE_OLD_SUFFIX
-    for path in (tmp_path, old_path):
+    install_parent = os.path.dirname(_INSTALL_DIR)
+    if not install_parent or install_parent == _INSTALL_DIR:
+        # Top-of-volume install (e.g., C:\displayoff\displayoff.exe).
+        # `dirname` returns `C:\`; sibling cleanup would scan the drive
+        # root, which is hostile. Skip cleanup in this edge case.
+        log.info("Skipping update-artifact recovery: install dir %r has no "
+                 "usable parent for sibling cleanup.", _INSTALL_DIR)
+        return
+    try:
+        current_real = os.path.realpath(_INSTALL_DIR)
+    except OSError:
+        current_real = _INSTALL_DIR
+
+    def _safe_realpath(path):
+        try:
+            return os.path.realpath(path)
+        except OSError:
+            return path
+
+    artifacts = [
+        (os.path.join(install_parent, "displayoff.new.zip"), "file"),
+        (os.path.join(install_parent, "displayoff.new"), "dir"),
+        (os.path.join(install_parent, "displayoff.new.staging"), "dir"),
+        (os.path.join(install_parent, "displayoff.old"), "dir"),
+    ]
+    for path, kind in artifacts:
         if not os.path.exists(path):
             continue
-        # v1.7.17: preserve `.old` if its mtime is newer than current. The
-        # realistic scenario this protects: user did
-        # `copy displayoff.exe displayoff.exe.old` AS A MANUAL BACKUP after
-        # install (NTFS `copy` updates the destination's mtime to "now"
-        # while current's mtime stays at the original rename-dance time).
-        # `.old.mtime > current.mtime` then, and auto-cleanup of such a
-        # user-curated backup is hostile — keep it around until the user
-        # moves or deletes it themselves. Doesn't apply to `.tmp`
-        # (untrusted download bytes; always clean).
-        #
-        # The post-successful-update common case is `.old.mtime <
-        # current.mtime` (rename-dance: download → current at T1, current
-        # → .old at T0+ε; current ends up with the LATER mtime), so the
-        # preserve branch doesn't fire and cleanup runs as designed.
-        if path == old_path:
-            try:
-                old_mtime = os.path.getmtime(path)
-                cur_mtime = os.path.getmtime(_EXE_PATH)
-                # Strict > (not >=): equal mtimes (e.g. filesystem
-                # truncation to 1-second resolution when current and .old
-                # were written within the same second) fall through to
-                # the delete branch. The post-rename common case is
-                # current.mtime > .old.mtime by milliseconds, so equal
-                # mtime is the ambiguous edge and we default to cleanup.
-                if old_mtime > cur_mtime:
-                    log.info(
-                        "Preserving %s (mtime %.0f > current .exe mtime "
-                        "%.0f) — looks like a deliberate manual rollback "
-                        "backup; user can delete it manually.",
-                        path, old_mtime, cur_mtime,
-                    )
-                    continue
-            except OSError as e:
-                # mtime read failed. PRESERVE `.old` rather than fall
-                # through to delete: the most likely cause is that
-                # `_EXE_PATH` is missing (crash mid-rename left current
-                # in pieces). In that scenario `.old` is the only good
-                # copy — auto-deleting it would destroy the user's last
-                # recoverable artifact. Belt-and-suspenders: log and skip.
-                log.warning(
-                    "Could not compare mtimes for %r vs current .exe "
-                    "(%s) — preserving %r as a safe default rather than "
-                    "deleting an artifact we can't classify.",
-                    path, e, path,
-                )
-                continue
+        # Identity guard: never delete a sibling that's actually the
+        # current install dir under a symlink/junction loop.
+        if kind == "dir" and _safe_realpath(path) == current_real:
+            log.warning(
+                "Skipping update-artifact cleanup of %r: realpath matches "
+                "current install dir. Likely a junction/symlink loop — "
+                "user should manually inspect the layout.",
+                path,
+            )
+            continue
         try:
-            os.remove(path)
+            if kind == "file":
+                os.remove(path)
+            else:
+                import shutil
+                shutil.rmtree(path, ignore_errors=False)
             log.info("Cleaned update artifact: %s", path)
         except OSError as e:
-            # Most common cause: Windows still holds a file lock on .old
-            # because the just-finished process hasn't fully unwound. We're
-            # called from main() at startup, so the parent process is gone
-            # by the time we get here — but AV scanners can hold a lock
-            # for a few seconds after a write. Log and move on; the next
-            # launch retries.
+            # Most common cause: Windows still holds a file lock on a
+            # DLL inside `.old/` because AV scanning the just-renamed
+            # bundle hasn't finished. We're called from main() at startup,
+            # so the parent process is gone by the time we get here — but
+            # AV can hold a lock for a few seconds after a write. Log and
+            # move on; the next launch retries.
             log.warning("Could not clean update artifact %r: %s", path, e)
 
 
-def _execute_rename_dance(exe_url, exe_sha256, new_version):
-    """Execute steps 3-8 of the rename-dance (steps 1-2 are the caller's
-    API + manifest fetch; step 9 is the --after-update child). Step
-    numbering matches the v1.7.13 CHANGELOG entry — see the outer
-    `── Rename-dance updater ──` comment block above for the full
-    9-step framing.
+def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename):
+    """Execute steps 3-8 of the folder-swap dance (steps 1-2 are the
+    caller's API + manifest fetch; step 9 is the --after-update-folder-swap
+    child). See the outer `── Folder-swap updater ──` comment block above
+    for the full 9-step framing.
 
     Returns (status, detail):
       - ("relaunched", None)           — caller MUST exit immediately
       - ("not_frozen", detail)         — running from .py source; N/A
       - ("download_failed", detail)    — network/404/redirect outside allowlist
       - ("sha256_mismatch", detail)    — download corrupted or tampered
-      - ("rename_failed", detail)      — .exe locked / AV / permissions
-      - ("spawn_failed", detail)       — new .exe in place but child didn't launch
+      - ("extract_failed", detail)     — bad zip, Zip Slip rejection, or
+                                         could not place displayoff.new/
+      - ("rename_failed", detail)      — bundle locked / AV / permissions
+                                         (caught when the child tries to
+                                         swap — the parent's own work
+                                         can't actually reach this status)
+      - ("spawn_failed", detail)       — bundle staged but child didn't launch
 
     URL allowlist re-validation happens here even though `_download_to_path`
     also checks — belt-and-suspenders, especially relevant because this
     function takes the URL as a parameter from the manifest+API flow and
     we want a single audit checkpoint right at the dance entry.
     """
-    if not _is_frozen() or not _EXE_PATH:
-        return "not_frozen", "rename-dance requires the frozen displayoff.exe build"
-    if not _download_url_allowed(exe_url):
-        return "rename_failed", f"download URL host not allowed: {exe_url!r}"
-    if not exe_sha256 or len(exe_sha256) != 64:
-        return "sha256_mismatch", "no SHA256 available for the new .exe"
+    if not _is_frozen() or not _EXE_PATH or not _INSTALL_DIR:
+        return "not_frozen", "folder-swap dance requires the frozen standalone build"
+    if not _download_url_allowed(zip_url):
+        return "rename_failed", f"download URL host not allowed: {zip_url!r}"
+    if not zip_sha256 or len(zip_sha256) != 64:
+        return "sha256_mismatch", "no SHA256 available for the new release zip"
 
-    current = _EXE_PATH
-    tmp = current + _UPDATE_TMP_SUFFIX
-    old = current + _UPDATE_OLD_SUFFIX
+    install_parent = os.path.dirname(_INSTALL_DIR)
+    if not install_parent or install_parent == _INSTALL_DIR:
+        return "rename_failed", (
+            f"install dir {_INSTALL_DIR!r} has no usable parent for sibling "
+            "staging — cannot run folder-swap dance here. Re-install under "
+            "a non-root path (e.g., %LOCALAPPDATA%\\Programs\\displayoff\\)."
+        )
 
-    # Pre-clean any stale .tmp / .old from a prior attempt. _recover_from_failed_update
-    # also runs at startup, so this is belt-and-suspenders — but a same-session
-    # retry (user clicked Install after a network glitch) needs cleanup before
-    # the new attempt starts.
-    for path in (tmp, old):
+    zip_path = os.path.join(install_parent, "displayoff" + _UPDATE_NEW_ZIP_SUFFIX)
+    new_dir = os.path.join(install_parent, "displayoff" + _UPDATE_NEW_DIR_SUFFIX)
+    staging_dir = os.path.join(install_parent, "displayoff.new.staging")
+
+    # Pre-clean any stale staging artifacts from a prior attempt.
+    # _recover_from_failed_update also runs at startup, so this is
+    # belt-and-suspenders — but a same-session retry (user clicked
+    # Install after a network glitch) needs cleanup before the new
+    # attempt starts.
+    import shutil
+    for path in (zip_path, new_dir, staging_dir):
         if os.path.exists(path):
             try:
-                os.remove(path)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
             except OSError as e:
                 return "rename_failed", f"cannot remove stale {path!r}: {e}"
 
-    # Steps 3+4: download new .exe to .tmp, then SHA256-verify against
-    # the manifest digest the caller already extracted. The two steps
-    # share a try-block because a failed verify also wants the .tmp
-    # cleaned up.
-    log.info("Update dance: downloading %s -> %s", exe_url, tmp)
-    ok, err = _download_to_path(exe_url, tmp)
+    # Steps 3+4: download new zip, then SHA256-verify against the manifest
+    # digest the caller already extracted. The two steps share a try-block
+    # because a failed verify also wants the zip cleaned up.
+    log.info("Update dance: downloading %s -> %s", zip_url, zip_path)
+    ok, err = _download_to_path(zip_url, zip_path)
     if not ok:
         return "download_failed", err or "download failed"
-    actual_sha = _sha256_file(tmp)
-    if actual_sha.lower() != exe_sha256.lower():
-        # v1.7.13 verifier round (T2-Opus + T3-Sonnet convergent): DELETE the
-        # .tmp on hash mismatch instead of preserving it. Previously we kept
-        # the file "for forensics" on the theory that the user (or support)
-        # could inspect the failed download — but that left arbitrary
-        # unverified bytes on disk in _INSTALL_DIR with the .tmp suffix,
-        # right next to the running .exe. An attacker who controlled a
-        # release manifest could ship a 1.1 MB body that passes the size
-        # floor, fails SHA, and persists indefinitely (until next launch's
-        # recovery pass — which `log.warning`'s any unlinking failure and
-        # moves on silently). Log the actual hash inline so a future debug
-        # session has the diagnostic info without a malicious-bytes
-        # primitive on disk.
+    actual_sha = _sha256_file(zip_path)
+    if actual_sha.lower() != zip_sha256.lower():
+        # DELETE the zip on hash mismatch instead of preserving it (same
+        # rationale as v1.7.13's exe-tmp handling — an attacker who
+        # controlled a release manifest could otherwise plant arbitrary
+        # unverified bytes inside install_parent).
         try:
-            os.remove(tmp)
+            os.remove(zip_path)
         except OSError as cleanup_err:
-            log.warning("Could not delete .tmp after sha256 mismatch %r: %s",
-                        tmp, cleanup_err)
+            log.warning("Could not delete zip after sha256 mismatch %r: %s",
+                        zip_path, cleanup_err)
         return "sha256_mismatch", (
-            f"sha256 mismatch: expected {exe_sha256}, got {actual_sha}; "
-            f"corrupted download or tampered release. .tmp deleted."
+            f"sha256 mismatch: expected {zip_sha256}, got {actual_sha}; "
+            f"corrupted download or tampered release. zip deleted."
         )
 
-    # Step 5: rename current → .old. The os.rename across the same NTFS
-    # directory is atomic and (unlike os.replace) refuses to overwrite the
-    # destination if it exists — we pre-cleaned .old above, so a name
-    # collision here means a parallel update attempt is in flight (extremely
-    # unlikely given the single-instance mutex, but defended against).
-    log.info("Update dance: renaming %s -> %s", current, old)
-    try:
-        os.rename(current, old)
-    except OSError as e:
+    # Step 5: extract zip → install_parent/displayoff.new/. The extract
+    # helper does Zip Slip protection + verifies a top-level displayoff/
+    # directory containing displayoff.exe before promoting the inner dir
+    # to the canonical .new/ location.
+    log.info("Update dance: extracting %s -> %s", zip_path, new_dir)
+    ok, err = _extract_zip_bundle(zip_path, install_parent, log=log)
+    if not ok:
         try:
-            os.remove(tmp)
+            os.remove(zip_path)
         except OSError:
             pass
-        return "rename_failed", (
-            f"cannot rename {current!r} -> {old!r}: {e}. "
-            "The .exe may be locked by AV scanning or another process. "
-            "Try closing other Display Off instances and retry."
-        )
+        return "extract_failed", err or "zip extraction failed"
 
-    # Step 6: move .tmp → current. If this fails, restore .old → current
-    # so the user isn't left with a missing .exe.
-    log.info("Update dance: renaming %s -> %s", tmp, current)
+    # Step 6: zip no longer needed once the bundle is extracted; deleting
+    # it shrinks the install_parent footprint by ~30 MB. Failure here is
+    # non-fatal — _recover_from_failed_update will catch the stale zip
+    # on next launch.
     try:
-        os.rename(tmp, current)
+        os.remove(zip_path)
     except OSError as e:
-        try:
-            os.rename(old, current)  # restore
-        except OSError as restore_err:
-            return "rename_failed", (
-                f"cannot rename {tmp!r} -> {current!r} ({e}), AND restore "
-                f"from {old!r} also failed ({restore_err}). "
-                f"MANUAL RECOVERY: rename {old!r} to {current!r}."
-            )
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        return "rename_failed", f"cannot move .tmp into place: {e}. Restored from .old."
+        log.warning("Could not delete downloaded zip %r after extract: %s "
+                    "— next launch will retry.", zip_path, e)
 
-    # Step 7: write relaunch state so the child knows what to do
+    # Step 7: write relaunch state so the child knows what to do. Records
+    # the OLD install dir (canonical pre-swap path) so the child can find
+    # its target. The state file lives in _DATA_DIR (%APPDATA%) which is
+    # outside the folder-swap path, so it survives the rename.
+    new_exe_path = os.path.join(new_dir, "displayoff.exe")
     try:
-        _write_update_relaunch_state(new_version)
+        _write_update_relaunch_state(new_version, old_install_dir=_INSTALL_DIR,
+                                     new_install_dir=new_dir)
     except OSError as e:
-        # Non-fatal — the child will just skip the post-update toast and
-        # log entry. Keep going.
+        # Non-fatal — the child will fall back to deducing old_install_dir
+        # from its own sibling layout. Keep going.
         log.warning("Could not write update-relaunch state: %s", e)
 
     # v1.7.20: create the child-ready handshake event BEFORE spawning the
@@ -3117,18 +3302,9 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
     global _update_child_ready_handle
     if sys.platform == "win32" and CreateEventW is not None:
         # v1.7.20 verifier T3-Sonnet H1: ABA defense. If a previous update
-        # attempt in this session left `_update_child_ready_handle` non-None
-        # (e.g., the caller's wait branch ran and CloseHandle'd it but the
-        # global slot wasn't cleared — see the `os._exit(0)` chain in
-        # `_run_rename_dance_flow._worker`), we'd silently leak that prior
-        # handle when CreateEventW assigns a new one. Closing first is
-        # idempotent and safe: kernel handles can be CloseHandle'd more
-        # than once across the same process only if the handle hasn't been
-        # already-closed; we guard with try/except for the already-closed
-        # case (CloseHandle returns FALSE + GetLastError ERROR_INVALID_HANDLE
-        # — harmless and won't raise here since CloseHandle's restype is
-        # BOOL not HRESULT). The "handle still valid" case is the leak we
-        # actually want to prevent.
+        # attempt in this session left `_update_child_ready_handle` non-None,
+        # we'd silently leak that prior handle when CreateEventW assigns a
+        # new one. Closing first is idempotent and safe.
         if _update_child_ready_handle:
             try:
                 CloseHandle(_update_child_ready_handle)
@@ -3136,9 +3312,6 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
                 pass
             _update_child_ready_handle = None
         try:
-            # Manual-reset (so the caller's wait + cleanup can read the
-            # signaled state without auto-resetting it mid-read), initial
-            # state = False (we haven't been signaled yet).
             _update_child_ready_handle = CreateEventW(
                 None, True, False, _UPDATE_CHILD_READY_EVENT_NAME
             )
@@ -3156,33 +3329,44 @@ def _execute_rename_dance(exe_url, exe_sha256, new_version):
             )
             _update_child_ready_handle = None
 
-    # Step 8: spawn child --after-update detached, then return so the
-    # caller exits (step 9 — child cleanup — runs in the new process).
-    log.info("Update dance: spawning %s --after-update", current)
+    # Step 8: spawn child --after-update-folder-swap detached. The child
+    # runs from <install_parent>/displayoff.new/displayoff.exe and is the
+    # process that performs the actual folder rename — the parent
+    # (this process) can't rename its OWN install dir while running from
+    # inside it (Windows allows directory rename with open file handles
+    # inside, but the parent's CWD might be _INSTALL_DIR and we don't
+    # want to gamble on those semantics).
+    log.info("Update dance: spawning %s --after-update-folder-swap", new_exe_path)
     try:
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         # close_fds=True ensures no inherited file handles keep the parent's
         # log file (or any opened tray pipe) locked into the child.
+        # cwd=new_dir so the child starts with its CWD inside the new
+        # bundle dir (matches the standalone-launch-from-double-click UX).
         subprocess.Popen(
-            [current, "--after-update"],
+            [new_exe_path, "--after-update-folder-swap"],
             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
-            cwd=_INSTALL_DIR,
+            cwd=new_dir,
         )
     except OSError as e:
         # Release the handshake event if Popen failed — the caller won't
-        # wait on it (we return "spawn_failed" so the relaunch branch
-        # isn't taken), and leaving a kernel handle dangling for the
-        # lifetime of the process is sloppy.
+        # wait on it, and leaving a kernel handle dangling for the
+        # lifetime of the process is sloppy. Best-effort cleanup of the
+        # staged .new/ dir too — recovery will catch any failures.
         if _update_child_ready_handle:
             try:
                 CloseHandle(_update_child_ready_handle)
             except Exception:
                 pass
             _update_child_ready_handle = None
+        try:
+            shutil.rmtree(new_dir, ignore_errors=True)
+        except OSError:
+            pass
         return "spawn_failed", (
-            f"new .exe written successfully but spawn failed: {e}. "
+            f"new bundle staged successfully but spawn failed: {e}. "
             "Restart Display Off manually."
         )
     return "relaunched", None
@@ -4232,20 +4416,38 @@ def _open_url(url):
         log.warning("webbrowser.open(%s) returned False — no URL handler registered.", url)
 
 
+def _find_release_zip_asset(assets):
+    """Return (zip_filename, zip_url) for the first `.zip` asset in `assets`,
+    or (None, None) if no zip is present. v1.7.22+ asset names are
+    version-stamped (`displayoff-v1.7.22.zip`, `displayoff-v1.7.23.zip`,
+    ...), so we match by suffix rather than exact filename. If multiple
+    zips are uploaded to one release (unusual), prefer the first one
+    starting with `displayoff-` to avoid grabbing a stray attachment."""
+    candidates = [
+        (name, url) for name, url in assets.items()
+        if isinstance(name, str) and name.lower().endswith(_UPDATE_ZIP_SUFFIX)
+    ]
+    if not candidates:
+        return None, None
+    # Prefer `displayoff-*.zip` if present; otherwise take the first.
+    preferred = [c for c in candidates if c[0].lower().startswith("displayoff-")]
+    return (preferred or candidates)[0]
+
+
 def _can_use_rename_dance(assets):
-    """True when the v1.7.13+ rename-dance update flow is viable for the
-    current launch context. Requires (1) running as the frozen .exe, (2)
-    both `displayoff.exe` and `SHA256SUMS.txt` published as release assets,
-    and (3) both URLs on the hardcoded allowlist. Any miss falls back to
-    the v1.7.12 "open release page" flow.
+    """True when the v1.7.22+ folder-swap update flow is viable for the
+    current launch context. Requires (1) running as the frozen standalone
+    bundle, (2) a `*.zip` asset AND `SHA256SUMS.txt` published on the
+    release, and (3) both URLs on the hardcoded allowlist. Any miss falls
+    back to the v1.7.12 "open release page" flow.
     """
     if not _is_frozen() or not _EXE_PATH:
         return False
-    exe_url = assets.get(_UPDATE_EXE_NAME)
+    _zip_name, zip_url = _find_release_zip_asset(assets)
     manifest_url = assets.get(_UPDATE_MANIFEST_NAME)
-    if not exe_url or not manifest_url:
+    if not zip_url or not manifest_url:
         return False
-    return _download_url_allowed(exe_url) and _download_url_allowed(manifest_url)
+    return _download_url_allowed(zip_url) and _download_url_allowed(manifest_url)
 
 
 def _run_rename_dance_flow(parent_root, assets, latest):
@@ -4296,22 +4498,30 @@ def _run_rename_dance_flow(parent_root, assets, latest):
         # shadows the module-level reads above, defeating the cleanup.
         global _update_child_ready_handle
         manifest_url = assets.get(_UPDATE_MANIFEST_NAME)
-        exe_url = assets.get(_UPDATE_EXE_NAME)
-        log.info("Update dance starting: latest=%s exe_url=%s manifest_url=%s",
-                 latest, exe_url, manifest_url)
+        zip_filename, zip_url = _find_release_zip_asset(assets)
+        log.info("Update dance starting: latest=%s zip=%s zip_url=%s manifest_url=%s",
+                 latest, zip_filename, zip_url, manifest_url)
+
+        if not zip_filename or not zip_url:
+            _marshal_error("Update failed",
+                           "No .zip asset on the latest release — the "
+                           "folder-swap updater needs a versioned zip "
+                           "(displayoff-vX.Y.Z.zip). The release may be "
+                           "mid-upload or assets-less.")
+            return
 
         sha, manifest_err = _fetch_release_manifest_sha256(
-            manifest_url, _UPDATE_EXE_NAME
+            manifest_url, zip_filename
         )
         if manifest_err:
             _marshal_error("Update failed",
                            f"Could not fetch SHA256 manifest: {manifest_err}")
             return
 
-        status, detail = _execute_rename_dance(exe_url, sha, latest)
+        status, detail = _execute_rename_dance(zip_url, sha, latest, zip_filename)
         if status == "relaunched":
-            log.info("Rename-dance complete; exiting current process so the "
-                     "spawned child .exe (--after-update) can take over.")
+            log.info("Folder-swap dance complete; exiting current process so the "
+                     "spawned child (--after-update-folder-swap) can take over.")
             # v1.7.13 verifier round (T3-Sonnet + T3-Opus convergent):
             # logging.shutdown() flushes the RotatingFileHandler's pending
             # writes so the dance's last 3-4 log lines ("downloading",
@@ -4386,13 +4596,14 @@ def _run_rename_dance_flow(parent_root, assets, latest):
             os._exit(0)
 
         # Failure path
-        log.warning("Rename-dance failed: status=%s detail=%s", status, detail)
+        log.warning("Folder-swap dance failed: status=%s detail=%s", status, detail)
         title = {
             "not_frozen":      "Update not available in source mode",
             "download_failed": "Update download failed",
             "sha256_mismatch": "Update download corrupted",
-            "rename_failed":   "Update could not replace running .exe",
-            "spawn_failed":    "Update applied but relaunch failed",
+            "extract_failed":  "Update zip could not be extracted",
+            "rename_failed":   "Update could not be staged",
+            "spawn_failed":    "Update staged but relaunch failed",
         }.get(status, f"Update failed ({status})")
         _marshal_error(title, detail or "(no detail)")
 
@@ -5139,36 +5350,36 @@ def main():
         _MIGRATION_LOG.clear()
         _RESOLVER_LOG.clear()
 
-    # v1.7.13: clean up artifacts from a previous launch's rename-dance that
-    # may have crashed or been interrupted before --after-update could fire.
-    # Cheap when there's nothing to do; no-op under .py source. Runs BEFORE
-    # the --after-update handler so a legitimate post-update launch goes
-    # through the dedicated path below rather than the generic cleanup.
-    # (--after-update both reads the relaunch-state file AND triggers the
-    # same .tmp/.old cleanup; ordering means cleanup happens once per launch
-    # regardless of which path fired it.)
+    # v1.7.22: clean up artifacts from a previous launch's folder-swap dance
+    # that may have crashed or been interrupted. Cheap when there's nothing
+    # to do; no-op under .py source. Runs BEFORE the --after-update-folder-swap
+    # handler so any pre-existing `.new/` / `.new.zip` / `.new.staging/` /
+    # `.old/` from a crash get cleaned up first. Important ordering note:
+    # the --after-update-folder-swap handler then performs ITS OWN
+    # rename of the current install dir → .old + .new → canonical, after
+    # which it best-effort deletes .old. If THAT delete fails, the next
+    # launch's _recover_from_failed_update catches the leftover.
     _recover_from_failed_update()
 
-    # v1.7.13: --after-update is the relaunch entry point used by the
-    # rename-dance. The previous-version's _execute_rename_dance() wrote the
-    # state file just before spawning us with this flag, so reading +
-    # clearing it gives us forensics for "we just upgraded from X to Y".
-    # We then strip the flag from sys.argv so the rest of main() doesn't
-    # treat the post-update launch any differently than a normal tray
-    # startup — tray-mode is the default, so falling through is correct.
-    if "--after-update" in sys.argv:
-        # v1.7.20: signal the parent's child-ready handshake event as the
-        # very first act of --after-update — before reading state, before
-        # `_acquire_single_instance`. Signaling before mutex acquire is the
-        # design choice that avoids a parent-must-exit-first deadlock: the
-        # parent still holds the single-instance mutex when we get here,
-        # so we cannot acquire it until the parent's `os._exit(0)` releases
-        # it; the parent in turn won't os._exit until it sees our signal.
-        # Signaling early breaks the deadlock — parent observes the signal,
-        # exits (releasing mutex), then this process's later
-        # `_acquire_single_instance()` call succeeds. The 5-second wait the
-        # parent does is for "child's Python interpreter is alive and
-        # running" — that's what we're attesting to with the SetEvent here.
+    # v1.7.22: --after-update-folder-swap is the relaunch entry point used
+    # by the folder-swap dance. The previous-version's _execute_rename_dance()
+    # extracted the new bundle into <install_parent>/displayoff.new/, then
+    # spawned <new_bundle>/displayoff.exe --after-update-folder-swap. THIS
+    # process is that child, running from the .new/ dir. We need to:
+    #   1. Signal the parent (so it exits, releasing the install dir lock)
+    #   2. Rename old install dir → .old (backup)
+    #   3. Rename our own .new dir → canonical install dir name
+    #   4. Re-resolve _EXE_PATH / _INSTALL_DIR via GetModuleFileNameW
+    #   5. Best-effort delete the .old dir
+    #   6. Fall through to normal tray startup
+    if "--after-update-folder-swap" in sys.argv:
+        # Signal the parent's child-ready handshake event as the very
+        # first act — before reading state, before any folder rename,
+        # before `_acquire_single_instance`. Signaling early breaks the
+        # parent-must-exit-first / child-can't-acquire-mutex deadlock:
+        # parent observes the signal, exits (releasing mutex AND
+        # releasing any open file handles in the old install dir),
+        # then THIS process can safely rename the old install dir.
         if sys.platform == "win32" and OpenEventW is not None:
             try:
                 _child_event = OpenEventW(
@@ -5178,61 +5389,137 @@ def main():
                 if _child_event:
                     try:
                         SetEvent(_child_event)
-                        log.info("After-update: signaled parent via "
-                                 "child-ready event.")
+                        log.info("After-update-folder-swap: signaled parent "
+                                 "via child-ready event.")
                     finally:
                         CloseHandle(_child_event)
                 else:
-                    # Parent never created the event (CreateEventW failed,
-                    # or this child was launched outside the dance flow).
-                    # Not fatal — parent will fall through its own 0.3s
-                    # fallback and exit.
-                    log.info("After-update: child-ready event not present "
-                             "(parent may be running an older build or "
-                             "the event creation failed). No-op.")
+                    log.info("After-update-folder-swap: child-ready event "
+                             "not present (parent may be running an older "
+                             "build or the event creation failed).")
             except OSError as e:
-                log.warning("After-update: child-ready signal raised %s; "
-                            "continuing anyway.", e)
+                log.warning("After-update-folder-swap: child-ready signal "
+                            "raised %s; continuing anyway.", e)
+
         state = _read_and_clear_update_relaunch_state()
+        old_install_dir = ""
+        new_install_dir = ""
         if state is not None:
             persisted_version = state.get("version") or "?"
-            # v1.7.13 verifier round (T2-Opus C3): cross-check the state
-            # file's recorded target-version against the running binary's
-            # __version__. They should always match — the previous-version
-            # dance wrote the API's "latest" tag into state, then spawned
-            # the binary it just installed (which compiles that same tag's
-            # source). A mismatch indicates either (a) a stale state file
-            # from an earlier failed dance got consumed by a manually-
-            # launched --after-update, or (b) the rename step succeeded
-            # but the wrong .exe ended up at the canonical path (extreme
-            # FS corruption). Either way: forensics are unreliable, so
-            # surface the divergence instead of silently logging the
-            # bogus persisted value.
+            old_install_dir = state.get("old_install_dir") or ""
+            new_install_dir = state.get("new_install_dir") or ""
             if persisted_version != "?" and persisted_version != __version__:
                 log.warning(
-                    "After-update: state file says target version v%s but "
-                    "running binary is v%s — possible stale state from a "
-                    "prior failed dance, or wrong .exe at install path. "
-                    "Forensics below may be misleading.",
-                    persisted_version, __version__,
+                    "After-update-folder-swap: state file says target "
+                    "version v%s but running binary is v%s — possible "
+                    "stale state from a prior failed dance, or wrong "
+                    "build at the .new/ path. Forensics below may be "
+                    "misleading.", persisted_version, __version__,
                 )
             log.info(
-                "After-update: relaunched as v%s (parent pid %s, parent exe %r)",
+                "After-update-folder-swap: relaunched as v%s (parent "
+                "pid %s, parent exe %r, old_install=%r, new_install=%r)",
                 persisted_version,
                 state.get("pid") or "?",
                 state.get("exe_path") or "?",
+                old_install_dir, new_install_dir,
             )
         else:
-            # No state file. Either the user manually invoked --after-update
-            # (unusual but harmless — fall through to normal startup) or the
-            # state file disappeared between the parent's write and our read
-            # (sync-software, AV, manual delete). Log so it's diagnosable.
-            log.info("After-update: launched without relaunch state — "
-                     "manual invocation or state file lost")
-        # Strip --after-update from argv so it doesn't survive into any
-        # later argv-scanning code. Idempotent (no-op if a future code path
-        # also tries to strip it).
-        sys.argv = [a for a in sys.argv if a != "--after-update"]
+            log.info("After-update-folder-swap: launched without relaunch "
+                     "state — manual invocation or state file lost. "
+                     "Falling back to layout-based discovery.")
+
+        # Layout-based discovery fallback: if the state file is missing or
+        # didn't record the install dirs, deduce them from our current
+        # location. We MUST be running from <install_parent>/displayoff.new/
+        # (the dance only spawns from there); if we're not, something's off
+        # and we should bail out of the swap rather than rename random dirs.
+        if not new_install_dir:
+            new_install_dir = _INSTALL_DIR or ""
+        if not old_install_dir and new_install_dir:
+            # Strip the .new suffix to get the canonical install dir name.
+            if new_install_dir.endswith(_UPDATE_NEW_DIR_SUFFIX):
+                old_install_dir = new_install_dir[:-len(_UPDATE_NEW_DIR_SUFFIX)]
+
+        # Sanity-check the discovered paths before doing destructive moves.
+        # If either is empty, or new_install_dir != _INSTALL_DIR, OR
+        # new_install_dir doesn't end in `.new`, abort the swap and log
+        # loudly. The user is left running the v-new build from the .new/
+        # dir — functional, but the install layout will need manual cleanup.
+        do_swap = bool(
+            old_install_dir and new_install_dir
+            and new_install_dir == _INSTALL_DIR
+            and new_install_dir.endswith(_UPDATE_NEW_DIR_SUFFIX)
+            and not old_install_dir.endswith(_UPDATE_NEW_DIR_SUFFIX)
+        )
+
+        if do_swap:
+            import shutil
+            old_backup = old_install_dir + _UPDATE_OLD_DIR_SUFFIX
+            log.info("Folder-swap: renaming %s -> %s",
+                     old_install_dir, old_backup)
+            # If a stale .old/ from a prior crashed dance exists, clean it
+            # first; otherwise os.rename will refuse to overwrite.
+            if os.path.exists(old_backup):
+                try:
+                    shutil.rmtree(old_backup)
+                except OSError as e:
+                    log.warning("Folder-swap: could not remove stale %r: %s "
+                                "— skipping swap. Manual cleanup required.",
+                                old_backup, e)
+                    do_swap = False
+            if do_swap and os.path.exists(old_install_dir):
+                try:
+                    os.rename(old_install_dir, old_backup)
+                except OSError as e:
+                    log.warning("Folder-swap: cannot rename %r -> %r (%s) "
+                                "— skipping swap. Manual cleanup required.",
+                                old_install_dir, old_backup, e)
+                    do_swap = False
+            if do_swap:
+                log.info("Folder-swap: renaming %s -> %s",
+                         new_install_dir, old_install_dir)
+                try:
+                    os.rename(new_install_dir, old_install_dir)
+                except OSError as e:
+                    # We've already moved old_install_dir → .old. Try to
+                    # restore so the user isn't left without an install.
+                    log.error("Folder-swap: cannot rename %r -> %r (%s); "
+                              "restoring %r -> %r so the user isn't "
+                              "stranded.", new_install_dir, old_install_dir,
+                              e, old_backup, old_install_dir)
+                    try:
+                        os.rename(old_backup, old_install_dir)
+                    except OSError as restore_err:
+                        log.error("Folder-swap: restore also failed (%s). "
+                                  "MANUAL RECOVERY: rename %r back to %r.",
+                                  restore_err, old_backup, old_install_dir)
+                    do_swap = False
+            if do_swap:
+                # Re-resolve _EXE_PATH/_INSTALL_DIR — our underlying .exe
+                # is now at old_install_dir/displayoff.exe (NOT at the
+                # original new_install_dir path which no longer exists).
+                _re_resolve_exe_path_post_swap()
+                # Best-effort cleanup of the .old/ backup. AV may briefly
+                # hold locks on DLLs inside; failures here get retried at
+                # next launch's _recover_from_failed_update pass.
+                try:
+                    shutil.rmtree(old_backup)
+                    log.info("Folder-swap: deleted %s (old install backup).",
+                             old_backup)
+                except OSError as e:
+                    log.warning("Folder-swap: could not delete %r (%s) — "
+                                "will retry on next launch.", old_backup, e)
+        else:
+            log.warning("Folder-swap: skipping swap. old=%r new=%r "
+                        "_INSTALL_DIR=%r. Running build is v%s but install "
+                        "layout is non-canonical — user should reinstall.",
+                        old_install_dir, new_install_dir, _INSTALL_DIR,
+                        __version__)
+
+        # Strip --after-update-folder-swap from argv so it doesn't survive
+        # into any later argv-scanning code. Idempotent.
+        sys.argv = [a for a in sys.argv if a != "--after-update-folder-swap"]
 
     if "--version" in sys.argv:
         print(f"displayoff {__version__}")
