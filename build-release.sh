@@ -61,7 +61,7 @@ python -m nuitka \
     --product-name="Display Off" \
     --product-version="${VERSION}.0" \
     --file-version="${VERSION}.0" \
-    --file-description="Force all monitors to sleep without putting the PC to sleep." \
+    --file-description="Display Off" \
     --copyright="MIT License" \
     --company-name="itsnateai" \
     --output-dir=build \

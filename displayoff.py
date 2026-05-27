@@ -36,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.22"
+__version__ = "1.7.23"
 
 log = logging.getLogger("displayoff")
 
@@ -5275,6 +5275,63 @@ def run_tray():
                             "native_blank's atexit handler will attempt the restore.")
         icon.stop()
 
+    # Auto-blank idle-threshold submenu (v1.7.23).
+    #
+    # Idle threshold lives in cfg['idle_blank_minutes'] (0 = disabled). Before
+    # v1.7.23 the only entrypoint to change it was the Settings dialog spinbox.
+    # The submenu surfaces the common presets (off / 5 / 10 / 30 min) directly
+    # on the tray-icon right-click so the common case doesn't require opening
+    # Settings. Custom non-preset values are still editable via Settings; if
+    # the current cfg holds a non-preset value (e.g. 15), none of the radio
+    # items render checked — clicking any preset overwrites the custom value
+    # with the preset, which matches standard radio-button UX.
+    #
+    # Reads cfg fresh on every render and click. Right-click renders fire
+    # 4 small JSON reads here (one per radio's checked-callable). Each
+    # displayoff_config.json read is <200 bytes / <1 ms, so the overhead is
+    # not worth a memoization layer.
+    _IDLE_PRESETS = (
+        ("Off", 0),
+        ("5 minutes", 5),
+        ("10 minutes", 10),
+        ("30 minutes", 30),
+    )
+
+    def _idle_check(target):
+        def _check(item):
+            try:
+                return int(load_config().get("idle_blank_minutes", 0) or 0) == target
+            except (OSError, TypeError, ValueError):
+                return False
+        return _check
+
+    def _idle_set(target):
+        def _action(icon, item):
+            try:
+                c = load_config()
+                c["idle_blank_minutes"] = int(target)
+                save_config(c)
+                log.info("Auto-blank idle threshold set to %d minutes via tray submenu.",
+                         int(target))
+            except OSError as e:
+                log.exception("Failed to persist idle_blank_minutes from tray submenu: %s", e)
+                return
+            try:
+                icon.update_menu()
+            except Exception:
+                log.exception("icon.update_menu after idle-preset change failed (non-fatal)")
+            try:
+                msg = "Auto-blank disabled" if target == 0 else f"Auto-blank: {target} min idle"
+                icon.notify(msg, "Display Off")
+            except Exception:
+                log.exception("icon.notify after idle-preset change failed (non-fatal)")
+        return _action
+
+    idle_submenu = Menu(*(
+        MenuItem(label, _idle_set(mins), checked=_idle_check(mins), radio=True)
+        for label, mins in _IDLE_PRESETS
+    ))
+
     # Why no clickable "Turn Off Displays" menu item:
     #
     # In v1.6.0+ the blank routes through the Win32 native idle-display-off
@@ -5304,6 +5361,7 @@ def run_tray():
         MenuItem("• Double-click icon", None, enabled=False),
         MenuItem(lambda item: f"• {hotkey_name[0]}", None, enabled=False),
         Menu.SEPARATOR,
+        MenuItem("Auto-blank when idle", idle_submenu),
         MenuItem("Settings...", on_settings),
         MenuItem("Quit", on_quit),
         # Hidden item — not shown in the right-click menu, but `default=True`
