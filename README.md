@@ -18,7 +18,7 @@ The classic `SC_MONITORPOWER` mechanism — used by NirCmd, AutoHotkey scripts, 
 
 Two install options — pick whichever fits.
 
-### Option A: Single .exe (no Python required, recommended)
+### Option A: Zipped folder bundle (no Python required, recommended)
 
 Download `displayoff-vX.Y.Z.zip` from the [latest release](https://github.com/itsnateai/displayoff/releases/latest) and extract it anywhere you keep your portable tools (e.g. `C:\Users\<you>\Tools\`). The zip contains a `displayoff\` folder with `displayoff.exe` and ~150 runtime files — keep the folder together. Double-click `displayoff\displayoff.exe` to launch; the tray icon appears.
 

@@ -2968,13 +2968,40 @@ def _extract_zip_bundle(zip_path, install_parent, log=log):
         return False, f"zip extraction failed: {e}"
 
     # Expect a top-level `displayoff/` directory containing `displayoff.exe`.
-    inner = os.path.join(staging, "displayoff")
-    inner_exe = os.path.join(inner, "displayoff.exe")
-    if not os.path.isdir(inner) or not os.path.isfile(inner_exe):
+    # v1.7.22 verifier-round convergent fix (T3 Sonnet + T3 Opus): the
+    # original case-sensitive `os.path.isdir(staging/displayoff)` would
+    # spuriously pass on NTFS when the zip's top-level entry was actually
+    # cased differently (e.g. `Displayoff/displayoff.exe`) because NTFS
+    # lookups are case-insensitive but Windows then keeps whatever case
+    # the zip used on-disk. The subsequent `os.rename(inner, new_dir)`
+    # would leave the .new dir with a non-canonical case, breaking later
+    # `endswith(.new)` checks and the autostart .lnk target. Walk the
+    # staging dir and find a single top-level entry that case-insensitively
+    # equals "displayoff", rejecting any zip whose top-level is the wrong
+    # name OR contains multiple unrelated top-level entries.
+    try:
+        top_entries = os.listdir(staging)
+    except OSError as e:
         shutil.rmtree(staging, ignore_errors=True)
-        return False, ("zip does not contain a top-level 'displayoff/' "
-                       "directory with displayoff.exe — release packaging "
-                       "may be broken.")
+        return False, f"could not list staging dir {staging!r}: {e}"
+    matching = [
+        e for e in top_entries
+        if os.path.isdir(os.path.join(staging, e))
+        and e.lower() == "displayoff"
+    ]
+    if len(matching) != 1:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, (f"zip does not contain a single top-level 'displayoff/' "
+                       f"directory (found {len(matching)} matching entries "
+                       f"out of {len(top_entries)} top-level items) — "
+                       "release packaging may be broken.")
+    inner_name = matching[0]
+    inner = os.path.join(staging, inner_name)
+    inner_exe = os.path.join(inner, "displayoff.exe")
+    if not os.path.isfile(inner_exe):
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, ("top-level 'displayoff/' directory does not contain "
+                       "displayoff.exe — release packaging may be broken.")
 
     # Promote the inner dir to the canonical .new/ location, then clean
     # the now-empty staging tree.
@@ -3023,19 +3050,60 @@ def _re_resolve_exe_path_post_swap():
         _GetModuleFileNameW = _k.GetModuleFileNameW
         _GetModuleFileNameW.argtypes = [_wt.HMODULE, _wt.LPWSTR, _wt.DWORD]
         _GetModuleFileNameW.restype = _wt.DWORD
-        buf = ctypes.create_unicode_buffer(32768)
-        n = _GetModuleFileNameW(None, buf, len(buf))
-        if n > 0 and buf.value and os.path.isfile(buf.value):
-            new_path = os.path.abspath(buf.value)
-            log.info("Re-resolved _EXE_PATH post-folder-swap: %r -> %r",
-                     _EXE_PATH, new_path)
-            _EXE_PATH = new_path
-            _INSTALL_DIR = os.path.dirname(new_path)
+        # Buffer needs to be > 32767 (the long-path ceiling under
+        # `\\?\`-prefixed paths). On overflow GetModuleFileNameW returns
+        # the buffer length (NOT null-terminated) — we treat that case as
+        # a failure (path truncation could land us at a path that exists
+        # but isn't ours).
+        buf_size = 32768
+        buf = ctypes.create_unicode_buffer(buf_size)
+        n = _GetModuleFileNameW(None, buf, buf_size)
     except (OSError, AttributeError) as e:
         log.warning("Could not re-resolve _EXE_PATH post-swap "
-                    "(GetModuleFileNameW failed: %s); leaving cached "
-                    "value %r. Autostart .lnk re-toggle may produce a "
-                    "stale target until next launch.", e, _EXE_PATH)
+                    "(GetModuleFileNameW setup failed: %s); leaving "
+                    "cached value %r. Autostart .lnk re-toggle may "
+                    "produce a stale target until next launch.", e, _EXE_PATH)
+        return
+
+    # v1.7.22 verifier-round convergent fix (T2 Sonnet + T2 Opus): log
+    # loudly on every silent-failure branch instead of falling through
+    # quietly. A silent fallthrough leaves `_EXE_PATH` pointing at the
+    # pre-swap `.new/displayoff.exe` path that no longer exists; the
+    # autostart .lnk re-toggle then writes a broken target with no
+    # diagnostic trail.
+    if n == 0:
+        log.warning("Post-swap _EXE_PATH re-resolve: "
+                    "GetModuleFileNameW returned 0 (lastError=%d); "
+                    "leaving cached value %r. Autostart .lnk re-toggle "
+                    "may produce a stale target until next launch.",
+                    ctypes.get_last_error(), _EXE_PATH)
+        return
+    if n >= buf_size:
+        log.warning("Post-swap _EXE_PATH re-resolve: "
+                    "GetModuleFileNameW returned %d (== buf_size %d) "
+                    "indicating path truncation; leaving cached value "
+                    "%r. Autostart .lnk re-toggle may produce a stale "
+                    "target until next launch.",
+                    n, buf_size, _EXE_PATH)
+        return
+    if not buf.value:
+        log.warning("Post-swap _EXE_PATH re-resolve: "
+                    "GetModuleFileNameW returned n=%d but buf is empty; "
+                    "leaving cached value %r.", n, _EXE_PATH)
+        return
+    if not os.path.isfile(buf.value):
+        log.warning("Post-swap _EXE_PATH re-resolve: "
+                    "GetModuleFileNameW returned %r but os.path.isfile "
+                    "is False; leaving cached value %r. Filesystem may "
+                    "not have flushed the rename yet, or path uses an "
+                    "extended-length prefix Python can't stat.",
+                    buf.value, _EXE_PATH)
+        return
+    new_path = os.path.abspath(buf.value)
+    log.info("Re-resolved _EXE_PATH post-folder-swap: %r -> %r",
+             _EXE_PATH, new_path)
+    _EXE_PATH = new_path
+    _INSTALL_DIR = os.path.dirname(new_path)
 
 
 def _write_update_relaunch_state(new_version, old_install_dir=None,
@@ -3093,19 +3161,29 @@ def _recover_from_failed_update():
     hung. Called at the top of main() — runs on every launch, cheap when
     there's nothing to do.
 
-    Four independent cleanups in `<install_parent>/`:
-      1. `displayoff.new.zip` — partial download (untrusted bytes; delete)
-      2. `displayoff.new/` — extracted bundle that never made it through
-         the swap step (we're already running from the canonical
-         `displayoff/` dir, so the staged copy is dead weight)
-      3. `displayoff.new.staging/` — interrupted zip extraction
-      4. `displayoff.old/` — pre-swap backup that
+    Five independent cleanups:
+      1. `<install_parent>/displayoff.new.zip` — partial download
+         (untrusted bytes; delete)
+      2. `<install_parent>/displayoff.new/` — extracted bundle that never
+         made it through the swap step (we're already running from the
+         canonical `displayoff/` dir, so the staged copy is dead weight)
+      3. `<install_parent>/displayoff.new.staging/` — interrupted zip
+         extraction
+      4. `<install_parent>/displayoff.old/` — pre-swap backup that
          --after-update-folder-swap didn't get around to deleting (we're
          already running from the new install dir; safe to clean)
-      5. Stale `_update_relaunch.json` without a corresponding
-         --after-update-folder-swap CLI flag — the spawn-child step
-         succeeded but the child crashed before consuming the state. Log
-         + delete.
+      5. Stale `_update_relaunch.json` in _DATA_DIR without a
+         corresponding --after-update-folder-swap CLI flag — the
+         spawn-child step succeeded but the child crashed before
+         consuming the state. Log + delete.
+
+    Also detects the **half-swapped state** (canonical install dir
+    missing but both `displayoff.new/` and `displayoff.old/` exist as
+    siblings — what you get if the previous run's
+    --after-update-folder-swap was killed between rename steps) and
+    resumes the swap by completing `.new -> canonical`. This MUST run
+    before the artifact cleanup loop — otherwise the loop would delete
+    `.new/` and `.old/`, destroying all the user's installed bytes.
 
     Skipped under .py source mode — the folder-swap dance only applies to
     the frozen --standalone bundle. Under source, `_EXE_PATH` is None and
@@ -3130,14 +3208,83 @@ def _recover_from_failed_update():
         return
     try:
         current_real = os.path.realpath(_INSTALL_DIR)
-    except OSError:
-        current_real = _INSTALL_DIR
+    except OSError as e:
+        # v1.7.22 verifier-round convergent fix (T2 Sonnet + T3 Opus): if
+        # realpath on our own install dir fails, skip the entire cleanup
+        # pass rather than fall back to the unresolved path. Without the
+        # fallback's safer-default the identity guard below silently
+        # disables — `_safe_realpath` would return raw paths for both
+        # `current_real` and the artifact, and the equality check could
+        # randomly compare unresolved-to-resolved across calls, exposing
+        # the live install dir to deletion via a junction.
+        log.warning("Update-artifact recovery: cannot realpath %r (%s); "
+                    "skipping cleanup pass to keep the identity guard "
+                    "honest.", _INSTALL_DIR, e)
+        return
 
     def _safe_realpath(path):
+        """Return realpath(path), or None if realpath fails. v1.7.22
+        verifier-fix: signaling failure (None) lets the caller treat the
+        guard as failed-closed rather than failed-open (the prior
+        implementation returned the raw path on OSError, which silently
+        bypassed the identity guard whenever the artifact's parent had
+        a permission-denied entry along the realpath chain)."""
         try:
             return os.path.realpath(path)
         except OSError:
-            return path
+            return None
+
+    # v1.7.22 verifier-round convergent fix (T3 Opus I2): detect the
+    # half-swapped state where the previous run's --after-update-folder-swap
+    # was killed between the first rename (canonical → .old) and the
+    # second rename (.new → canonical). Symptom: canonical install dir
+    # is missing but both `.new/` and `.old/` exist as siblings. Without
+    # this recovery, the autostart .lnk's canonical target doesn't exist
+    # AND the cleanup loop below would happily delete the `.new/` and
+    # `.old/` artifacts, destroying ALL the user's installed bytes.
+    # Resume by completing the second rename — gets the user onto the new
+    # version they wanted; .old/ gets cleaned by the loop below.
+    canonical_name = "displayoff"
+    canonical_dir = os.path.join(install_parent, canonical_name)
+    new_dir = os.path.join(install_parent, canonical_name + _UPDATE_NEW_DIR_SUFFIX)
+    old_dir = os.path.join(install_parent, canonical_name + _UPDATE_OLD_DIR_SUFFIX)
+    if (not os.path.exists(canonical_dir)
+            and os.path.isdir(new_dir)
+            and os.path.isdir(old_dir)
+            and os.path.isfile(os.path.join(new_dir, "displayoff.exe"))):
+        log.warning(
+            "Detected half-swapped install layout: canonical %r missing, "
+            "but %r and %r both exist. Resuming the swap by completing "
+            "the .new -> canonical rename.",
+            canonical_dir, new_dir, old_dir,
+        )
+        try:
+            os.rename(new_dir, canonical_dir)
+            log.info("Half-swap resumed: %r -> %r", new_dir, canonical_dir)
+            # If we're CURRENTLY running from new_dir (because the user
+            # manually launched <install_parent>/displayoff.new/displayoff.exe
+            # because their autostart .lnk was broken), re-resolve our
+            # cached paths so the cleanup loop's identity guard works.
+            if _INSTALL_DIR == new_dir:
+                _re_resolve_exe_path_post_swap()
+                # Refresh the install_parent + current_real values we
+                # already computed before this rename.
+                install_parent = os.path.dirname(_INSTALL_DIR)
+                try:
+                    current_real = os.path.realpath(_INSTALL_DIR)
+                except OSError:
+                    log.warning("Post-half-swap recovery: cannot realpath "
+                                "%r; skipping artifact cleanup pass.",
+                                _INSTALL_DIR)
+                    return
+        except OSError as e:
+            # The half-swap could not be resumed. Bail BEFORE the cleanup
+            # loop — proceeding would delete `.old/` (the user's only
+            # remaining install bytes) leaving them with nothing usable.
+            log.error("Half-swap resume failed (%s). MANUAL RECOVERY: "
+                      "rename %r to %r. Skipping artifact cleanup pass.",
+                      e, new_dir, canonical_dir)
+            return
 
     artifacts = [
         (os.path.join(install_parent, "displayoff.new.zip"), "file"),
@@ -3145,19 +3292,50 @@ def _recover_from_failed_update():
         (os.path.join(install_parent, "displayoff.new.staging"), "dir"),
         (os.path.join(install_parent, "displayoff.old"), "dir"),
     ]
+    # v1.7.22 verifier-round MINOR fix (T1 Opus): the docstring lists 5
+    # cleanups but the loop only ran 4. Item 5 — the stale
+    # `_update_relaunch.json` left in _DATA_DIR by a crashed dance — used
+    # to be cleaned by the v1.7.13 recovery code; restored here so the
+    # docstring's "Five independent cleanups" claim isn't a lie.
+    # Only cleans the file if NO `--after-update-folder-swap` flag is
+    # currently in argv (because in that case, the handler in main()
+    # is about to consume the state file via _read_and_clear).
+    if ("--after-update-folder-swap" not in sys.argv
+            and os.path.exists(_UPDATE_RELAUNCH_PATH)):
+        try:
+            os.remove(_UPDATE_RELAUNCH_PATH)
+            log.info("Cleaned stale update-relaunch state: %s",
+                     _UPDATE_RELAUNCH_PATH)
+        except OSError as e:
+            log.warning("Could not clean stale update-relaunch state "
+                        "%r: %s", _UPDATE_RELAUNCH_PATH, e)
+
     for path, kind in artifacts:
         if not os.path.exists(path):
             continue
         # Identity guard: never delete a sibling that's actually the
-        # current install dir under a symlink/junction loop.
-        if kind == "dir" and _safe_realpath(path) == current_real:
-            log.warning(
-                "Skipping update-artifact cleanup of %r: realpath matches "
-                "current install dir. Likely a junction/symlink loop — "
-                "user should manually inspect the layout.",
-                path,
-            )
-            continue
+        # current install dir under a symlink/junction loop. v1.7.22
+        # verifier-fix: failed realpath also skips (safer default — a
+        # path we can't resolve is one we can't safely classify).
+        if kind == "dir":
+            artifact_real = _safe_realpath(path)
+            if artifact_real is None:
+                log.warning(
+                    "Skipping update-artifact cleanup of %r: could not "
+                    "realpath (permission denied or broken junction). "
+                    "Failed-closed to keep the identity guard honest.",
+                    path,
+                )
+                continue
+            if artifact_real == current_real:
+                log.warning(
+                    "Skipping update-artifact cleanup of %r: realpath "
+                    "matches current install dir. Likely a "
+                    "junction/symlink loop — user should manually "
+                    "inspect the layout.",
+                    path,
+                )
+                continue
         try:
             if kind == "file":
                 os.remove(path)

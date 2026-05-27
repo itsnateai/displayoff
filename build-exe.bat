@@ -43,8 +43,22 @@ REM displayoff.py's _execute_rename_dance for the folder-swap protocol).
 REM Distribution moves from a bare .exe asset to a zip.
 
 setlocal
-set VERSION=1.7.21
+REM v1.7.22: scrape VERSION from displayoff.py's __version__ instead of
+REM hardcoding it here. The dual-source pattern (.bat hardcodes / .sh
+REM scrapes from source) was the root of a recurring forgot-to-bump bug
+REM caught by the v1.7.21 verifier round (T2-Opus HIGH) and immediately
+REM re-occurred at v1.7.22 (caught by the v1.7.22 verifier round,
+REM convergent REJECT across 5 of 6 verifier agents). Scraping from a
+REM single source of truth is the recurrence-killing fix the v1.7.22
+REM T3-Opus verifier suggested. Matches build-release.sh exactly.
+REM Pattern: [[reference_settings_apply_dual_propagation_bug]].
+for /f "delims=" %%V in ('python -c "import re; print(re.search(r'^__version__ = \"([^\"]+)\"', open(r'displayoff.py', encoding='utf-8').read(), re.M).group(1))"') do set VERSION=%%V
+if "%VERSION%"=="" (
+    echo === BUILD FAILED: could not scrape __version__ from displayoff.py. ===
+    exit /b 1
+)
 set VERSION_FOUR=%VERSION%.0
+echo Building v%VERSION% (scraped from displayoff.py)...
 
 REM v1.7.20: Nuitka 4.1.1 preflight. CI is pinned via
 REM `pip install nuitka==4.1.1` inside release.yml, but local builds rely
