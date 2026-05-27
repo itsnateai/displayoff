@@ -1,6 +1,6 @@
 # Changelog — Display Off
 
-## [1.7.22] — UNRELEASED
+## [1.7.22] — 2026-05-27
 
 **Breaking-ish distribution change.** v1.7.13–v1.7.21 shipped a single-file `displayoff.exe` built via Nuitka `--onefile`. v1.7.22 switches to Nuitka `--standalone` and ships a zipped folder bundle (`displayoff-v1.7.22.zip` → extracts to `displayoff/displayoff.exe` + ~150 runtime files). The previous in-app self-updater can't reach v1.7.22 (it expects a `.exe` release asset; v1.7.22 ships a `.zip`) — manual one-time reinstall required. From v1.7.22 onward the new folder-swap self-updater handles automatic upgrades.
 
