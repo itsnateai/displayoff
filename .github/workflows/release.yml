@@ -93,7 +93,7 @@ jobs:
         run: ./build-release.sh
 
       - name: Upload artifacts to the release
-        # Pinned to v2.6.2 — softprops/action-gh-release@v2 is the tag the
+        # Pinned to v3.0.0 — softprops/action-gh-release@v3 is the tag the
         # user-facing docs reference, the SHA is the actual security
         # boundary. Re-resolve via `gh api repos/softprops/action-gh-release/git/refs/tags/<tag>`
         # before bumping. v1.7.20 verifier-converged fix: write permission
