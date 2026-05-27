@@ -3307,25 +3307,58 @@ def _recover_from_failed_update():
             "the .new -> canonical rename.",
             canonical_dir, new_dir, old_dir,
         )
-        # If canonical exists but is empty, remove it first so os.rename
-        # can target the canonical name (Windows rename refuses to
-        # overwrite a non-empty dst, but actually also refuses to
-        # overwrite an empty dst too on some Win versions). shutil.rmtree
-        # handles the empty-dir case cleanly.
+        # R3 verifier-round convergent fix (T2 Opus + T3 Sonnet + T3 Opus):
+        # the previous implementation called `shutil.rmtree(canonical_dir)`
+        # before `os.rename(new_dir, canonical_dir)`. rmtree is NOT atomic
+        # on Windows — if AV holds a lock partway through the recursive
+        # delete, rmtree raises OSError with PARTIAL deletion done. The
+        # caught exception triggered a return, leaving canonical with
+        # partial contents, and the next launch's empty-canonical detector
+        # then saw a "non-empty" canonical and skipped the half-swap
+        # branch entirely, after which the cleanup loop deleted .new/ +
+        # .old/. Net: hard brick from a state that was recoverable.
+        #
+        # Atomic alternative: rename canonical → a scratch sibling
+        # (single-syscall, can't partial-fail), then rename .new →
+        # canonical, then best-effort rmtree the scratch sibling
+        # (ignore_errors=True so AV locks don't propagate failure into
+        # an otherwise-successful swap). Same recurrence-killing pattern
+        # the single-file rename-dance used in v1.7.13.
+        scratch_dir = canonical_dir + ".tmp-evicted"
         if os.path.exists(canonical_dir):
+            # Pre-clean any stale scratch dir from a prior crashed
+            # attempt before reusing the name.
+            if os.path.exists(scratch_dir):
+                try:
+                    import shutil
+                    shutil.rmtree(scratch_dir, ignore_errors=True)
+                except OSError:
+                    pass
             try:
-                import shutil
-                shutil.rmtree(canonical_dir)
+                os.rename(canonical_dir, scratch_dir)
             except OSError as e:
-                log.error("Could not remove empty canonical %r before "
-                          "half-swap resume (%s). MANUAL RECOVERY: "
-                          "remove %r, then rename %r to %r. Skipping "
-                          "artifact cleanup pass.", canonical_dir, e,
+                log.error("Could not evict empty canonical %r to %r "
+                          "before half-swap resume (%s). MANUAL "
+                          "RECOVERY: remove %r, then rename %r to %r. "
+                          "Skipping artifact cleanup pass.",
+                          canonical_dir, scratch_dir, e,
                           canonical_dir, new_dir, canonical_dir)
                 return
         try:
             os.rename(new_dir, canonical_dir)
             log.info("Half-swap resumed: %r -> %r", new_dir, canonical_dir)
+            # Best-effort cleanup of the evicted-canonical scratch dir.
+            # ignore_errors=True so an AV lock here doesn't undo the
+            # swap that just succeeded — the next launch's
+            # _recover_from_failed_update artifact loop will retry the
+            # scratch_dir delete (it's not on the loop's list yet,
+            # though — see the inline cleanup below).
+            if os.path.exists(scratch_dir):
+                try:
+                    import shutil
+                    shutil.rmtree(scratch_dir, ignore_errors=True)
+                except OSError:
+                    pass
             # R2 T3 Sonnet + Opus: replace the prior `_INSTALL_DIR ==
             # new_dir` string comparison with `os.path.samefile` /
             # normpath-normcase equivalence so junction loops, trailing-
