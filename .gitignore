@@ -63,3 +63,8 @@ CLAUDE.md
 # as a release asset; the build dir is local-only scratch.
 build/
 nuitka-crash-report.xml
+
+# CI artifact validation scratch (v1.7.22+ release flow). Downloaded zips
+# + extracts from `gh release download` used to verify CI manifest matches
+# CI bytes before promoting drafts. Pure local — never committed.
+ci-validate/
