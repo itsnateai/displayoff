@@ -20,9 +20,11 @@ Two install options — pick whichever fits.
 
 ### Option A: Single .exe (no Python required, recommended)
 
-Download `displayoff.exe` from the [latest release](https://github.com/itsnateai/displayoff/releases/latest), double-click to launch. The tray icon appears.
+Download `displayoff-vX.Y.Z.zip` from the [latest release](https://github.com/itsnateai/displayoff/releases/latest) and extract it anywhere you keep your portable tools (e.g. `C:\Users\<you>\Tools\`). The zip contains a `displayoff\` folder with `displayoff.exe` and ~150 runtime files — keep the folder together. Double-click `displayoff\displayoff.exe` to launch; the tray icon appears.
 
-Built-in self-updater: tray → right-click → **Settings → Updates → Install now**. Downloads the new release, verifies its SHA256 against the published `SHA256SUMS.txt` manifest, atomically replaces the running `.exe`, and relaunches. No installer, no admin.
+Built-in self-updater: tray → right-click → **Settings → Updates → Install now**. Downloads the new release zip, verifies its SHA256 against the published `SHA256SUMS.txt` manifest, hot-swaps the install folder, and relaunches. No installer, no admin. (See "Why a folder, not a single .exe?" below.)
+
+**Upgrading from v1.7.21 or earlier:** the install layout changed in v1.7.22 — single-file `displayoff.exe` was replaced by a folder bundle. The v1.7.21 in-app updater can't reach v1.7.22 (it expects a `.exe` asset; v1.7.22 ships a `.zip`). Manual one-time upgrade: quit the running v1.7.21 tray, delete the old `displayoff.exe`, extract the v1.7.22 zip in its place, re-toggle "Run at Windows startup" in Settings so the `.lnk` repoints at `displayoff\displayoff.exe`. Your `%APPDATA%\displayoff\` config + logs carry over untouched.
 
 ### Option B: Python source
 
@@ -31,7 +33,11 @@ pip install -r requirements.txt
 python displayoff.py
 ```
 
-Requires **Python 3.8+** and **Windows**. Same logic as the .exe; the .exe is a frozen build of this source via Nuitka onefile.
+Requires **Python 3.8+** and **Windows**. Same logic as the frozen build; the frozen build is a Nuitka --standalone compile of this source.
+
+### Why a folder, not a single .exe?
+
+v1.7.13–v1.7.21 shipped a single 52 MB `displayoff.exe` built via Nuitka `--onefile`. That mode extracts bundled DLLs to `%TEMP%\onefile_<pid>_<rand>\` on every launch, then runs from there. The pattern matches Microsoft Defender's `Trojan:Win32/Bearfoos.A!ml` heuristic almost exactly (small unsigned binary + Temp DLL staging + global keyboard hook + `powercfg` subprocess spawning), and Defender's ML model started false-positive-quarantining the extracted DLL on some installs. v1.7.22 switched to Nuitka `--standalone`, which lays the DLLs out next to the .exe persistently — no Temp extraction, no Bearfoos.A!ml trigger, slightly faster cold-start.
 
 Both modes use the same global hotkey (**Ctrl+Alt+F12** by default) and the same `%APPDATA%\displayoff\` state directory, so you can switch between them without losing config.
 
@@ -82,7 +88,7 @@ Right-click the tray icon → **Settings**:
 |---|---|
 | **Hotkey** | Click the field, then press your combination. Esc cancels recording. |
 | **Lock workstation when blanking** | Locks via Win+L before powering off the screens. |
-| **Run at Windows startup** | Creates `Display Off.lnk` in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`. Targets `displayoff.exe` when launched from the frozen build, or `pythonw.exe displayoff.py` when launched from source — auto-refreshes the .lnk if you switch between modes. Legacy `HKCU\...\Run` entries auto-cleaned on first toggle. |
+| **Run at Windows startup** | Creates `Display Off.lnk` in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`. Targets `<install_dir>\displayoff\displayoff.exe` when launched from the frozen build, or `pythonw.exe displayoff.py` when launched from source — auto-refreshes the .lnk if you switch between modes or move the install folder. Legacy `HKCU\...\Run` entries auto-cleaned on first toggle. |
 | **Auto-blank after N minutes idle** | Polls `GetLastInputInfo` every 15s, fires once when idle ≥ threshold. Set to 0 to disable. |
 
 **Save** = apply and close. **Apply** = persist and stay open. **Cancel** = close, discard in-dialog edits (already-applied changes stay persisted).

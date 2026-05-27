@@ -1,5 +1,27 @@
 # Changelog — Display Off
 
+## [1.7.22] — UNRELEASED
+
+**Breaking-ish distribution change.** v1.7.13–v1.7.21 shipped a single-file `displayoff.exe` built via Nuitka `--onefile`. v1.7.22 switches to Nuitka `--standalone` and ships a zipped folder bundle (`displayoff-v1.7.22.zip` → extracts to `displayoff/displayoff.exe` + ~150 runtime files). The previous in-app self-updater can't reach v1.7.22 (it expects a `.exe` release asset; v1.7.22 ships a `.zip`) — manual one-time reinstall required. From v1.7.22 onward the new folder-swap self-updater handles automatic upgrades.
+
+### Why this changed
+
+The `--onefile` mode extracts bundled DLLs to `%TEMP%\onefile_<pid>_<rand>\` on every launch and runs from there. That extraction pattern matches Microsoft Defender's `Trojan:Win32/Bearfoos.A!ml` heuristic almost exactly — small unsigned Nuitka onefile binaries that also do global keyboard hooks (pynput), Win32 syscalls (ctypes), and spawn subprocesses (powercfg) fingerprint as malware-staging behavior to Defender's ML model. Verified false-positive on a daily-driver install 2026-05-27: the auto-idle-blank fired, Nuitka bootstrap extracted `displayoff.dll` to a fresh `onefile_*` Temp folder, and Defender quarantined it within seconds (event ID 1116, threat `Trojan:Win32/Bearfoos.A!ml`). The detection was a pure pattern hit, not a signature — the binary itself was clean, the bytes were just statistically suspicious.
+
+Switching to `--standalone` eliminates the Temp extraction step. The .exe and all its dependencies live persistently in `displayoff/` next to each other; nothing gets unpacked on launch. Same runtime behavior, no Bearfoos.A!ml trigger, slightly faster cold-start (no extraction cost per launch). Trade-off: install footprint goes from one 52 MB `.exe` to a 52 MB folder with ~150 files, distribution moves from a bare `.exe` to a zip, and the self-updater's old "atomic single-file rename" trick has to become a folder-swap protocol (see v1.7.22 self-updater rewrite below).
+
+### Build + release pipeline
+
+- **`build-exe.bat` and `build-release.sh` switched to `--standalone`.** Both build scripts drop `--onefile --onefile-no-compression` (the latter was a workaround for a Nuitka 4.1.1 + py3.14 zstd packing bug specific to onefile-pack — under standalone there is no zstd step, so the workaround is moot). The Nuitka 4.1.1 pin stays until we've smoke-tested a newer Nuitka under standalone mode on Win11.
+- **Post-build step: rename + zip.** Nuitka standalone outputs `build/displayoff.dist/`; the build scripts rename that to `build/displayoff/` (clean folder name matching the documented install layout) then `python -m zipfile -c build/displayoff-vX.Y.Z.zip displayoff/` packages it. SHA256SUMS.txt now hashes the zip (the actual release artifact) instead of a bare .exe.
+- **`.github/workflows/release.yml` upload list switched from `build/displayoff.exe` to the glob `build/displayoff-v*.zip` + `build/SHA256SUMS.txt`.** Glob means the workflow doesn't need a parallel source of truth for the version string — build-release.sh derives the version from `__version__` in displayoff.py, the workflow just uploads whatever zip it produced.
+- **CDN redirect-host smoke test URL bumped from `displayoff.exe` to `displayoff-${TAG}.zip`.** Same allowlist + same defensive purpose; just the asset path under the release URL changed.
+- **README.md install instructions updated.** Option A now says "download zip, extract to `<install_dir>/`, end up with `<install_dir>/displayoff/displayoff.exe`" instead of "drop the .exe in `<install_dir>/`". Added a "Why a folder, not a single .exe?" section linking the Bearfoos.A!ml context.
+
+### Folder-swap self-updater
+
+*See Commit B for the runtime/displayoff.py changes — those land in a separate commit so this build-pipeline change can be reviewed independently.*
+
 ## [1.7.21] — 2026-05-23
 
 **Maintenance-mode exception** — one user-reported UX gap surfaced after v1.7.20's "final release" tag: when something held `ES_DISPLAY_REQUIRED` (PowerToys Awake's "Keep screen on", a fullscreen video player, presentation mode), the hotkey appeared to silently no-op. The blank attempt actually fired correctly, but the kernel's native idle-blank path respects display wake-locks by design — so the user saw "nothing happens" with no signal as to why.

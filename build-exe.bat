@@ -1,8 +1,10 @@
 @echo off
-REM build-exe.bat — Nuitka onefile build for displayoff
+REM build-exe.bat — Nuitka standalone build for displayoff (v1.7.22+)
 REM
-REM Output:  build\displayoff.exe  (single self-contained .exe, ~55 MB
-REM          uncompressed — see --onefile-no-compression note below)
+REM Output:  build\displayoff\          standalone bundle directory (~55 MB,
+REM                                     contains displayoff.exe + ~150 runtime files)
+REM          build\displayoff-vX.Y.Z.zip  zip of that directory, for release upload
+REM          build\SHA256SUMS.txt         one-line manifest, sha256sum -b format
 REM
 REM Requirements:
 REM   - Python 3.14
@@ -13,9 +15,9 @@ REM
 REM Build time: ~3-8 minutes on first run, ~2-4 minutes incremental.
 REM
 REM Verify after build:
-REM   build\displayoff.exe --version       (should print "displayoff 1.7.21")
-REM   build\displayoff.exe                 (should start tray icon)
-REM   build\displayoff.exe --diagnose-paths (should print path-resolver state; exit 0 on success, 1 on broken resolver)
+REM   build\displayoff\displayoff.exe --version       (should print "displayoff 1.7.22")
+REM   build\displayoff\displayoff.exe                 (should start tray icon)
+REM   build\displayoff\displayoff.exe --diagnose-paths (should print path-resolver state; exit 0 on success, 1 on broken resolver)
 REM
 REM ── Why Nuitka and not PyInstaller ──
 REM Nuitka compiles Python to C → native binary. Smaller (~15-25 MB vs ~30-40
@@ -23,11 +25,22 @@ REM MB PyInstaller), faster startup (~200-500 ms vs ~800-2000 ms), and less
 REM AV-flagged because the binary signature differs from the well-known
 REM PyInstaller bootloader. Trade-off: 5-10x slower build.
 REM
-REM ── --onefile vs --standalone ──
-REM --onefile produces a single .exe that extracts dependencies to a per-launch
-REM temp dir at startup. --standalone produces a directory with .exe + .dll
-REM files alongside (no extraction step). We use --onefile so the install is
-REM a single file the rename-dance updater can swap atomically.
+REM ── --onefile vs --standalone (CHANGED in v1.7.22) ──
+REM v1.7.13–v1.7.21 used --onefile, which produces a single .exe that extracts
+REM all bundled DLLs to %TEMP%\onefile_<pid>_<rand>\ on every launch. That
+REM extraction pattern matches Microsoft Defender's Trojan:Win32/Bearfoos.A!ml
+REM heuristic 1:1 — small unsigned PyInstaller/Nuitka onefile binaries with
+REM pynput keyboard hooks + ctypes Win32 calls + powercfg subprocess spawning
+REM trip the ML model reliably. Verified false-positive on Nate's machine
+REM 2026-05-27 — Defender quarantined the extracted displayoff.dll from
+REM Temp\onefile_17168_583395_yKV8JgBRtaU\ within seconds of an auto-blank
+REM firing. Switching to --standalone eliminates the Temp extraction entirely:
+REM the .exe and all its dependency DLLs live persistently in build\displayoff\
+REM and run from there directly. Trade-off: install footprint changes from a
+REM single 52 MB .exe to a 52 MB folder with ~150 files; can't atomically
+REM rename the running install via single-file os.rename anymore (see
+REM displayoff.py's _execute_rename_dance for the folder-swap protocol).
+REM Distribution moves from a bare .exe asset to a zip.
 
 setlocal
 set VERSION=1.7.21
@@ -36,14 +49,17 @@ set VERSION_FOUR=%VERSION%.0
 REM v1.7.20: Nuitka 4.1.1 preflight. CI is pinned via
 REM `pip install nuitka==4.1.1` inside release.yml, but local builds rely
 REM on whatever Nuitka happens to be installed in the active venv. A
-REM mismatch silently introduces behavior drift (the py3.14 zstd
-REM compression bug we're working around might be fixed in a newer
-REM Nuitka — in which case --onefile-no-compression should be DROPPED,
-REM not kept). Failing fast here forces the human to make that call
-REM explicitly. If you intentionally want to test a newer Nuitka:
+REM mismatch silently introduces behavior drift. Failing fast here forces
+REM the human to make the bump call explicitly. If you intentionally want
+REM to test a newer Nuitka:
 REM   - bump the findstr below to the new version
 REM   - bump release.yml's pip-install pin to match
 REM   - re-verify the comment timeline in this file
+REM v1.7.22 note: the py3.14 zstd packing bug only affected --onefile pack
+REM (compression.zstd.ZstdError during the onefile-bootstrap zstd step).
+REM Under --standalone there is no zstd packing step, so the workaround
+REM (--onefile-no-compression) is no longer relevant. The 4.1.1 pin stays
+REM until we've smoke-tested a newer Nuitka under standalone mode on Win11.
 python -m nuitka --version | findstr /B "4.1.1" >nul
 if errorlevel 1 (
     echo === BUILD FAILED ===
@@ -54,8 +70,8 @@ if errorlevel 1 (
 )
 
 REM Embed the icon as a Windows resource (--windows-icon-from-ico) AND bundle
-REM the .ico inside the onefile (--include-data-files) so pystray's
-REM Image.open(_ICON_PATH) still finds it at the temp extract dir at runtime.
+REM the .ico inside the standalone dir (--include-data-files) so pystray's
+REM Image.open(_ICON_PATH) finds it next to the .exe at runtime.
 REM Both are required: the resource is for File Explorer + the .lnk's
 REM IconLocation; the data file is for in-process loading by pystray.
 REM
@@ -63,32 +79,15 @@ REM native_blank and tray_promoter are imported INSIDE functions in
 REM displayoff.py (not at module level), so Nuitka's static import scanner
 REM might miss them — include explicitly to be safe.
 
-REM --onefile-no-compression bypasses a Nuitka 4.1.1 + Python 3.14 + zstd
-REM incompatibility ("Allocation error : not enough memory" in
-REM compression.zstd.ZstdError during onefile bootstrap packing — the
-REM compiled .dist directory is fine, but zstd's compress() can't accept
-REM the dist-file enumeration write under py3.14). Bypass costs ~30 MB of
-REM .exe size (55 MB vs ~20 MB compressed).
-REM
-REM Version-check timeline (re-check before each release; drop the flag
-REM if a newer Nuitka has shipped the py3.14 zstd fix):
-REM   2026-05-21 (v1.7.13 / v1.7.14): Nuitka PyPI latest = 4.1.1 — bug still present, flag required.
-REM   2026-05-21 (v1.7.15):           re-checked `pip index versions nuitka` → 4.1.1 still latest. Flag required.
-REM   2026-05-22 (v1.7.16 / v1.7.17): Nuitka still pinned to 4.1.1 (no PyPI release between v1.7.15 and v1.7.17 — same day). Flag still required.
-REM   2026-05-22 (v1.7.18 / v1.7.19): Confirmed Nuitka 4.1.1 latest. Flag still required.
-REM   2026-05-22 (v1.7.20):           Final maintenance release. Nuitka still pinned to 4.1.1 (no PyPI update). Flag still required.
-REM                                   v1.7.20 also adds the `python -m nuitka --version` preflight guard above so a future local
-REM                                   build with a different Nuitka pinned in the venv fails fast instead of producing a binary
-REM                                   that subtly differs from what CI shipped.
-REM
-REM Recipe to re-verify: `pip index versions nuitka | head -1` — if the
-REM top line shows >4.1.1, install it in a scratch venv, build with the
-REM flag dropped, and confirm onefile-pack completes. See build-release.sh
-REM for the matching bash recipe (kept in sync).
+REM Wipe previous artifacts so a silent build failure produces no
+REM new bundle at all rather than ship a half-stale mix.
+if exist build\displayoff rmdir /s /q build\displayoff
+if exist build\displayoff.dist rmdir /s /q build\displayoff.dist
+del /q build\displayoff-v*.zip 2>nul
+del /q build\SHA256SUMS.txt 2>nul
 
 python -m nuitka ^
-    --onefile ^
-    --onefile-no-compression ^
+    --standalone ^
     --windows-console-mode=disable ^
     --windows-icon-from-ico=displayoff.ico ^
     --include-data-files=displayoff.ico=displayoff.ico ^
@@ -113,10 +112,40 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM Rename the Nuitka .dist directory to a clean "displayoff" name so the
+REM zip extracts to displayoff\displayoff.exe (matches the documented install
+REM layout in README.md).
+move /y build\displayoff.dist build\displayoff >nul
+if not exist build\displayoff\displayoff.exe (
+    echo === BUILD FAILED: build\displayoff\displayoff.exe not produced. ===
+    exit /b 1
+)
+
+REM Package the standalone bundle as a zip for release upload.
+set ZIP_NAME=displayoff-v%VERSION%.zip
+pushd build
+python -m zipfile -c %ZIP_NAME% displayoff
+popd
+if not exist build\%ZIP_NAME% (
+    echo === BUILD FAILED: build\%ZIP_NAME% not produced. ===
+    exit /b 1
+)
+
+REM Generate SHA256SUMS.txt — hash the zip (the actual release artifact).
+REM Uses Python's hashlib so we don't depend on sha256sum being on PATH
+REM (Git for Windows ships it; vanilla cmd doesn't).
+for /f "delims=" %%H in ('python -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest())" build\%ZIP_NAME%') do set SHA=%%H
+> build\SHA256SUMS.txt echo %SHA% *%ZIP_NAME%
+
 echo.
 echo === BUILD OK ===
-echo Output: build\displayoff.exe
-for %%I in (build\displayoff.exe) do echo Size:   %%~zI bytes
+echo Bundle: build\displayoff\
+echo Zip:    build\%ZIP_NAME%
+for %%I in (build\%ZIP_NAME%) do echo Size:   %%~zI bytes
+echo SHA256: %SHA%
 echo.
-echo Verify:  build\displayoff.exe --version
+echo Manifest contents:
+type build\SHA256SUMS.txt
+echo.
+echo Verify:  build\displayoff\displayoff.exe --version
 endlocal

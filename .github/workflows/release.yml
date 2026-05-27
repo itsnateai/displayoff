@@ -1,10 +1,18 @@
 name: Release
 
-# Auto-build displayoff.exe + SHA256SUMS.txt on every annotated semver tag
-# push (v*.*.*) and attach them to the matching GitHub release. The release
-# itself must already exist (created via `gh release create` or the web UI)
-# at the time the tag pushes — softprops/action-gh-release tolerates this:
-# if the release exists, it uploads to it; if it doesn't, it creates one.
+# Auto-build displayoff-vX.Y.Z.zip + SHA256SUMS.txt on every annotated semver
+# tag push (v*.*.*) and attach them to the matching GitHub release. The
+# release itself must already exist (created via `gh release create` or the
+# web UI) at the time the tag pushes — softprops/action-gh-release tolerates
+# this: if the release exists, it uploads to it; if it doesn't, it creates one.
+#
+# v1.7.22: asset format changed from a single `displayoff.exe` to a zipped
+# Nuitka --standalone bundle (`displayoff-vX.Y.Z.zip` containing a
+# `displayoff/` folder with the .exe + ~150 runtime DLLs). The previous
+# onefile bootstrap pattern tripped Defender's Trojan:Win32/Bearfoos.A!ml
+# heuristic on every launch (Temp extraction); --standalone has no Temp
+# extraction so the false-positive disappears. See build-release.sh's
+# v1.7.22 comment block for the full context.
 #
 # Why the build runs in CI instead of locally:
 #   - Reproducibility — a clean windows-latest runner with no Nuitka cache
@@ -43,7 +51,7 @@ permissions:
 
 jobs:
   build-windows-exe:
-    name: Build displayoff.exe (windows-latest)
+    name: Build displayoff bundle (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 30
     # v1.7.20 verifier convergence (T1-Sonnet + T1-Opus): GitHub Actions only
@@ -80,7 +88,7 @@ jobs:
           # comments referencing the Nuitka + py3.14 zstd workaround.
           python -m pip install nuitka==4.1.1
 
-      - name: Build displayoff.exe + SHA256SUMS.txt
+      - name: Build displayoff zip + SHA256SUMS.txt
         shell: bash
         run: ./build-release.sh
 
@@ -91,17 +99,21 @@ jobs:
         # before bumping. v1.7.20 verifier-converged fix: write permission
         # is set at the JOB level (above) — step-level `permissions:` is
         # not a supported GitHub Actions key and would be silently ignored.
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
         with:
           # On push: the ref is the tag GitHub already resolved.
           # On workflow_dispatch: the inputs.tag value drives both checkout
           # ref above AND the release we upload to.
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           # fail_on_unmatched_files=true so a silent build failure (Nuitka
-          # produced no .exe but exited 0) doesn't ship an asset-less release.
+          # produced no zip but exited 0) doesn't ship an asset-less release.
+          # v1.7.22: glob the versioned zip (e.g. `displayoff-v1.7.22.zip`)
+          # rather than hard-coding the filename — build-release.sh derives
+          # the version from `__version__` in displayoff.py, so the workflow
+          # doesn't need a parallel source of truth for the version string.
           fail_on_unmatched_files: true
           files: |
-            build/displayoff.exe
+            build/displayoff-v*.zip
             build/SHA256SUMS.txt
 
       - name: Post-upload CDN redirect-host smoke test
@@ -121,7 +133,11 @@ jobs:
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          URL="https://github.com/itsnateai/displayoff/releases/download/${TAG}/displayoff.exe"
+          # v1.7.22: asset is now the standalone-bundle zip, not the bare .exe.
+          # TAG is the full tag like `v1.7.22`; the zip is named
+          # `displayoff-vX.Y.Z.zip` so concatenating ${TAG} into the URL gives
+          # the right asset name without a second parse of the version string.
+          URL="https://github.com/itsnateai/displayoff/releases/download/${TAG}/displayoff-${TAG}.zip"
           echo "Probing redirect chain from: $URL"
           # -L follows redirects; -I emits only headers; -s suppresses
           # progress noise. The final "location:" line is the resolved
