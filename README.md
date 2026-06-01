@@ -10,6 +10,12 @@ Tiny system tray utility that turns off all monitors without putting the PC to s
 
 **Double-click** the tray icon or press **Ctrl+Alt+F12** to blank all displays. Move the mouse or press any key to wake.
 
+## Screenshots
+
+| Tray Menu | Settings |
+|:---:|:---:|
+| ![Menu](screenshots/displayoffmenu.png) | ![Settings](screenshots/displayoffsettings.png) |
+
 ## Why this exists
 
 The classic `SC_MONITORPOWER` mechanism — used by NirCmd, AutoHotkey scripts, PowerToys, and every PowerShell one-liner out there — **breaks on Modern Standby + hybrid-GPU laptops**, where it triggers a wake-handshake loop the user can't recover from. Display Off works around this by hooking into Windows' native idle-display-off code path (the one wired to *Settings ▸ Power ▸ "Turn off the display after N minutes"*) instead of sending `SC_MONITORPOWER`. The legacy mechanism is still available as an opt-in for users on hardware where it works (and where the legacy path is slightly faster).
@@ -49,12 +55,6 @@ Both modes use the same global hotkey (**Ctrl+Alt+F12** by default) and the same
 - **Optional auto-blank-when-idle** — fires once after N minutes of inactivity, re-arms on activity
 - **Autostart toggle** — one-click register/unregister at Windows startup
 - **No admin required, no telemetry, no automatic phone-home** — manual update-check only
-
-## Screenshots
-
-| Tray Menu | Settings |
-|:---:|:---:|
-| ![Menu](screenshots/displayoffmenu.png) | ![Settings](screenshots/displayoffsettings.png) |
 
 ## Usage
 

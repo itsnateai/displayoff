@@ -36,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.23"
+__version__ = "1.7.24"
 
 log = logging.getLogger("displayoff")
 
@@ -4295,6 +4295,14 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
     Left side  : [GitHub] [About] [Updates]   ← info / action buttons
     Right side : [Apply] [Save] [Cancel]      ← dialog-result buttons
 
+    A fixed minimum gutter sits between the two groups (the childless spacer
+    frame below) so the action buttons never butt up against the info buttons.
+    The buttons are sized in character units (`width=8`), which scale with
+    display DPI, while the window width is otherwise content-driven — on a
+    high-DPI laptop the gutter used to collapse to zero and "Apply" ended up
+    smooshed against "Updates" (v1.7.24 fix; the gutter is now part of the
+    footer's requested width, so the window sizing always reserves room for it).
+
     `on_about` and `on_check_updates` are optional callbacks. When supplied,
     they render as buttons that open child dialogs of the Settings root.
     Added in v1.7.0 — previously these lived in the tray right-click menu."""
@@ -4312,6 +4320,7 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
         highlightthickness=1, highlightbackground=_THEME_SEP,
     )
 
+    # Left group — info / navigation, packed left-to-right.
     tk.Button(footer, text="GitHub",
               command=lambda: _open_url(_GITHUB_REPO_URL),
               **_btn_kw).pack(side="left")
@@ -4321,6 +4330,8 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
     if on_check_updates is not None:
         tk.Button(footer, text="Updates", command=on_check_updates,
                   **_btn_kw).pack(side="left", padx=(4, 0))
+    # Right group — dialog-result buttons, packed right-to-left so the visual
+    # order reads [Apply] [Save] [Cancel].
     tk.Button(footer, text="Cancel", command=on_cancel,
               **_btn_kw).pack(side="right", padx=(4, 0))
     tk.Button(footer, text="Save", command=on_save,
@@ -4328,6 +4339,14 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
     if on_apply is not None:
         tk.Button(footer, text="Apply", command=on_apply,
                   **_btn_kw).pack(side="right", padx=(0, 4))
+    # Guaranteed minimum gutter between the info group and the action group.
+    # Packed last with side="left", it claims the left edge of the remaining
+    # cavity (immediately right of "Updates"); any slack from a wider window
+    # pools to its right, so the gap is always >= this width. DPI-relative
+    # (~0.3in) so it tracks the character-unit button widths. A childless
+    # frame with an explicit width does not propagate, so it holds its size.
+    _gutter_px = max(24, footer.winfo_pixels("0.3i"))
+    tk.Frame(footer, bg=_THEME_BG, width=_gutter_px, height=1).pack(side="left")
 
 
 def _release_dialog_slot():
@@ -4515,13 +4534,23 @@ def _open_settings_impl(tray_icon, on_saved):
                   on_about=on_about_btn, on_check_updates=on_updates_btn)
 
     # Size the window to its actual content. Must happen after every widget
-    # has been added so winfo_reqheight reports the right value. Center on
-    # screen using the computed height.
+    # has been added so winfo_req{width,height} report the right values.
+    #
+    # Width was a flat 460 — correct at 100% display scaling, but the footer's
+    # six buttons are sized in character units (width=8) which scale with DPI,
+    # while a hardcoded pixel width does not. On 125%/150% laptops the action
+    # buttons overran the centre gutter and "Apply" butted against "Updates".
+    # Grow to the actual content requirement (which now includes the footer's
+    # gutter spacer) with 460 as the floor, and pin a minsize so a later
+    # font-cache / DPI re-solve can't clip the footer — mirrors the durable
+    # sizing the About/Updates child dialog already uses. v1.7.24.
     root.update_idletasks()
+    w = max(w, root.winfo_reqwidth())
     h = root.winfo_reqheight()
     x = (root.winfo_screenwidth() - w) // 2
     y = (root.winfo_screenheight() - h) // 2
     root.geometry(f"{w}x{h}+{x}+{y}")
+    root.minsize(w, h)
 
     # Alpha trick to mask the deiconify → first-paint flash. Without this,
     # Win11 briefly paints the window with default-light chrome on first show
