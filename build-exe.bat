@@ -15,7 +15,7 @@ REM
 REM Build time: ~3-8 minutes on first run, ~2-4 minutes incremental.
 REM
 REM Verify after build:
-REM   build\displayoff\displayoff.exe --version       (should print "displayoff 1.7.22")
+REM   build\displayoff\displayoff.exe --version       (should print the current __version__ from displayoff.py)
 REM   build\displayoff\displayoff.exe                 (should start tray icon)
 REM   build\displayoff\displayoff.exe --diagnose-paths (should print path-resolver state; exit 0 on success, 1 on broken resolver)
 REM

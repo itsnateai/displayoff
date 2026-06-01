@@ -4343,10 +4343,16 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
     # Packed last with side="left", it claims the left edge of the remaining
     # cavity (immediately right of "Updates"); any slack from a wider window
     # pools to its right, so the gap is always >= this width. DPI-relative
-    # (~0.3in) so it tracks the character-unit button widths. A childless
-    # frame with an explicit width does not propagate, so it holds its size.
+    # (~0.3in) so it tracks the character-unit button widths.
+    #
+    # pack_propagate(False) is load-bearing: a Frame's configured width/height
+    # is otherwise advisory and the geometry manager may shrink it. Turning
+    # propagation off pins the width across Tk versions AND keeps the gutter
+    # intact if anyone ever drops a child widget into this spacer.
     _gutter_px = max(24, footer.winfo_pixels("0.3i"))
-    tk.Frame(footer, bg=_THEME_BG, width=_gutter_px, height=1).pack(side="left")
+    _gutter = tk.Frame(footer, bg=_THEME_BG, width=_gutter_px, height=1)
+    _gutter.pack_propagate(False)
+    _gutter.pack(side="left")
 
 
 def _release_dialog_slot():
@@ -4541,9 +4547,11 @@ def _open_settings_impl(tray_icon, on_saved):
     # while a hardcoded pixel width does not. On 125%/150% laptops the action
     # buttons overran the centre gutter and "Apply" butted against "Updates".
     # Grow to the actual content requirement (which now includes the footer's
-    # gutter spacer) with 460 as the floor, and pin a minsize so a later
-    # font-cache / DPI re-solve can't clip the footer — mirrors the durable
-    # sizing the About/Updates child dialog already uses. v1.7.24.
+    # gutter spacer) with 460 as the floor, and pin a minsize — matching the
+    # durable sizing the themed message-dialog helper (`_themed_dialog`, used
+    # for the update-check prompts) already uses. The minsize is belt-and-
+    # suspenders here (the root is `resizable(False, False)`), kept for
+    # consistency with that helper's convention. v1.7.24.
     root.update_idletasks()
     w = max(w, root.winfo_reqwidth())
     h = root.winfo_reqheight()
