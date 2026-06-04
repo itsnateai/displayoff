@@ -5849,9 +5849,14 @@ def main():
             _build_about_body(_diag_root, load_config(), autostart_enabled())
             _diag_root.mainloop()                    # Close button destroys the root
         elif which == "themed":
+            # Do NOT withdraw the host: _themed_dialog makes a transient Toplevel,
+            # and a transient of a hidden root never maps onto the (captured)
+            # desktop. A small visible host lets the dialog render for capture.
             _diag_root = tk.Tk()
             _apply_tk_scaling(_diag_root)
-            _diag_root.withdraw()
+            _diag_root.title("DPI diag (themed)")
+            _diag_root.configure(bg=_THEME_BG)
+            _diag_root.geometry("220x90+200+200")
             _themed_dialog(_diag_root, "Display Off",
                            "DPI diagnostic — sample dialog text.\n"
                            "A second line to exercise wrapping and the button row.",
