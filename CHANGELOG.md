@@ -1,5 +1,22 @@
 # Changelog — Display Off
 
+## [1.7.25] — 2026-06-04
+
+High-DPI correctness pass: the Settings, About, and message/update dialogs now render proportionally identical at 100% and 125%/150%+ display scale, by construction. This completes the v1.7.24 footer fix across the whole UI.
+
+### Fixed
+
+- **All dialog spacing now scales with display DPI.** v1.7.24 fixed only the settings footer gutter; the rest of the UI still used raw-pixel pad literals (`PAD = 20`, the inter-button `padx`, the About dialog's `padx=20, pady=15`, the themed dialog's `wraplength=460`, …). Tk grows point-sized fonts with display DPI but leaves pixel literals fixed, so at 125%/150% the fonts enlarged while the gaps between rows stayed put — spacing got tighter the higher the scale, and it looked correct only on a 100% monitor. Measured before the fix: the settings window's height scaled only **1.57×** from 100%→200% (a proportional layout scales ~2.0×), and the vertical gap between two rows was a **constant 14 px at every scale**. Now every pad goes through a `_dpi_scale()` helper tied to the live Tk scaling, so spacing tracks the fonts — settings height scales **1.94×** and the surfaces stay proportional at every scale.
+
+### Changed / internal
+
+- **Deterministic font scaling.** Tk's point→pixel `scaling` is now pinned to the real system DPI (`GetDpiForSystem`, Win10 1607+) right after each window is created, instead of relying on Tk's Windows auto-detect.
+- **DPI awareness declared once, at the GUI entry.** `SetProcessDpiAwarenessContext(PerMonitor-V2)` now runs at the top of `run_tray()`, before any window exists, so every dialog inherits it on every entry path (previously it was set lazily inside the Settings-open path only).
+- **About dialog** gained the content-driven `minsize` the Settings and themed dialogs already had, so a later font-cache / DPI re-solve can't clip its button row.
+- Added `tests/test_dpi_layout.py` — a regression guard asserting the surfaces scale proportionally, so a future change can't silently reintroduce a fixed-pixel pad.
+
+No behaviour change to monitor blanking, hotkeys, idle-blank, single-instance, or autostart — this release is layout/DPI only.
+
 ## [1.7.24] — 2026-06-01
 
 UX polish: settings-dialog footer spacing on high-DPI displays, plus refreshed README screenshots.
