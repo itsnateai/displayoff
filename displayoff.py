@@ -950,6 +950,16 @@ if sys.platform == "win32":
     except AttributeError:
         _SetProcessDPIAware = None
 
+    # GetDpiForSystem (Win10 1607+) — authoritative system DPI so Tk `scaling`
+    # can be set deterministically instead of relying on Tk's Windows auto-detect.
+    # None on older Windows; _apply_tk_scaling then leaves Tk's own default in place.
+    try:
+        _GetDpiForSystem = _user32.GetDpiForSystem
+        _GetDpiForSystem.argtypes = []
+        _GetDpiForSystem.restype = ctypes.c_uint
+    except AttributeError:
+        _GetDpiForSystem = None
+
     _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     OpenProcessToken = _advapi32.OpenProcessToken
     OpenProcessToken.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
@@ -1023,6 +1033,7 @@ else:
     _SetProcessDpiAwarenessContext = None
     _SetProcessDpiAwareness = None
     _SetProcessDPIAware = None
+    _GetDpiForSystem = None
     _dwmapi = None
     DwmSetWindowAttribute = None
 
@@ -3877,6 +3888,35 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
 
 # ── UI helpers ─────────────────────────────────────────────────────────────
 
+def _dpi_scale(widget, n):
+    """Device pixels for a 96-DPI *design* pixel `n`, using the widget's live Tk
+    scaling. Ties every pad/coord literal to the same factor that scales the
+    point-sized fonts, so 100% and 150% stay proportional *by construction*
+    rather than by spot-patching. `winfo_fpixels('1i')` = 72 * tk-scaling, so at
+    96 DPI this is identity and at 144 DPI (150%) it returns 1.5x. Falls back to
+    the raw value if the measurement ever fails — never break layout over DPI."""
+    try:
+        return max(1, round(n * widget.winfo_fpixels("1i") / 96.0))
+    except Exception:
+        return n
+
+
+def _apply_tk_scaling(root):
+    """Set Tk `scaling` from the authoritative system DPI so point-fonts scale
+    deterministically, independent of Tk's (historically flaky on Windows)
+    auto-detect. No-op when the DPI source is unavailable (pre-1607) — Tk's own
+    default then stands, exactly as before this change. Call once, right after a
+    root is created and before building widgets."""
+    if _GetDpiForSystem is None:
+        return
+    try:
+        dpi = int(_GetDpiForSystem())
+        if dpi >= 72:
+            root.tk.call("tk", "scaling", dpi / 72.0)
+    except Exception:
+        log.debug("tk scaling set skipped", exc_info=True)
+
+
 def _set_dpi_awareness():
     """Best-effort: declare per-monitor V2 DPI awareness for crisp Tk dialogs.
 
@@ -4382,8 +4422,9 @@ def _open_settings_impl(tray_icon, on_saved):
     captured = {"modifiers": list(cfg["hotkey"]["modifiers"]), "key": cfg["hotkey"]["key"]}
     recording = {"active": False}
 
-    _set_dpi_awareness()
-
+    # DPI awareness is declared once at the GUI entry (run_tray), before any
+    # window exists — it's process-global, so this dialog inherits it on every
+    # entry path. Here we only pin Tk's point->pixel scaling to the real DPI.
     root = tk.Tk()
     # Route Tk callback exceptions through our logger BEFORE any other
     # callback wiring. Tk's default `report_callback_exception` writes the
@@ -4396,6 +4437,7 @@ def _open_settings_impl(tray_icon, on_saved):
         log.error("Tk callback exception (Settings dialog)",
                   exc_info=(exc_type, exc_val, exc_tb))
     root.report_callback_exception = _log_tk_callback_exc
+    _apply_tk_scaling(root)  # deterministic point-font scaling at high DPI
     # Hide the window IMMEDIATELY so the user never sees the default
     # light-mode Tk chrome flash before our dark theme + DWM dark title bar
     # apply. We re-show (deiconify) only after every widget is built, the
@@ -5109,6 +5151,12 @@ def _run_update_check(parent_root):
 
 def run_tray():
     """Run as a system tray application."""
+    # Declare DPI awareness ONCE, process-global, before any window (the tray
+    # HWND or any Tk dialog root) exists — so every surface inherits crisp
+    # PerMonitor-V2 scaling on every entry path. Was previously set lazily inside
+    # _open_settings_impl, which only covered the Settings path (load-bearing
+    # coincidence that About/Updates open as its children, not by design).
+    _set_dpi_awareness()
     import pystray
     from pystray import MenuItem, Menu
 
