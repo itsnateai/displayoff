@@ -3795,14 +3795,15 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
 
     result = [None]  # mutable closure capture; messages-box-style return
 
-    body = tk.Label(dlg, text=display_message, justify="left", wraplength=460,
+    body = tk.Label(dlg, text=display_message, justify="left",
+                    wraplength=_dpi_scale(dlg, 460),
                     font=("Segoe UI", 10),
                     bg=_THEME_BG, fg=_THEME_FG,
-                    padx=20, pady=15)
+                    padx=_dpi_scale(dlg, 20), pady=_dpi_scale(dlg, 15))
     body.pack()
 
     btn_frame = tk.Frame(dlg, bg=_THEME_BG)
-    btn_frame.pack(pady=(0, 15))
+    btn_frame.pack(pady=(0, _dpi_scale(dlg, 15)))
 
     def _make_handler(label):
         def _handler():
@@ -3819,7 +3820,7 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
                         activeforeground=_THEME_BTN_ACTIVE_FG,
                         relief="flat", borderwidth=1,
                         highlightthickness=1, highlightbackground=_THEME_SEP)
-        btn.pack(side="left", padx=5)
+        btn.pack(side="left", padx=_dpi_scale(dlg, 5))
         btn_widgets.append(btn)
 
     if btn_widgets:
