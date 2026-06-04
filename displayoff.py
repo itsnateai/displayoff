@@ -4699,6 +4699,54 @@ def _enable_dark_mode_menus():
 # top-level root, and the parent's dialog-slot (already held by Settings)
 # covers them too — no separate slot mgmt needed.
 
+def _build_about_body(parent, cfg, autostart_value):
+    """Build the About body (info label + GitHub link + Close button) into
+    `parent`, with DPI-relative pads. Split out of _show_about so the surface is
+    testable without a Toplevel/mainloop and so its spacing scales by construction.
+    `parent.destroy` is the Close action (in _show_about that's the About Toplevel).
+    Returns the Close button so the caller can focus it."""
+    import tkinter as tk
+
+    def px(n):
+        return _dpi_scale(parent, n)
+
+    idle_min = int(cfg.get("idle_blank_minutes", 0) or 0)
+    idle_line = f"{idle_min} min" if idle_min > 0 else "off"
+    body_text = (
+        f"Display Off v{__version__}\n\n"
+        "Tiny tray utility to power off all monitors\n"
+        "without putting the PC to sleep.\n\n"
+        f"Hotkey: {hotkey_display_name(cfg)}\n"
+        f"Lock on blank: {'on' if cfg.get('lock_on_off') else 'off'}\n"
+        f"Auto-blank when idle: {idle_line}\n"
+        f"Autostart: {'on' if autostart_value else 'off'}"
+    )
+    tk.Label(parent, text=body_text, justify="left",
+             font=("Segoe UI", 10),
+             bg=_THEME_BG, fg=_THEME_FG,
+             padx=px(20), pady=px(15)).pack()
+
+    # Clickable GitHub link styled as a label with hand cursor. (tuple-form
+    # padding is only valid on the geometry manager, not the widget constructor.)
+    link = tk.Label(parent, text="https://github.com/itsnateai/displayoff",
+                    font=("Segoe UI", 9, "underline"),
+                    bg=_THEME_BG, fg="#4ec9ff", cursor="hand2")
+    link.pack(padx=px(20), pady=(0, px(10)))
+    link.bind("<Button-1>", lambda _: _open_url(_GITHUB_REPO_URL))
+
+    btn_frame = tk.Frame(parent, bg=_THEME_BG)
+    btn_frame.pack(pady=(0, px(15)))
+    close_btn = tk.Button(btn_frame, text="Close", command=parent.destroy,
+                          font=("Segoe UI", 9), width=10,
+                          bg=_THEME_BTN_BG, fg=_THEME_BTN_FG,
+                          activebackground=_THEME_BTN_ACTIVE_BG,
+                          activeforeground=_THEME_BTN_ACTIVE_FG,
+                          relief="flat", borderwidth=1,
+                          highlightthickness=1, highlightbackground=_THEME_SEP)
+    close_btn.pack()
+    return close_btn
+
+
 def _show_about(parent_root, autostart_enabled_value=None):
     """Open a modeless About window as a child of `parent_root`.
 
@@ -4715,8 +4763,8 @@ def _show_about(parent_root, autostart_enabled_value=None):
     try:
         import tkinter as tk
         cfg = load_config()
-        idle_min = int(cfg.get("idle_blank_minutes", 0) or 0)
-        idle_line = f"{idle_min} min" if idle_min > 0 else "off"
+        autostart_value = (autostart_enabled_value if autostart_enabled_value is not None
+                           else autostart_enabled())
 
         about = tk.Toplevel(parent_root)
         # Hide IMMEDIATELY so the user never sees default light-mode Tk chrome
@@ -4738,43 +4786,7 @@ def _show_about(parent_root, autostart_enabled_value=None):
         about.attributes("-topmost", True)
         _apply_dark_titlebar(about)
 
-        body_text = (
-            f"Display Off v{__version__}\n\n"
-            "Tiny tray utility to power off all monitors\n"
-            "without putting the PC to sleep.\n\n"
-            f"Hotkey: {hotkey_display_name(cfg)}\n"
-            f"Lock on blank: {'on' if cfg.get('lock_on_off') else 'off'}\n"
-            f"Auto-blank when idle: {idle_line}\n"
-            f"Autostart: {'on' if (autostart_enabled_value if autostart_enabled_value is not None else autostart_enabled()) else 'off'}"
-        )
-        body = tk.Label(about, text=body_text, justify="left",
-                        font=("Segoe UI", 10),
-                        bg=_THEME_BG, fg=_THEME_FG,
-                        padx=20, pady=15)
-        body.pack()
-
-        # Clickable GitHub link styled as a label with hand cursor.
-        # Note: tuple-form padding (e.g. (0, 10)) is only valid on the geometry
-        # manager (pack/grid/place), NOT on the widget constructor — Tk parses
-        # the constructor pad-* values as a single screen-distance and raises
-        # TclError: bad screen distance "0 10" otherwise. Keep the asymmetric
-        # bottom padding on the pack() call below.
-        link = tk.Label(about, text="https://github.com/itsnateai/displayoff",
-                        font=("Segoe UI", 9, "underline"),
-                        bg=_THEME_BG, fg="#4ec9ff", cursor="hand2")
-        link.pack(padx=20, pady=(0, 10))
-        link.bind("<Button-1>", lambda _: _open_url(_GITHUB_REPO_URL))
-
-        btn_frame = tk.Frame(about, bg=_THEME_BG)
-        btn_frame.pack(pady=(0, 15))
-        close_btn = tk.Button(btn_frame, text="Close", command=about.destroy,
-                              font=("Segoe UI", 9), width=10,
-                              bg=_THEME_BTN_BG, fg=_THEME_BTN_FG,
-                              activebackground=_THEME_BTN_ACTIVE_BG,
-                              activeforeground=_THEME_BTN_ACTIVE_FG,
-                              relief="flat", borderwidth=1,
-                              highlightthickness=1, highlightbackground=_THEME_SEP)
-        close_btn.pack()
+        close_btn = _build_about_body(about, cfg, autostart_value)
         # Enter / Escape both close the window.
         about.bind("<Return>", lambda _: about.destroy())
         about.bind("<Escape>", lambda _: about.destroy())
@@ -4787,6 +4799,10 @@ def _show_about(parent_root, autostart_enabled_value=None):
         x = (about.winfo_screenwidth() - w) // 2
         y = (about.winfo_screenheight() - h) // 2
         about.geometry(f"{w}x{h}+{x}+{y}")
+        # Sticky minimum size so a later font-cache / DPI re-solve can't clip the
+        # button row — the durable form of the content-driven sizing, matching
+        # _themed_dialog and the Settings root.
+        about.minsize(w, h)
 
         # Alpha=0 mask while deiconify + dark-titlebar reapply happens — see
         # the matching block in `_open_settings_impl` for the full rationale.

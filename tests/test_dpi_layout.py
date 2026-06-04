@@ -86,6 +86,21 @@ def test_settings_height_scales_proportionally():
     assert ratio >= 1.85, f"settings reqheight 100->200% ratio {ratio:.3f} < 1.85 (fixed-px pads not scaling)"
 
 
+def _about_reqsize(scale):
+    r = _root(scale)
+    do._build_about_body(r, do.load_config(), False)
+    r.update_idletasks()
+    sz = (r.winfo_reqwidth(), r.winfo_reqheight())
+    r.destroy()
+    return sz
+
+
+def test_about_scales_proportionally():
+    (_, h1), (_, h2) = _about_reqsize(1.0), _about_reqsize(2.0)
+    ratio = h2 / h1
+    assert ratio >= 1.85, f"About reqheight 100->200% ratio {ratio:.3f} < 1.85 (fixed-px pads not scaling)"
+
+
 def _diagnostics():
     print(f"{'scale':>6} {'reqw':>6} {'reqh':>6}")
     for s in SCALES:
