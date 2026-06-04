@@ -5826,6 +5826,41 @@ def main():
         _MIGRATION_LOG.clear()
         _RESOLVER_LOG.clear()
 
+    # --diag-dpi-show <settings|about|themed>: render exactly ONE UI surface
+    # standalone (no tray, no single-instance mutex) so a high-DPI VM can
+    # screenshot it for the 100%-vs-150% proportionality check. Blocks until the
+    # surface is closed, then exits. Undocumented developer/CI tool; harmless if
+    # ever invoked in the shipped build. Runs after logging/data-dir setup so
+    # load_config() works, but before single-instance acquisition so it can run
+    # alongside a live tray instance.
+    if "--diag-dpi-show" in sys.argv:
+        import tkinter as tk
+        _i = sys.argv.index("--diag-dpi-show")
+        which = sys.argv[_i + 1] if _i + 1 < len(sys.argv) else "settings"
+        _set_dpi_awareness()
+        if which == "settings":
+            _open_settings_impl(None, None)          # builds + runs its own root
+        elif which == "about":
+            _diag_root = tk.Tk()
+            _apply_tk_scaling(_diag_root)
+            _diag_root.title("About Display Off")
+            _diag_root.configure(bg=_THEME_BG)
+            _apply_dark_titlebar(_diag_root)
+            _build_about_body(_diag_root, load_config(), autostart_enabled())
+            _diag_root.mainloop()                    # Close button destroys the root
+        elif which == "themed":
+            _diag_root = tk.Tk()
+            _apply_tk_scaling(_diag_root)
+            _diag_root.withdraw()
+            _themed_dialog(_diag_root, "Display Off",
+                           "DPI diagnostic — sample dialog text.\n"
+                           "A second line to exercise wrapping and the button row.",
+                           ("OK", "Cancel"))         # wait_window blocks until closed
+        else:
+            print(f"--diag-dpi-show: unknown surface {which!r}; use settings|about|themed")
+            sys.exit(2)
+        sys.exit(0)
+
     # v1.7.22: clean up artifacts from a previous launch's folder-swap dance
     # that may have crashed or been interrupted. Cheap when there's nothing
     # to do; no-op under .py source. Runs BEFORE the --after-update-folder-swap
