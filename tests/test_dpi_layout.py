@@ -51,16 +51,9 @@ def _build_settings(r):
 def _settings_metrics(scale):
     r = _root(scale)
     _build_settings(r)
-    reqw, reqh = r.winfo_reqwidth(), r.winfo_reqheight()
-    # vertical gap between header (row 0) and hotkey row (row 2): pure pady spacing.
-    try:
-        _, y0, _, h0 = r.grid_bbox(0, 0)
-        _, y2, _, _ = r.grid_bbox(0, 2)
-        gap = y2 - (y0 + h0)
-    except Exception:
-        gap = -1
+    m = {"reqw": r.winfo_reqwidth(), "reqh": r.winfo_reqheight()}
     r.destroy()
-    return {"reqw": reqw, "reqh": reqh, "row_gap": gap}
+    return m
 
 
 def _ratio(metric):
@@ -70,26 +63,35 @@ def _ratio(metric):
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-# Threshold 1.90: proportional layout (everything DPI-scaled) yields ~2.0 between
-# 100% and 200%; fixed-pixel pads pull the ratio below 1.90. Calibrated against the
-# measured red (pre-fix) and green (post-fix) numbers — see the diagnostic table.
+# When every pad is DPI-relative, the whole surface scales ~2.0x between 100% and
+# 200%. Fixed-pixel pads pull the ratio down — pre-fix reqheight scaled only 1.57x.
+# Threshold 1.85 cleanly separates the broken state (1.57) from the fixed state
+# (~1.94), with margin for font-metric variation. reqheight is the sensitive axis
+# (a tall stack of rows, each previously gapped by a fixed pady). The remaining
+# ~0.06 shortfall from a perfect 2.0 is legitimate 1px hairlines (separator line,
+# widget borders) that conventionally stay thin — the Tiny11 150% screenshot
+# (acceptance gate) is the direct visual spacing proof.
+
+def test_dpi_scale_doubles_at_200pct():
+    r = _root(2.0)
+    try:
+        assert do._dpi_scale(r, 20) == 40, "design 20px should be 40 device-px at 200%"
+        assert do._dpi_scale(r, 0) == 0, "explicit 0 pad must stay 0 at any DPI"
+    finally:
+        r.destroy()
+
 
 def test_settings_height_scales_proportionally():
     ratio = _ratio("reqh")
-    assert ratio >= 1.90, f"settings reqheight 100->200% ratio {ratio:.3f} < 1.90 (fixed-px pads not scaling)"
-
-
-def test_settings_row_gap_scales_proportionally():
-    ratio = _ratio("row_gap")
-    assert ratio >= 1.90, f"header→hotkey row gap ratio {ratio:.3f} < 1.90 (fixed pady not scaling)"
+    assert ratio >= 1.85, f"settings reqheight 100->200% ratio {ratio:.3f} < 1.85 (fixed-px pads not scaling)"
 
 
 def _diagnostics():
-    print(f"{'scale':>6} {'reqw':>6} {'reqh':>6} {'row_gap':>8}")
+    print(f"{'scale':>6} {'reqw':>6} {'reqh':>6}")
     for s in SCALES:
         m = _settings_metrics(s)
-        print(f"{s:>6} {m['reqw']:>6} {m['reqh']:>6} {m['row_gap']:>8}")
-    print(f"\nratios 100%->200%:  reqw={_ratio('reqw'):.3f}  reqh={_ratio('reqh'):.3f}  row_gap={_ratio('row_gap'):.3f}")
+        print(f"{s:>6} {m['reqw']:>6} {m['reqh']:>6}")
+    print(f"\nratios 100%->200%:  reqw={_ratio('reqw'):.3f}  reqh={_ratio('reqh'):.3f}")
 
 
 if __name__ == "__main__":

@@ -3893,10 +3893,13 @@ def _dpi_scale(widget, n):
     scaling. Ties every pad/coord literal to the same factor that scales the
     point-sized fonts, so 100% and 150% stay proportional *by construction*
     rather than by spot-patching. `winfo_fpixels('1i')` = 72 * tk-scaling, so at
-    96 DPI this is identity and at 144 DPI (150%) it returns 1.5x. Falls back to
-    the raw value if the measurement ever fails — never break layout over DPI."""
+    96 DPI this is identity and at 144 DPI (150%) it returns 1.5x. An explicit 0
+    stays 0 at every DPI. Falls back to the raw value if the measurement ever
+    fails — never break layout over a DPI hiccup."""
+    if not n:
+        return 0
     try:
-        return max(1, round(n * widget.winfo_fpixels("1i") / 96.0))
+        return round(n * widget.winfo_fpixels("1i") / 96.0)
     except Exception:
         return n
 
@@ -4142,16 +4145,19 @@ def _build_header(root, row, pad):
     import tkinter as tk
     from tkinter import ttk
 
+    def px(n):
+        return _dpi_scale(root, n)
+
     header = tk.Label(root, text=f"Display Off v{__version__}",
                       font=("Segoe UI", 13, "bold"),
                       bg=_THEME_BG, fg=_THEME_FG, anchor="w")
-    header.grid(row=row, column=0, columnspan=3, sticky="w", padx=pad, pady=(pad, 2))
+    header.grid(row=row, column=0, columnspan=3, sticky="w", padx=px(pad), pady=(px(pad), px(2)))
 
     # ttk.Separator doesn't accept `bg=` directly — use a configured ttk Style.
     style = ttk.Style(root)
     style.configure("Dark.TSeparator", background=_THEME_SEP)
     sep = ttk.Separator(root, orient="horizontal", style="Dark.TSeparator")
-    sep.grid(row=row + 1, column=0, columnspan=3, sticky="ew", padx=pad, pady=(0, 12))
+    sep.grid(row=row + 1, column=0, columnspan=3, sticky="ew", padx=px(pad), pady=(0, px(12)))
 
 
 def _build_hotkey_row(root, row, pad, cfg, captured, recording):
@@ -4164,22 +4170,25 @@ def _build_hotkey_row(root, row, pad, cfg, captured, recording):
     """
     import tkinter as tk
 
+    def px(n):
+        return _dpi_scale(root, n)
+
     hotkey_lbl = tk.Label(root, text="Hotkey:", font=("Segoe UI", 10),
                           bg=_THEME_BG, fg=_THEME_FG, anchor="e")
-    hotkey_lbl.grid(row=row, column=0, sticky="e", padx=(pad, 8), pady=4)
+    hotkey_lbl.grid(row=row, column=0, sticky="e", padx=(px(pad), px(8)), pady=px(4))
 
     display_var = tk.StringVar(value=hotkey_display_name(cfg))
 
     hotkey_display = tk.Label(root, textvariable=display_var, font=("Segoe UI", 11),
                               relief="sunken", bg=_THEME_BG_SUNKEN, fg=_THEME_FG,
-                              anchor="center", width=28, pady=6, cursor="hand2",
+                              anchor="center", width=28, pady=px(6), cursor="hand2",
                               highlightthickness=1, highlightbackground=_THEME_SEP)
     hotkey_display.grid(row=row, column=1, columnspan=2, sticky="ew",
-                        padx=(0, pad), pady=4)
+                        padx=(0, px(pad)), pady=px(4))
 
     hint = tk.Label(root, text="Click the field above, press your hotkey (Esc cancels)",
                     font=("Segoe UI", 8), fg=_THEME_FG_HINT, bg=_THEME_BG)
-    hint.grid(row=row + 1, column=1, columnspan=2, sticky="w", pady=(0, 10))
+    hint.grid(row=row + 1, column=1, columnspan=2, sticky="w", pady=(0, px(10)))
 
     def start_recording(event=None):
         if recording["active"]:
@@ -4291,6 +4300,9 @@ def _build_options_section(root, row, pad, lock_var, autostart_var, idle_var, wa
     """
     import tkinter as tk
 
+    def px(n):
+        return _dpi_scale(root, n)
+
     # Common checkbutton kwargs — selectcolor is the indicator box itself,
     # activebackground is the row's hover state.
     _chk_kw = dict(
@@ -4302,19 +4314,19 @@ def _build_options_section(root, row, pad, lock_var, autostart_var, idle_var, wa
     )
     lock_chk = tk.Checkbutton(root, text="Lock workstation when blanking",
                               variable=lock_var, **_chk_kw)
-    lock_chk.grid(row=row, column=0, columnspan=3, sticky="w", padx=pad, pady=2)
+    lock_chk.grid(row=row, column=0, columnspan=3, sticky="w", padx=px(pad), pady=px(2))
 
     autostart_chk = tk.Checkbutton(root, text="Run at Windows startup",
                                    variable=autostart_var, **_chk_kw)
-    autostart_chk.grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=pad, pady=2)
+    autostart_chk.grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=px(pad), pady=px(2))
 
     warn_chk = tk.Checkbutton(root,
                               text="Warn when something is keeping the display awake",
                               variable=warn_var, **_chk_kw)
-    warn_chk.grid(row=row + 2, column=0, columnspan=3, sticky="w", padx=pad, pady=2)
+    warn_chk.grid(row=row + 2, column=0, columnspan=3, sticky="w", padx=px(pad), pady=px(2))
 
     idle_frame = tk.Frame(root, bg=_THEME_BG)
-    idle_frame.grid(row=row + 3, column=0, columnspan=3, sticky="w", padx=pad, pady=(6, 2))
+    idle_frame.grid(row=row + 3, column=0, columnspan=3, sticky="w", padx=px(pad), pady=(px(6), px(2)))
     tk.Label(idle_frame, text="Auto-blank after",
              font=("Segoe UI", 10), bg=_THEME_BG, fg=_THEME_FG).pack(side="left")
     tk.Spinbox(idle_frame, from_=0, to=999, width=5, textvariable=idle_var,
@@ -4323,7 +4335,7 @@ def _build_options_section(root, row, pad, lock_var, autostart_var, idle_var, wa
                insertbackground=_THEME_FG,
                buttonbackground=_THEME_BTN_BG,
                highlightthickness=1, highlightbackground=_THEME_SEP,
-               relief="flat").pack(side="left", padx=(8, 8))
+               relief="flat").pack(side="left", padx=(px(8), px(8)))
     tk.Label(idle_frame, text="minutes idle  (0 = off)",
              font=("Segoe UI", 10), bg=_THEME_BG, fg=_THEME_FG).pack(side="left")
 
@@ -4348,8 +4360,11 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
     Added in v1.7.0 — previously these lived in the tray right-click menu."""
     import tkinter as tk
 
+    def px(n):
+        return _dpi_scale(root, n)
+
     footer = tk.Frame(root, bg=_THEME_BG)
-    footer.grid(row=row, column=0, columnspan=3, sticky="ew", padx=pad, pady=(16, pad))
+    footer.grid(row=row, column=0, columnspan=3, sticky="ew", padx=px(pad), pady=(px(16), px(pad)))
 
     _btn_kw = dict(
         font=("Segoe UI", 9), width=8,
@@ -4366,19 +4381,19 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
               **_btn_kw).pack(side="left")
     if on_about is not None:
         tk.Button(footer, text="About", command=on_about,
-                  **_btn_kw).pack(side="left", padx=(4, 0))
+                  **_btn_kw).pack(side="left", padx=(px(4), 0))
     if on_check_updates is not None:
         tk.Button(footer, text="Updates", command=on_check_updates,
-                  **_btn_kw).pack(side="left", padx=(4, 0))
+                  **_btn_kw).pack(side="left", padx=(px(4), 0))
     # Right group — dialog-result buttons, packed right-to-left so the visual
     # order reads [Apply] [Save] [Cancel].
     tk.Button(footer, text="Cancel", command=on_cancel,
-              **_btn_kw).pack(side="right", padx=(4, 0))
+              **_btn_kw).pack(side="right", padx=(px(4), 0))
     tk.Button(footer, text="Save", command=on_save,
-              **_btn_kw).pack(side="right", padx=(0, 4))
+              **_btn_kw).pack(side="right", padx=(0, px(4)))
     if on_apply is not None:
         tk.Button(footer, text="Apply", command=on_apply,
-                  **_btn_kw).pack(side="right", padx=(0, 4))
+                  **_btn_kw).pack(side="right", padx=(0, px(4)))
     # Guaranteed minimum gutter between the info group and the action group.
     # Packed last with side="left", it claims the left edge of the remaining
     # cavity (immediately right of "Updates"); any slack from a wider window
