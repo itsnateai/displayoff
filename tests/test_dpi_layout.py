@@ -101,6 +101,17 @@ def test_about_scales_proportionally():
     assert ratio >= 1.85, f"About reqheight 100->200% ratio {ratio:.3f} < 1.85 (fixed-px pads not scaling)"
 
 
+# KNOWN GAP — no test_themed_scales. `_themed_dialog` is monolithic (Toplevel +
+# grab_set + parent.wait_window blocks), so it can't be measured here without
+# either a risky extract-method refactor of production dialog code or a flaky
+# timing hack. Compensating controls: the themed dialog scales via the SAME
+# `_dpi_scale` helper these tests prove (test_dpi_scale_doubles + the settings/
+# about proportionality), its pads are verifier-confirmed, and it is screenshot-
+# verified at real 150% as a release step (Tiny11 lab: `--diag-dpi-show themed`).
+# To close the gap properly, extract `_build_themed_body(parent, message, buttons)`
+# from `_themed_dialog` (mirror of `_build_about_body`) and measure it like About.
+
+
 def _diagnostics():
     print(f"{'scale':>6} {'reqw':>6} {'reqh':>6}")
     for s in SCALES:

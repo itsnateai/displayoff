@@ -5827,14 +5827,23 @@ def main():
         _RESOLVER_LOG.clear()
 
     # --diag-dpi-show <settings|about|themed>: render exactly ONE UI surface
-    # standalone (no tray, no single-instance mutex) so a high-DPI VM can
-    # screenshot it for the 100%-vs-150% proportionality check. Blocks until the
-    # surface is closed, then exits. Undocumented developer/CI tool; harmless if
-    # ever invoked in the shipped build. Runs after logging/data-dir setup so
-    # load_config() works, but before single-instance acquisition so it can run
-    # alongside a live tray instance.
+    # standalone (no tray) so a high-DPI VM can screenshot it for the
+    # 100%-vs-150% proportionality check. Blocks until the surface is closed,
+    # then exits. Undocumented developer/CI tool — NOT reachable via the tray,
+    # hotkey, or double-click; only an explicit multi-token CLI invocation hits
+    # it, so normal users never do. Caveat (not "harmless"): the `settings`
+    # branch runs the REAL settings dialog with a working Save, and this runs
+    # BEFORE single-instance acquisition — don't click Save here against a live
+    # tray (the tray won't see the change until restart; the write itself is
+    # atomic via os.replace, so there's no corruption). Runs after logging/
+    # data-dir setup so load_config() works.
     if "--diag-dpi-show" in sys.argv:
         import tkinter as tk
+        # Route Tk callback exceptions to the log — these standalone diag roots
+        # don't get _open_settings_impl's report_callback_exception wiring, and
+        # under pythonw an unhandled callback exception would otherwise vanish.
+        def _diag_tk_exc(_et, _ev, _tb):
+            log.error("Tk callback exception (--diag-dpi-show)", exc_info=(_et, _ev, _tb))
         _i = sys.argv.index("--diag-dpi-show")
         which = sys.argv[_i + 1] if _i + 1 < len(sys.argv) else "settings"
         _set_dpi_awareness()
@@ -5842,6 +5851,7 @@ def main():
             _open_settings_impl(None, None)          # builds + runs its own root
         elif which == "about":
             _diag_root = tk.Tk()
+            _diag_root.report_callback_exception = _diag_tk_exc
             _apply_tk_scaling(_diag_root)
             _diag_root.title("About Display Off")
             _diag_root.configure(bg=_THEME_BG)
@@ -5853,6 +5863,7 @@ def main():
             # and a transient of a hidden root never maps onto the (captured)
             # desktop. A small visible host lets the dialog render for capture.
             _diag_root = tk.Tk()
+            _diag_root.report_callback_exception = _diag_tk_exc
             _apply_tk_scaling(_diag_root)
             _diag_root.title("DPI diag (themed)")
             _diag_root.configure(bg=_THEME_BG)
