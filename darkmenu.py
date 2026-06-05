@@ -47,7 +47,6 @@ _BG_HOVER = _rgb(0x3D, 0x3D, 0x3D)  # highlighted (hot) row
 _TX = _rgb(0xEC, 0xEC, 0xEC)        # enabled text
 _TX_DISABLED = _rgb(0x80, 0x80, 0x80)   # disabled / label text
 _LIME = _rgb(0x6F, 0xA8, 0x2A)      # the separator accent — dark lime green
-_ARROW = _rgb(0xC8, 0xC8, 0xC8)     # submenu ▸ arrow
 
 _PAD_L = 28          # text left padding (clears the check/icon gutter)
 _PAD_R = 16          # text right padding
@@ -83,7 +82,6 @@ if sys.platform == "win32":
         LOGPIXELSY = 90
         SPI_GETNONCLIENTMETRICS = 0x0029
         MIM_BACKGROUND = 0x00000002
-        NULL_PEN = 8
         TRANSPARENT = 1
         DT_LEFT = 0x00000000
         DT_VCENTER = 0x00000004
@@ -248,11 +246,6 @@ if sys.platform == "win32":
         _SetTextColor = _bind(_gdi32, "SetTextColor",
                               [wintypes.HDC, wintypes.COLORREF],
                               wintypes.COLORREF)
-        _Polygon = _bind(_gdi32, "Polygon",
-                         [wintypes.HDC, ctypes.POINTER(wintypes.POINT),
-                          ctypes.c_int], wintypes.BOOL)
-        _GetStockObject = _bind(_gdi32, "GetStockObject",
-                                [ctypes.c_int], wintypes.HGDIOBJ)
 
         # self-test-only menu builders
         _CreatePopupMenu = _bind(_user32, "CreatePopupMenu", [],
@@ -412,7 +405,6 @@ if sys.platform == "win32":
         def _apply_impl(hmenu):
             if not hmenu:
                 return
-            _DESCRIPTORS.clear()
             # Dark margins: paint the menu's own background dark too.
             if _BG_BRUSH:
                 mi = MENUINFO()
@@ -421,6 +413,17 @@ if sys.platform == "win32":
                 mi.hbrBack = _BG_BRUSH
                 _SetMenuInfo(hmenu, ctypes.byref(mi))
 
+            # Build the descriptor map in a LOCAL dict, then publish it with a
+            # single atomic rebind at the end. The module-level _DESCRIPTORS the
+            # handlers read is therefore never the half-built map — it stays the
+            # previous complete map until the rebind swaps in the new complete
+            # one. (In practice apply and WM_DRAWITEM share pystray's single
+            # message-pump thread and never interleave; the rebind keeps this
+            # correct by construction rather than relying on that timing — and
+            # under free-threaded CPython the GIL no longer makes
+            # dict.clear()+repopulate look atomic.)
+            global _DESCRIPTORS
+            fresh = {}
             count = _GetMenuItemCount(hmenu)
             for i in range(count):
                 info = MENUITEMINFOW()
@@ -433,7 +436,7 @@ if sys.platform == "win32":
                     continue
                 is_sep = bool(info.fType & MFT_SEPARATOR)
                 token = _BASE_TOKEN + i
-                _DESCRIPTORS[token] = {
+                fresh[token] = {
                     "text": "" if is_sep else _read_text(hmenu, i, info.cch),
                     "sep": is_sep,
                     "disabled": bool(info.fState & MFS_DISABLED),
@@ -453,11 +456,12 @@ if sys.platform == "win32":
                     upd.fMask = MIIM_FTYPE | MIIM_DATA
                     upd.fType = MFT_OWNERDRAW
                 _SetMenuItemInfoW(hmenu, i, True, ctypes.byref(upd))
+            _DESCRIPTORS = fresh
 
         def _subclass_window(hwnd):
             key = int(hwnd)
             if key in _SUBCLASSED:
-                return
+                return True
             store = {"prev": 0}
 
             def _proc(h, msg, wparam, lparam):
@@ -510,13 +514,22 @@ if sys.platform == "win32":
             if not menu_hwnd:
                 log.debug("darkmenu: Icon._menu_hwnd not ready; skipping")
                 return
-            _subclass_window(menu_hwnd)
+            if not _subclass_window(menu_hwnd):
+                # Subclass failed → there's no WM_DRAWITEM drawer. Converting
+                # items to owner-draw now would render them blank, so leave the
+                # menu native-themed instead.
+                return
             _wrap_update_menu(icon)
             try:
                 icon.update_menu()  # rebuild now so it converts immediately
+                log.info("darkmenu: dark menu + lime separators installed.")
             except Exception:
-                log.exception("darkmenu: initial update_menu failed")
-            log.info("darkmenu: dark menu + lime separators installed.")
+                # Subclass + wrap ARE installed, so the conversion will run on
+                # the next menu rebuild — but don't log success for a failed
+                # initial conversion (misleading when debugging a blank menu).
+                log.exception(
+                    "darkmenu: initial menu conversion failed — subclass + "
+                    "wrap installed; will convert on next rebuild")
 
         _ENABLED = True
     except Exception:  # noqa: BLE001 — any failure → stay native-themed

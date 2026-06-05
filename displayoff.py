@@ -4624,7 +4624,7 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
     """Footer button row.
 
     Left side  : [GitHub] [About] [Updates]   ← info / action buttons
-    Right side : [Apply] [Save] [Cancel]      ← dialog-result buttons
+    Right side : [Save] [Apply] [Cancel]      ← dialog-result buttons (Save = lime primary)
 
     A fixed minimum gutter sits between the two groups (the childless spacer
     frame below) so the action buttons never butt up against the info buttons.
