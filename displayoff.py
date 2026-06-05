@@ -36,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.27"
+__version__ = "1.7.28"
 
 log = logging.getLogger("displayoff")
 

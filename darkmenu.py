@@ -79,7 +79,6 @@ if sys.platform == "win32":
         WM_MEASUREITEM = 0x002C
         WM_DRAWITEM = 0x002B
         GWLP_WNDPROC = -4
-        LOGPIXELSY = 90
         SPI_GETNONCLIENTMETRICS = 0x0029
         MIM_BACKGROUND = 0x00000002
         TRANSPARENT = 1
@@ -228,8 +227,6 @@ if sys.platform == "win32":
                                   [wintypes.COLORREF], wintypes.HBRUSH)
         _DeleteObject = _bind(_gdi32, "DeleteObject",
                               [wintypes.HGDIOBJ], wintypes.BOOL)
-        _GetDeviceCaps = _bind(_gdi32, "GetDeviceCaps",
-                               [wintypes.HDC, ctypes.c_int], ctypes.c_int)
         _CreateFontIndirectW = _bind(_gdi32, "CreateFontIndirectW",
                                      [ctypes.POINTER(LOGFONTW)],
                                      wintypes.HFONT)
@@ -299,7 +296,12 @@ if sys.platform == "win32":
                     ncm.lfMenuFont.lfHeight = int(
                         ncm.lfMenuFont.lfHeight * dpi / 96)
             hf = _CreateFontIndirectW(ctypes.byref(ncm.lfMenuFont)) if ok else None
-            _FONTS[dpi] = hf
+            # Only cache a real handle. Caching None on a transient SPI failure
+            # would poison this DPI permanently — every later lookup returns the
+            # cached None and the rows draw fontless. Leaving it uncached lets
+            # the next call retry.
+            if hf is not None:
+                _FONTS[dpi] = hf
             return hf
 
         def _text_size(hwnd, text, hfont):
@@ -333,12 +335,13 @@ if sys.platform == "win32":
             d = _DESCRIPTORS.get(mis.itemData)
             if d is None:
                 return False
-            scale = _scale(_dpi_for(hwnd))
+            dpi = _dpi_for(hwnd)
+            scale = _scale(dpi)
             if d["sep"]:
                 mis.itemHeight = max(4, _px(_SEP_H, scale))
                 mis.itemWidth = _px(40, scale)
                 return True
-            hfont = _menu_font(_dpi_for(hwnd))
+            hfont = _menu_font(dpi)
             tw, th = _text_size(hwnd, d["text"] or " ", hfont)
             width = _px(_PAD_L, scale) + tw + _px(_PAD_R, scale)
             if d["submenu"]:
@@ -348,7 +351,7 @@ if sys.platform == "win32":
                                  th + 2 * _px(_VPAD, scale))
             return True
 
-        def _on_draw(lparam):
+        def _on_draw(hwnd, lparam):
             dis = DRAWITEMSTRUCT.from_address(lparam)
             if dis.CtlType != ODT_MENU:
                 return False
@@ -357,7 +360,14 @@ if sys.platform == "win32":
                 return False
             hdc = dis.hDC
             rc = dis.rcItem
-            dpi = _GetDeviceCaps(hdc, LOGPIXELSY) or 96
+            # Use the SAME DPI source as _on_measure — the owner window's
+            # GetDpiForWindow, NOT GetDeviceCaps(hdc). On a mixed-DPI
+            # multi-monitor setup the popup can land on a different-DPI monitor
+            # than the owner window; if measure and draw disagree on DPI a row
+            # is sized at one scale and painted at another → clipped text or an
+            # overlapping system arrow. Consistency between the two is what
+            # prevents the clip.
+            dpi = _dpi_for(hwnd)
             scale = _scale(dpi)
             selected = bool(dis.itemState & ODS_SELECTED) and not d["disabled"]
             _fill(hdc, rc, _BG_HOVER if selected else _BG)
@@ -375,12 +385,17 @@ if sys.platform == "win32":
             _SetBkMode(hdc, TRANSPARENT)
             _SetTextColor(hdc, _TX_DISABLED if d["disabled"] else _TX)
             old = _SelectObject(hdc, hfont) if hfont else None
-            tr = wintypes.RECT(rc.left + _px(_PAD_L, scale), rc.top,
-                               rc.right - _px(_PAD_R, scale), rc.bottom)
-            _DrawTextW(hdc, d["text"] or "", -1, ctypes.byref(tr),
-                       DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX)
-            if old:
-                _SelectObject(hdc, old)
+            try:
+                tr = wintypes.RECT(rc.left + _px(_PAD_L, scale), rc.top,
+                                   rc.right - _px(_PAD_R, scale), rc.bottom)
+                _DrawTextW(hdc, d["text"] or "", -1, ctypes.byref(tr),
+                           DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX)
+            finally:
+                # Always restore the prior font, even if _DrawTextW raises —
+                # otherwise our font stays selected in the shared menu DC and
+                # corrupts the next item's paint (matches _fill / _text_size).
+                if old:
+                    _SelectObject(hdc, old)
             # The submenu ▸ arrow is intentionally NOT drawn here: Windows
             # always draws its own arrow for an item that has a submenu, even
             # when the item is owner-drawn. Drawing our own stacked a second
@@ -466,7 +481,7 @@ if sys.platform == "win32":
 
             def _proc(h, msg, wparam, lparam):
                 try:
-                    if msg == WM_DRAWITEM and _on_draw(lparam):
+                    if msg == WM_DRAWITEM and _on_draw(h, lparam):
                         return 1
                     if msg == WM_MEASUREITEM and _on_measure(h, lparam):
                         return 1

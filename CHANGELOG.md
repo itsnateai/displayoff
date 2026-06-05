@@ -1,5 +1,19 @@
 # Changelog — Display Off
 
+## [1.7.28] — 2026-06-05
+
+Fixes tray-menu text clipping on mixed-DPI multi-monitor setups, plus internal hardening of the v1.7.27 dark menu.
+
+### Fixed
+
+- **Tray menu no longer clips text on mixed-DPI multi-monitor setups.** The owner-drawn menu measured each row's width at one monitor's DPI but painted it at another's when the popup opened on a differently-scaled monitor than the tray icon — clipping item text or letting the submenu arrow overlap. Measuring and painting now use a single consistent DPI source, so the menu renders cleanly wherever it pops up.
+
+### Internal
+
+- darkmenu hardening from a multi-round verification pass: gate the owner-draw conversion on the menu-window subclass actually installing (never render blank items), publish the menu-item descriptor map via an atomic rebind (free-threaded-safe), restore the prior GDI font on every paint path including errors, don't cache a failed font lookup, and log "installed" only after a successful initial conversion.
+
+No change to monitor blanking, hotkeys, idle-blank, autostart, single-instance, or the updater.
+
 ## [1.7.27] — 2026-06-05
 
 The tray right-click menu is now **dark with dark-lime green separators** instead of flat grey, and the Settings window picks up the same lime accent.
