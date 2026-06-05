@@ -99,15 +99,15 @@ Expected: `FAIL test_settings_scales_proportionally: ... ratio < 1.90` (current 
 
 ```bash
 # claim + check first
-cat D:/Hyper-V/Tiny11Lab/.in-use 2>/dev/null   # check the lab lock first
+cat <hyperv-lab>/.in-use 2>/dev/null   # check the lab lock first
 # if free or stale (>15m): claim
-echo "$SESSION_ID $(date) DisplayOff DPI 150% render" > D:/Hyper-V/Tiny11Lab/.in-use
-powershell.exe -File D:/Hyper-V/Tiny11Lab/lab.ps1 status
-powershell.exe -File D:/Hyper-V/Tiny11Lab/lab.ps1 snapshot
-powershell.exe -File D:/Hyper-V/Tiny11Lab/lab.ps1 dpi 150
-powershell.exe -File D:/Hyper-V/Tiny11Lab/lab.ps1 deploy X:/_Projects/displayoff
+echo "$SESSION_ID $(date) DisplayOff DPI 150% render" > <hyperv-lab>/.in-use
+powershell.exe -File <hyperv-lab>/lab.ps1 status
+powershell.exe -File <hyperv-lab>/lab.ps1 snapshot
+powershell.exe -File <hyperv-lab>/lab.ps1 dpi 150
+powershell.exe -File <hyperv-lab>/lab.ps1 deploy .
 # in guest: python displayoff.py --diag-dpi-show settings  (Task 6 flag; for baseline use current settings open)
-powershell.exe -File D:/Hyper-V/Tiny11Lab/lab.ps1 shot   # -> latest.png
+powershell.exe -File <hyperv-lab>/lab.ps1 shot   # -> latest.png
 ```
 Expected: a 150% screenshot of the current Settings dialog = the "before" reference. Also probe `root.winfo_fpixels('1i')` in the guest to confirm whether Tk auto-detects 144 (informs whether explicit scaling is load-bearing or belt-and-suspenders).
 
@@ -310,13 +310,13 @@ git commit -m "feat(dpi): --diag-dpi-show flag to render one surface standalone 
 
 - [ ] **Step 1:** Under the lock protocol (Task 1 Step 3), with DPI already at 150%, deploy the fixed build and screenshot each surface:
 ```bash
-powershell.exe -File D:/Hyper-V/Tiny11Lab/lab.ps1 deploy X:/_Projects/displayoff
+powershell.exe -File <hyperv-lab>/lab.ps1 deploy .
 # guest: pythonw displayoff.py --diag-dpi-show settings ; lab.ps1 shot -> settings-150.png
 # repeat: about, themed
 ```
 - [ ] **Step 2:** `lab.ps1 dpi 125` → re-deploy → shot each → compare. Then `lab.ps1 dpi 100` for the reference set.
 - [ ] **Step 3:** Compare 100% vs 150% vs 125% side by side: assert proportionally identical (spacing, no clipping, no collision). Screenshots are ground truth.
-- [ ] **Step 4:** Restore the VM as found: `lab.ps1 dpi 100`; `lab.ps1 restore` (or leave at the snapshot); clear the lock: `rm D:/Hyper-V/Tiny11Lab/.in-use`; update `active-work.md`.
+- [ ] **Step 4:** Restore the VM as found: `lab.ps1 dpi 100`; `lab.ps1 restore` (or leave at the snapshot); clear the lock: `rm <hyperv-lab>/.in-use`; update `active-work.md`.
 
 ---
 
