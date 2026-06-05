@@ -1,5 +1,23 @@
 # Changelog — Display Off
 
+## [1.7.26] — 2026-06-04
+
+Fixes the in-app updater, which could leave you with **no tray icon after clicking "Install now"** — and gives the update visible progress instead of a silent void.
+
+### Fixed
+
+- **Self-update no longer kills the app on its way to the new version.** The folder-swap updater spawns the new build as a child process to perform the swap, while the old (current) process exits. Through v1.7.25 the child raced ahead the instant it told the old process "you can exit now" — but the old process was still alive at that exact moment (the v1.7.20 handshake guarantees it). Two things then failed within the same millisecond: the still-running old `.exe` **locked its own install folder** so the rename failed with `WinError 32`, and it **still owned the single-instance lock** so the new process saw "another instance is already running" and exited too. Net result: both processes gone, **no tray icon came back**. The new build now **waits for the old process to fully terminate** (using the parent PID recorded in the relaunch state) before renaming the folder and taking the single-instance lock — so the folder is unlocked and the lock is free by the time it needs them. A bounded retry on the lock acquisition backstops the rare case where the old process can't be waited on directly. (Live-log-confirmed against a real failed update on 2026-06-04.)
+- **The updated app now actually reappears in the tray.** Even once the swap succeeds, the process performing it is running from the folder it just renamed — so its later resource and module lookups (the tray icon, and `pystray` itself) pointed at the now-gone old path, and the app silently dropped to a one-shot "blank once and exit" mode with **no tray icon**. The swap now hands off to a freshly launched instance from the final install path (which has correct paths and starts up normally) and exits, so the tray comes back reliably after an update. Caught by an end-to-end test on the compiled `.exe`, which the unit tests and code review could not see.
+- **"Install now" now shows progress.** Previously the whole download → verify → extract → restart ran silently in the background and the window simply vanished when the new version took over — no indication anything was happening. There is now a small progress window (*Downloading → Verifying → Extracting → Restarting*) for the duration, and the new version fires a **"Updated to vX.Y.Z"** tray notification once it's up, so a successful self-update gives clear feedback start to finish.
+
+### Internal
+
+- New `_wait_for_parent_exit(pid)` helper (`OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject`, 10s bound, fail-open) and a `retry_until_s` grace window on `_acquire_single_instance` scoped to the post-update relaunch path only — every normal launch keeps the historical single-attempt, instant second-instance detection.
+- New `_relaunch_after_swap()` + internal `--updated-to <version>` flag: a successful folder swap now spawns a fresh instance from the canonical exe and exits, instead of continuing in-process with module paths pointing at the renamed-away `.new` dir.
+- Added `tests/test_update_handoff.py` — real-process (no-mock) regression guard for the wait helper and the back-compatible acquire signature.
+
+No change to monitor blanking, hotkeys, idle-blank, autostart, or the DPI work from v1.7.24–v1.7.25.
+
 ## [1.7.25] — 2026-06-04
 
 High-DPI correctness pass: the Settings, About, and message/update dialogs now render proportionally identical at 100% and 125%/150%+ display scale, by construction. This completes the v1.7.24 footer fix across the whole UI.

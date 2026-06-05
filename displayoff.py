@@ -36,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.25"
+__version__ = "1.7.26"
 
 log = logging.getLogger("displayoff")
 
@@ -707,6 +707,11 @@ _mutex_handle = None
 _UPDATE_CHILD_READY_EVENT_NAME = "Local\\DisplayOff_UpdateChildReady"
 _update_child_ready_handle = None
 
+# v1.7.26: set by the --after-update-folder-swap handler to the version we
+# just relaunched into, so run_tray() can fire a one-shot "Updated to vX.Y.Z"
+# confirmation toast once the tray icon is registered. None on a normal launch.
+_post_update_toast_version = None
+
 # ── Win32 constants ────────────────────────────────────────────────────────
 SC_MONITORPOWER = 0xF170
 WM_SYSCOMMAND = 0x0112
@@ -1053,6 +1058,11 @@ _EVENT_MODIFY_STATE = 0x0002
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _TOKEN_QUERY = 0x0008
 _TOKEN_ELEVATION = 20  # TOKEN_INFORMATION_CLASS::TokenElevation
+# SYNCHRONIZE (0x00100000) is the minimum process-access right needed to
+# WaitForSingleObject on a process handle (used by the update child to wait
+# for the OLD build to fully terminate before swapping + acquiring the mutex).
+# _PROCESS_QUERY_LIMITED_INFORMATION above does NOT include it.
+_SYNCHRONIZE = 0x00100000
 
 
 # ── Cross-thread state ─────────────────────────────────────────────────────
@@ -1064,7 +1074,7 @@ _dialog_active = False             # True while any Tk window (Settings/About) i
 
 # ── Single-instance ────────────────────────────────────────────────────────
 
-def _acquire_single_instance():
+def _acquire_single_instance(retry_until_s=0.0):
     """Acquire a named mutex to prevent multiple instances.
 
     Returns True if this is the only instance, False if another is running.
@@ -1075,23 +1085,99 @@ def _acquire_single_instance():
     rather than silently letting two trays coexist — log loudly and refuse to
     proceed. Conditions that can cause this: low system resources, sandbox
     restrictions, ACL changes on the Local\\ namespace.
+
+    `retry_until_s > 0`: keep retrying (200ms cadence) until the deadline
+    before giving up on an ERROR_ALREADY_EXISTS. Used ONLY by the post-update
+    relaunch path (v1.7.26), where the OLD build may still be releasing the
+    mutex for a few hundred ms after we waited on its process handle — or
+    where we could not open its handle to wait at all. Every NORMAL launch
+    passes the 0.0 default → a single attempt → instant "second instance"
+    detection (unchanged from v1.7.25 and earlier).
     """
     global _mutex_handle
     if sys.platform != "win32":
         return True
-    _mutex_handle = CreateMutexW(None, True, _MUTEX_NAME)
-    last_error = ctypes.get_last_error()
-    if not _mutex_handle:
-        # CreateMutexW failed entirely — no guard at all. Treat as "another
-        # instance might be running" rather than risk launching a second tray.
-        log.error("CreateMutexW failed (lastError=%d) — cannot acquire single-instance guard; "
-                  "refusing to start to avoid duplicate trays.", last_error)
-        return False
-    if last_error == ERROR_ALREADY_EXISTS:
+    deadline = time.monotonic() + max(0.0, retry_until_s)
+    while True:
+        _mutex_handle = CreateMutexW(None, True, _MUTEX_NAME)
+        last_error = ctypes.get_last_error()
+        if not _mutex_handle:
+            # CreateMutexW failed entirely — no guard at all. Treat as "another
+            # instance might be running" rather than risk launching a second tray.
+            # Not retryable: a NULL handle is a resource/ACL failure, not a
+            # transient ownership collision.
+            log.error("CreateMutexW failed (lastError=%d) — cannot acquire single-instance guard; "
+                      "refusing to start to avoid duplicate trays.", last_error)
+            return False
+        if last_error != ERROR_ALREADY_EXISTS:
+            return True  # we own it
+        # Mutex already exists — another instance (or, on the post-update path,
+        # the not-yet-fully-dead parent) holds it. Drop our handle to the
+        # existing object and either retry or give up.
         CloseHandle(_mutex_handle)
         _mutex_handle = None
+        if time.monotonic() >= deadline:
+            return False
+        log.info("Single-instance mutex still held; retrying acquire "
+                 "(post-update relaunch grace, up to %.1fs)...", retry_until_s)
+        time.sleep(0.2)
+
+
+def _wait_for_parent_exit(pid, timeout_ms=10000):
+    """Block until process `pid` terminates, or `timeout_ms` elapses.
+
+    The `--after-update-folder-swap` child calls this with the OLD (parent)
+    build's PID — read from the relaunch state file — BEFORE it renames the
+    install dir and BEFORE it acquires the single-instance mutex. Both of
+    those operations require the parent to be GONE:
+
+      * the parent's running .exe image locks its install dir, so renaming
+        the dir while the parent lives fails with WinError 32
+        (ERROR_SHARING_VIOLATION); and
+      * the parent owns Local\\DisplayOff_SingleInstance until it dies.
+
+    The v1.7.20 child-ready handshake made the PARENT wait for the CHILD,
+    which inverted the dependency and guaranteed the parent was still alive
+    right here — the v1.7.26 root cause (both processes died, no tray).
+
+    Returns True when the parent is confirmed gone (or was never openable —
+    already reaped, the common fast-exit case), False on timeout. Never
+    raises; on any unexpected failure it returns True so the caller proceeds
+    (the mutex-acquire retry is the backstop).
+    """
+    if sys.platform != "win32" or OpenProcess is None or WaitForSingleObject is None:
+        return True
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return True
+    handle = OpenProcess(_SYNCHRONIZE, False, pid)
+    if not handle:
+        # ERROR_INVALID_PARAMETER once the PID is reaped, or ACCESS_DENIED.
+        # Either way we can't wait — assume gone. This is the common case:
+        # the parent usually exits in the window between its child-ready
+        # wait returning and this call.
+        log.info("After-update: parent pid %s not openable (already exited "
+                 "or access denied) — proceeding without an explicit wait.", pid)
+        return True
+    try:
+        result = WaitForSingleObject(handle, timeout_ms)
+        if result == _WAIT_OBJECT_0:
+            log.info("After-update: parent pid %s has exited; install dir is "
+                     "unlocked and the single-instance mutex is free.", pid)
+            return True
+        log.warning("After-update: parent pid %s still alive after %dms "
+                    "(WaitForSingleObject=0x%X) — proceeding anyway; the swap "
+                    "may skip and the mutex acquire will retry.",
+                    pid, timeout_ms, result)
         return False
-    return True
+    finally:
+        try:
+            CloseHandle(handle)
+        except Exception:
+            pass
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -2633,9 +2719,14 @@ def check_for_updates(timeout=5, force=False):
 #
 # Step 9 (in the new --after-update-folder-swap process, running from
 # the `.new/` dir):
-#   - Signals the parent via named event (parent then exits, releasing
-#     the single-instance mutex)
-#   - Reads + deletes _UPDATE_RELAUNCH_PATH (forensics)
+#   - Signals the parent via named event (parent then BEGINS to exit)
+#   - Reads + deletes _UPDATE_RELAUNCH_PATH (forensics + the parent PID)
+#   - v1.7.26: WAITS for the parent to FULLY exit (_wait_for_parent_exit on
+#     the parent PID). The signal above only starts the parent's exit; until
+#     it completes, the parent's running .exe locks the install dir AND owns
+#     the single-instance mutex. Skipping this wait was the v1.7.25 brick:
+#     rename → WinError 32 and acquire → "another instance running", both
+#     processes died. The rename + mutex acquire below depend on this wait.
 #   - os.rename(`<install_parent>/displayoff`,
 #               `<install_parent>/displayoff.old`)    — old install backed up
 #   - os.rename(`<install_parent>/displayoff.new`,
@@ -3134,6 +3225,61 @@ def _re_resolve_exe_path_post_swap():
     _INSTALL_DIR = os.path.dirname(new_path)
 
 
+def _relaunch_after_swap(canonical_dir, version):
+    """After a SUCCESSFUL folder swap, hand off to a fresh process and exit.
+
+    The process that performs the swap is the child running from the `.new/`
+    dir — and the swap renames *that very dir* (`.new` → canonical). A Nuitka
+    `--standalone` build resolves its data files and not-yet-imported extension
+    modules against the binary directory it captured at startup, which is now
+    the renamed-away `.new` path. So continuing in-process is broken: the icon
+    isn't found and, critically, `import pystray` (done lazily inside
+    `run_tray`) raises ImportError → the app falls back to one-shot `--off`
+    mode with NO TRAY. (Confirmed on the frozen exe 2026-06-04: a swap that
+    otherwise succeeded still left no tray.)
+
+    The fix is a clean relaunch: spawn a fresh instance from the canonical exe
+    (correct paths, normal startup) and `os._exit(0)` this one. We never
+    acquired the single-instance mutex (the swap handler exits here, before the
+    acquire), so the fresh process takes it uncontested. `--updated-to` carries
+    the version so the fresh instance fires the "Updated to vX.Y.Z" toast.
+
+    Returns ONLY if the relaunch spawn fails (degraded fallback: the caller
+    then continues in-process — broken imports, but better than silently doing
+    nothing). On success this never returns.
+    """
+    if not _is_frozen():
+        return  # source mode never reaches a real swap; nothing to relaunch
+    canonical_exe = os.path.join(canonical_dir, "displayoff.exe")
+    log.info("Post-swap: relaunching a fresh instance from %r (this process's "
+             "module/resource paths point at the renamed-away .new dir).",
+             canonical_exe)
+    args = [canonical_exe]
+    if version and version != "?":
+        args += ["--updated-to", version]
+    try:
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        proc = subprocess.Popen(
+            args,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+            cwd=canonical_dir,
+        )
+    except OSError as e:
+        log.error("Post-swap relaunch spawn failed (%s). Falling back to "
+                  "in-process startup — the tray may be unavailable until the "
+                  "user relaunches manually.", e)
+        return
+    log.info("Post-swap: fresh instance spawned (pid %s); exiting the swap "
+             "process now.", proc.pid)
+    try:
+        logging.shutdown()  # flush the log before os._exit skips teardown
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def _write_update_relaunch_state(new_version, old_install_dir=None,
                                  new_install_dir=None):
     """Persist the relaunch state file. Called at step 7 of the dance, just
@@ -3484,7 +3630,8 @@ def _recover_from_failed_update():
             log.warning("Could not clean update artifact %r: %s", path, e)
 
 
-def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename):
+def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename,
+                          progress_cb=None):
     """Execute steps 3-8 of the folder-swap dance (steps 1-2 are the
     caller's API + manifest fetch; step 9 is the --after-update-folder-swap
     child). See the outer `── Folder-swap updater ──` comment block above
@@ -3508,6 +3655,11 @@ def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename):
     function takes the URL as a parameter from the manifest+API flow and
     we want a single audit checkpoint right at the dance entry.
     """
+    # v1.7.26: optional phase callback so the caller's progress window can
+    # show what's happening. Defaults to a no-op so existing/test callers and
+    # the source-mode path are unaffected.
+    _progress = progress_cb if callable(progress_cb) else (lambda *_a: None)
+
     if not _is_frozen() or not _EXE_PATH or not _INSTALL_DIR:
         return "not_frozen", "folder-swap dance requires the frozen standalone build"
     if not _download_url_allowed(zip_url):
@@ -3549,10 +3701,12 @@ def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename):
     # Steps 3+4: download new zip, then SHA256-verify against the manifest
     # digest the caller already extracted. The two steps share a try-block
     # because a failed verify also wants the zip cleaned up.
+    _progress(f"Downloading v{new_version}…")
     log.info("Update dance: downloading %s -> %s", zip_url, zip_path)
     ok, err = _download_to_path(zip_url, zip_path)
     if not ok:
         return "download_failed", err or "download failed"
+    _progress("Verifying download (SHA256)…")
     actual_sha = _sha256_file(zip_path)
     if actual_sha.lower() != zip_sha256.lower():
         # DELETE the zip on hash mismatch instead of preserving it (same
@@ -3573,6 +3727,7 @@ def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename):
     # helper does Zip Slip protection + verifies a top-level displayoff/
     # directory containing displayoff.exe before promoting the inner dir
     # to the canonical .new/ location.
+    _progress("Extracting new version…")
     log.info("Update dance: extracting %s -> %s", zip_path, new_dir)
     ok, err = _extract_zip_bundle(zip_path, install_parent, log=log)
     if not ok:
@@ -3648,6 +3803,7 @@ def _execute_rename_dance(zip_url, zip_sha256, new_version, zip_filename):
     # inside it (Windows allows directory rename with open file handles
     # inside, but the parent's CWD might be _INSTALL_DIR and we don't
     # want to gamble on those semantics).
+    _progress("Restarting Display Off…")
     log.info("Update dance: spawning %s --after-update-folder-swap", new_exe_path)
     try:
         DETACHED_PROCESS = 0x00000008
@@ -3885,6 +4041,125 @@ def _themed_dialog(parent, title, message, buttons=("OK",), default_idx=0,
     dlg.grab_set()
     parent.wait_window(dlg)
     return result[0]
+
+
+def _make_update_progress_window(parent, latest):
+    """Build a NON-modal, dark-themed progress window for the in-app update.
+
+    Through v1.7.25, clicking "Install now" ran the whole download → verify →
+    extract → swap in a background thread with NO UI, then the process vanished
+    via os._exit(0). From the user's seat: click, nothing visible happens for
+    8-15s, then the app disappears — the "no feedback" half of the bug report.
+    This window gives the update a visible heartbeat (indeterminate bar) plus a
+    phase label the worker updates as it progresses.
+
+    Returns a dict of callables {"set": set_phase(text), "close": close()}.
+    This function runs on the Tk thread (called from `_show_result`); the
+    background worker marshals `set`/`close` through `parent.after`. Both
+    callables are no-ops once the window is gone, so a late update after the
+    worker moves on can never raise. If the window can't be built at all, the
+    update still proceeds — the indicator is advisory, never a gate.
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    state = {"win": None, "label": None, "bar": None}
+
+    try:
+        win = tk.Toplevel(parent)
+        win.withdraw()
+        win.title("Display Off — Updating")
+        win.configure(bg=_THEME_BG)
+        win.resizable(False, False)
+        win.transient(parent)
+        win.attributes("-topmost", True)
+        _apply_dark_titlebar(win)
+        # No-op the close button: the swap is destructive once underway, so
+        # don't offer a mid-flight X that would just orphan the worker. The
+        # window self-destructs with the process at the os._exit relaunch.
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        tk.Label(
+            win, text=f"Updating Display Off to v{latest}",
+            justify="left", font=("Segoe UI", 10, "bold"),
+            bg=_THEME_BG, fg=_THEME_FG, anchor="w",
+            padx=_dpi_scale(win, 20),
+            pady=(_dpi_scale(win, 15), _dpi_scale(win, 4)),
+        ).pack(anchor="w", fill="x")
+
+        phase = tk.Label(
+            win, text="Starting…", justify="left", font=("Segoe UI", 9),
+            bg=_THEME_BG, fg=_THEME_FG_HINT, anchor="w", width=44,
+            padx=_dpi_scale(win, 20), pady=0,
+        )
+        phase.pack(anchor="w", fill="x")
+
+        style = ttk.Style(win)
+        style.configure(
+            "DisplayOff.Horizontal.TProgressbar",
+            troughcolor=_THEME_BG_SUNKEN, bordercolor=_THEME_BG,
+            background="#4a86e8", lightcolor="#4a86e8", darkcolor="#4a86e8",
+        )
+        bar = ttk.Progressbar(
+            win, mode="indeterminate", length=_dpi_scale(win, 320),
+            style="DisplayOff.Horizontal.TProgressbar",
+        )
+        bar.pack(padx=_dpi_scale(win, 20),
+                 pady=(_dpi_scale(win, 8), _dpi_scale(win, 6)))
+
+        tk.Label(
+            win, text="The app will restart automatically when done.",
+            justify="left", font=("Segoe UI", 8), bg=_THEME_BG,
+            fg=_THEME_FG_HINT, anchor="w", padx=_dpi_scale(win, 20),
+            pady=(0, _dpi_scale(win, 14)),
+        ).pack(anchor="w", fill="x")
+
+        bar.start(12)  # ~12ms/step indeterminate sweep
+
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        try:
+            px = parent.winfo_rootx() + max((parent.winfo_width() - w) // 2, 0)
+            py = parent.winfo_rooty() + max((parent.winfo_height() - h) // 2, 0)
+        except (AttributeError, tk.TclError):
+            px = (win.winfo_screenwidth() - w) // 2
+            py = (win.winfo_screenheight() - h) // 2
+        win.geometry(f"{w}x{h}+{px}+{py}")
+        win.attributes("-alpha", 0)
+        win.deiconify()
+        win.update()
+        _apply_dark_titlebar(win)  # re-assert after deiconify (Win11 repaint quirk)
+        win.update()
+        win.attributes("-alpha", 1)
+
+        state["win"], state["label"], state["bar"] = win, phase, bar
+    except Exception as e:  # noqa: BLE001 — progress UI is advisory; never block the update
+        log.warning("Could not build update-progress window (%s); the update "
+                    "will run without a progress indicator.", e)
+
+    def _set(text):
+        lbl, win = state["label"], state["win"]
+        if lbl is None or win is None:
+            return
+        try:
+            lbl.config(text=text)
+            win.update_idletasks()
+        except Exception:
+            pass
+
+    def _close():
+        win, bar = state["win"], state["bar"]
+        if win is None:
+            return
+        try:
+            if bar is not None:
+                bar.stop()
+            win.destroy()
+        except Exception:
+            pass
+        state["win"] = state["label"] = state["bar"] = None
+
+    return {"set": _set, "close": _close}
 
 
 # ── UI helpers ─────────────────────────────────────────────────────────────
@@ -4875,7 +5150,22 @@ def _run_rename_dance_flow(parent_root, assets, latest):
 
     import tkinter as _tk_local
 
+    # v1.7.26: visible progress for the otherwise-silent download/extract/swap.
+    # Built here on the Tk thread; the worker marshals phase updates through
+    # parent_root.after. Torn down by os._exit on success, or explicitly in
+    # _show_error before the error dialog renders. Degrades to no-op callables
+    # if the window can't be created — the update never depends on it.
+    _progress = _make_update_progress_window(parent_root, latest)
+
+    def _set_phase(text):
+        try:
+            parent_root.after(0, lambda: _progress["set"](text))
+        except Exception:
+            pass
+
     def _show_error(title, detail):
+        # Runs on the Tk thread (via _marshal_error's after); safe to touch Tk.
+        _progress["close"]()
         try:
             btn = _themed_dialog(
                 parent_root,
@@ -4900,6 +5190,13 @@ def _run_rename_dance_flow(parent_root, assets, latest):
             parent_root.after(0, lambda: _show_error(title, detail))
         except _tk_local.TclError:
             log.error("Update error (Tk gone): %s — %s", title, detail)
+            # parent_root is destroyed (that's why .after raised). The progress
+            # window is a Toplevel child of parent_root, so Tk already tore it
+            # down with its parent — there is nothing left to close. Do NOT call
+            # _progress["close"]() here: this runs on the WORKER thread, and
+            # _close() touches Tk (bar.stop()/win.destroy()) — a cross-thread
+            # Tcl call into an interpreter that's already gone. The safest
+            # cross-thread cleanup is none.
         except Exception as e:
             log.exception("Failed to marshal update error: %s", e)
 
@@ -4922,6 +5219,7 @@ def _run_rename_dance_flow(parent_root, assets, latest):
                            "mid-upload or assets-less.")
             return
 
+        _set_phase("Fetching the release checksum…")
         sha, manifest_err = _fetch_release_manifest_sha256(
             manifest_url, zip_filename
         )
@@ -4930,7 +5228,8 @@ def _run_rename_dance_flow(parent_root, assets, latest):
                            f"Could not fetch SHA256 manifest: {manifest_err}")
             return
 
-        status, detail = _execute_rename_dance(zip_url, sha, latest, zip_filename)
+        status, detail = _execute_rename_dance(zip_url, sha, latest, zip_filename,
+                                               progress_cb=_set_phase)
         if status == "relaunched":
             log.info("Folder-swap dance complete; exiting current process so the "
                      "spawned child (--after-update-folder-swap) can take over.")
@@ -5510,6 +5809,29 @@ def run_tray():
     global _tray_icon_ref
     _tray_icon_ref = icon
 
+    # v1.7.26: if we got here via the --after-update-folder-swap relaunch,
+    # fire a one-shot confirmation toast so a self-update gives the user
+    # positive "it worked, you're on the new version" feedback — the missing
+    # half of the old silent flow (the other half is the install-progress
+    # window in _run_rename_dance_flow). Settle-delayed in a daemon thread so
+    # pystray's NIM_ADD lands before NIF_INFO, matching the welcome toast.
+    if _post_update_toast_version:
+        _updated_to = _post_update_toast_version
+
+        def _updated_toast():
+            time.sleep(_TRAY_SETTLE_SECS)
+            try:
+                icon.notify(
+                    f"Updated to v{_updated_to}. Press {hotkey_name[0]} to "
+                    "blank all displays.",
+                    "Display Off",
+                )
+                log.info("Post-update confirmation toast fired (v%s).", _updated_to)
+            except Exception as e:  # noqa: BLE001 — toast is advisory, never fatal
+                log.warning("Could not fire post-update confirmation toast: %s", e)
+        threading.Thread(target=_updated_toast, daemon=True,
+                         name="displayoff-updated-toast").start()
+
     start_hotkey_listener(cfg)
     _start_listener_watchdog()
     # Idle watcher always reads fresh config so toggling via Settings takes effect immediately.
@@ -5697,6 +6019,11 @@ def run_tray():
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main():
+    # v1.7.26: the post-update toast version is set from one of two branches
+    # below (the --after-update-folder-swap handler for the in-process no-swap
+    # case, and the --updated-to handler for the post-swap fresh relaunch).
+    # Declare the module global once, up top, so both assignments target it.
+    global _post_update_toast_version
     # v1.7.19: --diagnose-paths prints the path-resolver candidates +
     # winning-strategy line to stdout, then exits. Runs BEFORE any
     # data-dir / logging setup so the flag works even when %APPDATA% is
@@ -5893,20 +6220,31 @@ def main():
     # extracted the new bundle into <install_parent>/displayoff.new/, then
     # spawned <new_bundle>/displayoff.exe --after-update-folder-swap. THIS
     # process is that child, running from the .new/ dir. We need to:
-    #   1. Signal the parent (so it exits, releasing the install dir lock)
-    #   2. Rename old install dir → .old (backup)
-    #   3. Rename our own .new dir → canonical install dir name
-    #   4. Re-resolve _EXE_PATH / _INSTALL_DIR via GetModuleFileNameW
-    #   5. Best-effort delete the .old dir
-    #   6. Fall through to normal tray startup
+    #   1. Signal the parent's child-ready event (so the parent stops waiting)
+    #   2. Wait for the parent to FULLY EXIT (v1.7.26) — it locks the install
+    #      dir and owns the single-instance mutex until it dies
+    #   3. Rename old install dir → .old (backup)
+    #   4. Rename our own .new dir → canonical install dir name
+    #   5. Re-resolve _EXE_PATH / _INSTALL_DIR via GetModuleFileNameW
+    #   6. Best-effort delete the .old dir
+    #   7. Fall through to normal tray startup (mutex acquire uses a grace
+    #      retry because we arrived here via the update relaunch)
+    # `post_update_relaunch` is read far below at the _acquire_single_instance
+    # call; initialize it unconditionally so non-update launches see False.
+    post_update_relaunch = False
     if "--after-update-folder-swap" in sys.argv:
         # Signal the parent's child-ready handshake event as the very
-        # first act — before reading state, before any folder rename,
-        # before `_acquire_single_instance`. Signaling early breaks the
-        # parent-must-exit-first / child-can't-acquire-mutex deadlock:
-        # parent observes the signal, exits (releasing mutex AND
-        # releasing any open file handles in the old install dir),
-        # then THIS process can safely rename the old install dir.
+        # first act — it tells the parent "I'm alive, you may exit now."
+        #
+        # v1.7.26: signaling is necessary but NOT sufficient. Through v1.7.25
+        # the child proceeded straight to the rename + mutex acquire right
+        # after this signal — but the signal only makes the parent BEGIN to
+        # exit; os._exit() teardown is not instantaneous. The child won the
+        # race by ~1ms (live log 2026-06-04): the still-alive parent's .exe
+        # image locked the install dir (WinError 32 → swap skipped) AND still
+        # owned the single-instance mutex (→ "another instance running" →
+        # child exited → BOTH processes dead, no tray). The real fix is the
+        # explicit `_wait_for_parent_exit` below, gated on the parent PID.
         if sys.platform == "win32" and OpenEventW is not None:
             try:
                 _child_event = OpenEventW(
@@ -5931,10 +6269,13 @@ def main():
         state = _read_and_clear_update_relaunch_state()
         old_install_dir = ""
         new_install_dir = ""
+        parent_pid = None
+        persisted_version = "?"
         if state is not None:
             persisted_version = state.get("version") or "?"
             old_install_dir = state.get("old_install_dir") or ""
             new_install_dir = state.get("new_install_dir") or ""
+            parent_pid = state.get("pid")
             if persisted_version != "?" and persisted_version != __version__:
                 log.warning(
                     "After-update-folder-swap: state file says target "
@@ -5967,6 +6308,30 @@ def main():
             # Strip the .new suffix to get the canonical install dir name.
             if new_install_dir.endswith(_UPDATE_NEW_DIR_SUFFIX):
                 old_install_dir = new_install_dir[:-len(_UPDATE_NEW_DIR_SUFFIX)]
+
+        # v1.7.26 THE FIX: wait for the OLD (parent) build to fully terminate
+        # before the destructive rename below AND before _acquire_single_instance
+        # (far below). Until the parent dies, its running .exe image locks the
+        # install dir (rename → WinError 32) and it owns the single-instance
+        # mutex (acquire → "another instance running"). The child-ready signal
+        # above only asked the parent to start exiting; this WAITS for it to be
+        # gone. See _wait_for_parent_exit for the full root-cause framing.
+        #
+        # `post_update_relaunch` flips on regardless of whether we have a PID to
+        # wait on — it is the signal to the mutex-acquire call (bottom of main)
+        # that this is an update relaunch and should use the grace-retry. When
+        # parent_pid is missing (manual invocation / lost state) the explicit
+        # wait is skipped, but the retry backstop still covers a lingering mutex.
+        post_update_relaunch = True
+        if parent_pid:
+            _wait_for_parent_exit(parent_pid, timeout_ms=10000)
+        # Remember the version we relaunched into so run_tray() can fire a
+        # one-shot "Updated to vX.Y.Z" confirmation toast once the tray is up
+        # (used by the in-process do_swap=False path; the do_swap=True path
+        # relaunches fresh and carries the version via --updated-to instead).
+        _post_update_toast_version = (
+            persisted_version if persisted_version != "?" else __version__
+        )
 
         # Sanity-check the discovered paths before doing destructive moves.
         # If either is empty, or new_install_dir != _INSTALL_DIR, OR
@@ -6037,6 +6402,17 @@ def main():
                 except OSError as e:
                     log.warning("Folder-swap: could not delete %r (%s) — "
                                 "will retry on next launch.", old_backup, e)
+                # v1.7.26: the swap renamed THIS process's own install dir, so
+                # its lazy imports (pystray) and data-file lookups now point at
+                # the gone .new path. Hand off to a fresh process from the
+                # canonical exe and exit — continuing in-process lands in
+                # --off mode with no tray. Never returns on success. Pass the
+                # __version__ fallback (not a bare "?") so the lost-state swap
+                # path still fires the "Updated to vX.Y.Z" toast.
+                _relaunch_after_swap(
+                    old_install_dir,
+                    persisted_version if persisted_version != "?" else __version__,
+                )
         else:
             log.warning("Folder-swap: skipping swap. old=%r new=%r "
                         "_INSTALL_DIR=%r. Running build is v%s but install "
@@ -6047,6 +6423,18 @@ def main():
         # Strip --after-update-folder-swap from argv so it doesn't survive
         # into any later argv-scanning code. Idempotent.
         sys.argv = [a for a in sys.argv if a != "--after-update-folder-swap"]
+
+    # v1.7.26: `--updated-to <version>` is set by the post-swap fresh relaunch
+    # (_relaunch_after_swap). This process is a NORMAL launch from the canonical
+    # dir (correct module paths); the flag just tells run_tray() to fire the
+    # one-shot "Updated to vX.Y.Z" confirmation toast. Consume it before any
+    # other argv scan or single-instance acquire.
+    if "--updated-to" in sys.argv:
+        _ut_idx = sys.argv.index("--updated-to")
+        _ut_ver = sys.argv[_ut_idx + 1] if _ut_idx + 1 < len(sys.argv) else ""
+        if _ut_ver:
+            _post_update_toast_version = _ut_ver
+        del sys.argv[_ut_idx:_ut_idx + 2]  # drop the flag and its value
 
     if "--version" in sys.argv:
         print(f"displayoff {__version__}")
@@ -6120,8 +6508,13 @@ def main():
         turn_off_monitors(force_path="legacy")
         return
 
-    # Tray modes need single-instance protection
-    if not _acquire_single_instance():
+    # Tray modes need single-instance protection. On the post-update relaunch
+    # path (v1.7.26) give the just-exited parent a grace window to release the
+    # mutex — _wait_for_parent_exit already blocked on the parent's process
+    # handle, but if we couldn't open that handle (PID reaped/denied) the mutex
+    # may linger for a few hundred ms. Normal launches use 0.0 → single attempt.
+    _acquire_grace_s = 5.0 if post_update_relaunch else 0.0
+    if not _acquire_single_instance(retry_until_s=_acquire_grace_s):
         log.info("Another instance is already running — exiting.")
         return
 
