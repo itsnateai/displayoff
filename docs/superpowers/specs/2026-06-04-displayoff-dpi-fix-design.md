@@ -97,7 +97,7 @@ The tkinter analog of EQSwitch's `CardLayout.cs` / `DpiScale`, kept minimal:
 
 Before any `lab.ps1 dpi/deploy/shot/restore`:
 1. Claim the lock `D:\Hyper-V\Tiny11Lab\.in-use` = session id + timestamp + "DisplayOff DPI 150% render".
-2. Note it in `_.claude/_comms/active-work.md`.
+2. Note it in the shared session-coordination log.
 3. Check both first; if another session's claim is **fresh**, **queue — never reboot/change DPI**
    while it's live. Stale (>~15 min) = reclaim.
 4. `snapshot` before changing DPI; `dpi 100` + `restore` to leave the VM as found.

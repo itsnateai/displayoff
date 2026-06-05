@@ -99,7 +99,7 @@ Expected: `FAIL test_settings_scales_proportionally: ... ratio < 1.90` (current 
 
 ```bash
 # claim + check first
-cat D:/Hyper-V/Tiny11Lab/.in-use 2>/dev/null; grep -i tiny11 /x/_Projects/_.claude/_comms/active-work.md
+cat D:/Hyper-V/Tiny11Lab/.in-use 2>/dev/null   # check the lab lock first
 # if free or stale (>15m): claim
 echo "$SESSION_ID $(date) DisplayOff DPI 150% render" > D:/Hyper-V/Tiny11Lab/.in-use
 powershell.exe -File D:/Hyper-V/Tiny11Lab/lab.ps1 status
