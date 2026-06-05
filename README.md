@@ -18,7 +18,7 @@ Tiny system tray utility that turns off all monitors without putting the PC to s
 
 ## Why this exists
 
-The classic `SC_MONITORPOWER` mechanism — used by NirCmd, AutoHotkey scripts, PowerToys, and every PowerShell one-liner out there — **breaks on Modern Standby + hybrid-GPU laptops**, where it triggers a wake-handshake loop the user can't recover from. Display Off works around this by hooking into Windows' native idle-display-off code path (the one wired to *Settings ▸ Power ▸ "Turn off the display after N minutes"*) instead of sending `SC_MONITORPOWER`. The legacy mechanism is still available as an opt-in for users on hardware where it works (and where the legacy path is slightly faster).
+The classic `SC_MONITORPOWER` mechanism — **breaks on Modern Standby + hybrid-GPU laptops**, where it triggers a wake-handshake loop the user can't recover from. Display Off works around this by hooking into Windows' native idle-display-off code path (the one wired to *Settings ▸ Power ▸ "Turn off the display after N minutes"*) instead of sending `SC_MONITORPOWER`. The legacy mechanism is still available as an opt-in for users on hardware where it works (and where the legacy path is slightly faster).
 
 ## Quickstart
 
@@ -29,8 +29,6 @@ Two install options — pick whichever fits.
 Download `displayoff-vX.Y.Z.zip` from the [latest release](https://github.com/itsnateai/displayoff/releases/latest) and extract it anywhere you keep your portable tools (e.g. `C:\Users\<you>\Tools\`). The zip contains a `displayoff\` folder with `displayoff.exe` and ~150 runtime files — keep the folder together. Double-click `displayoff\displayoff.exe` to launch; the tray icon appears.
 
 Built-in self-updater: tray → right-click → **Settings → Updates → Install now**. Downloads the new release zip, verifies its SHA256 against the published `SHA256SUMS.txt` manifest, hot-swaps the install folder, and relaunches. No installer, no admin. (See "Why a folder, not a single .exe?" below.)
-
-**Upgrading from v1.7.21 or earlier:** the install layout changed in v1.7.22 — single-file `displayoff.exe` was replaced by a folder bundle. The v1.7.21 in-app updater can't reach v1.7.22 (it expects a `.exe` asset; v1.7.22 ships a `.zip`). Manual one-time upgrade: quit the running v1.7.21 tray, delete the old `displayoff.exe`, extract the v1.7.22 zip in its place, re-toggle "Run at Windows startup" in Settings so the `.lnk` repoints at `displayoff\displayoff.exe`. Your `%APPDATA%\displayoff\` config + logs carry over untouched.
 
 ### Option B: Python source
 
