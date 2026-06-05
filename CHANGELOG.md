@@ -1,5 +1,20 @@
 # Changelog — Display Off
 
+## [1.7.27] — 2026-06-05
+
+The tray right-click menu is now **dark with dark-lime green separators** instead of flat grey, and the Settings window picks up the same lime accent.
+
+### Changed
+
+- **Dark tray menu with lime-green separators.** The right-click menu is now fully owner-drawn: a dark surface with light text, greyed-out labels, and a **dark-lime separator line** between sections — so it reads with more depth than the flat default. It stays dark regardless of your Windows app-mode setting (the app already forces the dark menu theme).
+- **Settings window lime accents.** A lime accent line now sits under the title (matching the menu separators), and **Save** is a lime-bordered primary button. The footer action buttons are reordered to **Save · Apply · Cancel**.
+
+### Internal
+
+- New `darkmenu.py` module. A native Win32 popup separator can't be recoloured without `MFT_OWNERDRAW`, and the moment any item is owner-drawn Windows drops the whole menu to the classic (light) renderer — so the module owner-draws every item and repaints the menu dark by hand (menu font via `SystemParametersInfoForDpi`, DPI-scaled metrics, `SetMenuInfo` dark background brush). The submenu ▸ arrow is left to the system (drawing our own stacked a second arrow on top of it). Wired through a pystray `setup=` callback that subclasses the menu owner window and re-applies on every menu rebuild; fail-open, so any Win32 failure leaves the native themed menu and the tray keeps working. Force-included in the Nuitka bundle (`--include-module=darkmenu`).
+
+No change to monitor blanking, hotkeys, idle-blank, autostart, single-instance, or the updater.
+
 ## [1.7.26] — 2026-06-04
 
 Fixes the in-app updater, which could leave you with **no tray icon after clicking "Install now"** — and gives the update visible progress instead of a silent void.

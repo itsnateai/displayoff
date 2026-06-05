@@ -56,6 +56,7 @@ python -m nuitka \
     --include-data-files=displayoff.ico=displayoff.ico \
     --include-module=native_blank \
     --include-module=tray_promoter \
+    --include-module=darkmenu \
     --include-module=PIL.Image \
     --enable-plugin=tk-inter \
     --product-name="Display Off" \

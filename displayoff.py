@@ -36,7 +36,7 @@ try:
 except ImportError:
     winreg = None
 
-__version__ = "1.7.26"
+__version__ = "1.7.27"
 
 log = logging.getLogger("displayoff")
 
@@ -3853,6 +3853,7 @@ _THEME_BTN_BG       = "#2d2d2d"
 _THEME_BTN_FG       = "#e6e6e6"
 _THEME_BTN_ACTIVE_BG = "#3d3d3d"
 _THEME_BTN_ACTIVE_FG = "#ffffff"
+_THEME_ACCENT       = "#6fa82a"  # Lime green accent — matches the tray-menu separators
 
 
 def _apply_dark_titlebar(root):
@@ -4430,9 +4431,11 @@ def _build_header(root, row, pad):
     header.grid(row=row, column=0, columnspan=3, sticky="w", padx=px(pad), pady=(px(pad), px(2)))
 
     # ttk.Separator doesn't accept `bg=` directly — use a configured ttk Style.
+    # Lime accent line under the title, mirroring the tray menu's lime
+    # separators so the two surfaces share a visual signature.
     style = ttk.Style(root)
-    style.configure("Dark.TSeparator", background=_THEME_SEP)
-    sep = ttk.Separator(root, orient="horizontal", style="Dark.TSeparator")
+    style.configure("Accent.TSeparator", background=_THEME_ACCENT)
+    sep = ttk.Separator(root, orient="horizontal", style="Accent.TSeparator")
     sep.grid(row=row + 1, column=0, columnspan=3, sticky="ew", padx=px(pad), pady=(0, px(12)))
 
 
@@ -4650,6 +4653,16 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
         relief="flat", borderwidth=1,
         highlightthickness=1, highlightbackground=_THEME_SEP,
     )
+    # Save is the primary action — lime accent text + a solid lime border (the
+    # same lime as the tray-menu separators), matching the SyncthingPause
+    # primary-button treatment. The border is a 2px lime Frame wrapped around
+    # the button (below): tk's focus-highlight ring renders too faintly on
+    # Windows to read as a border, so we paint it with a frame instead.
+    _save_btn_kw = dict(_btn_kw)
+    _save_btn_kw.update(
+        fg=_THEME_ACCENT, activeforeground=_THEME_ACCENT,
+        highlightthickness=0,
+    )
 
     # Left group — info / navigation, packed left-to-right.
     tk.Button(footer, text="GitHub",
@@ -4662,14 +4675,18 @@ def _build_footer(root, row, pad, on_save, on_cancel, on_apply=None,
         tk.Button(footer, text="Updates", command=on_check_updates,
                   **_btn_kw).pack(side="left", padx=(px(4), 0))
     # Right group — dialog-result buttons, packed right-to-left so the visual
-    # order reads [Apply] [Save] [Cancel].
+    # order reads [Save] [Apply] [Cancel] (Save is the lime primary action).
     tk.Button(footer, text="Cancel", command=on_cancel,
               **_btn_kw).pack(side="right", padx=(px(4), 0))
-    tk.Button(footer, text="Save", command=on_save,
-              **_btn_kw).pack(side="right", padx=(0, px(4)))
     if on_apply is not None:
         tk.Button(footer, text="Apply", command=on_apply,
                   **_btn_kw).pack(side="right", padx=(0, px(4)))
+    # Save wrapped in a lime frame → a solid 2px accent border framing the
+    # button. The inner padding (px(2)) is the visible border width.
+    save_wrap = tk.Frame(footer, bg=_THEME_ACCENT)
+    save_wrap.pack(side="right", padx=(0, px(4)))
+    tk.Button(save_wrap, text="Save", command=on_save,
+              **_save_btn_kw).pack(padx=px(2), pady=px(2))
     # Guaranteed minimum gutter between the info group and the action group.
     # Packed last with side="left", it claims the left edge of the remaining
     # cavity (immediately right of "Updates"); any slack from a wider window
@@ -6013,7 +6030,36 @@ def run_tray():
                             "is acceptable (rare edge case).", e)
         threading.Thread(target=_frozen_promote_ping, daemon=True).start()
 
-    icon.run()
+    def _darkmenu_setup(_icon):
+        # Custom pystray setup callback. Runs on pystray's setup thread once
+        # the message loop is up — the first moment Icon._menu_hwnd exists —
+        # so we can subclass the menu owner window and convert every menu
+        # item to an owner-drawn dark row (with dark-lime separators) BEFORE
+        # the icon is shown.
+        #
+        # Why owner-draw the WHOLE menu: a native popup separator can't be
+        # recoloured without MFT_OWNERDRAW, and the moment ANY item is
+        # owner-drawn Windows drops the entire menu to the classic (light)
+        # renderer — so to keep it dark we hand-paint every item. See
+        # darkmenu.py for the full rationale.
+        #
+        # darkmenu is imported inside a function (matching native_blank /
+        # tray_promoter) and is force-included in the Nuitka bundle via
+        # --include-module=darkmenu in build-release.sh / build-exe.bat.
+        # Cosmetic-only and fail-open: any failure here leaves the menu in
+        # its native themed state and must never stop the tray from starting.
+        #
+        # IMPORTANT: pystray's default (no-setup) behaviour is to set
+        # visible=True. Supplying a custom setup REPLACES that, so we must set
+        # it ourselves or the tray icon never appears.
+        try:
+            import darkmenu
+            darkmenu.install(_icon)
+        except Exception as e:  # noqa: BLE001 — menu styling is polish, never fatal
+            log.warning("darkmenu unavailable (%s) — tray menu stays native", e)
+        _icon.visible = True
+
+    icon.run(setup=_darkmenu_setup)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────

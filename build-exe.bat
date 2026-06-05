@@ -89,8 +89,8 @@ REM Image.open(_ICON_PATH) finds it next to the .exe at runtime.
 REM Both are required: the resource is for File Explorer + the .lnk's
 REM IconLocation; the data file is for in-process loading by pystray.
 REM
-REM native_blank and tray_promoter are imported INSIDE functions in
-REM displayoff.py (not at module level), so Nuitka's static import scanner
+REM native_blank, tray_promoter and darkmenu are imported INSIDE functions
+REM in displayoff.py (not at module level), so Nuitka's static import scanner
 REM might miss them — include explicitly to be safe.
 
 REM Wipe previous artifacts so a silent build failure produces no
@@ -107,6 +107,7 @@ python -m nuitka ^
     --include-data-files=displayoff.ico=displayoff.ico ^
     --include-module=native_blank ^
     --include-module=tray_promoter ^
+    --include-module=darkmenu ^
     --include-module=PIL.Image ^
     --enable-plugin=tk-inter ^
     --product-name="Display Off" ^
